@@ -74,6 +74,24 @@ export async function registerWorkerInstallerRoutes(
   options: { auth: ControlPlaneAuth }
 ): Promise<void> {
   const packagePath = path.resolve(process.cwd(), '../worker/dist-packages', FILE_NAME);
+  const portableResources = new Map([
+    ['setup', { path: path.resolve(process.cwd(), '../worker/install/macos/portable-setup.sh'), type: 'text/plain' }],
+    ['launcher', { path: path.resolve(process.cwd(), '../worker/install/macos/portable-launcher.sh'), type: 'text/plain' }],
+    ['terminal', { path: path.resolve(process.cwd(), '../worker/install/macos/portable-terminal.command'), type: 'text/plain' }],
+    ['applescript', { path: path.resolve(process.cwd(), '../worker/install/macos/portable-handler.applescript'), type: 'text/plain' }],
+    ['bundle', { path: path.resolve(process.cwd(), '../worker/dist/worker-bundle.mjs'), type: 'application/javascript' }],
+    ['keychain-source', { path: path.resolve(process.cwd(), '../worker/native/keychain-helper.swift'), type: 'text/plain' }],
+  ]);
+
+  app.get<{ Params: { resource: string } }>('/api/worker-installer/bootstrap/:resource', async (request, reply) => {
+    const resource = portableResources.get(request.params.resource);
+    if (!resource || !fs.existsSync(resource.path)) {
+      return reply.status(404).send({ success: false, error: { code: 'RESOURCE_NOT_FOUND', message: 'Portable Worker resource unavailable' } });
+    }
+    reply.header('Cache-Control', 'no-store');
+    reply.type(resource.type);
+    return reply.send(fs.createReadStream(resource.path));
+  });
 
   app.get('/api/worker-installer/manifest', async (request, reply) => {
     try {
@@ -95,6 +113,7 @@ export async function registerWorkerInstallerRoutes(
             process.platform === 'darwin' &&
             fs.existsSync(path.resolve(process.cwd(), '../worker/dist/worker-bundle.mjs')) &&
             fs.existsSync(path.resolve(process.cwd(), '../worker/native/keychain-helper')),
+          portableRunAvailable: [...portableResources.values()].every((resource) => fs.existsSync(resource.path)),
         },
       });
     } catch (error: any) {

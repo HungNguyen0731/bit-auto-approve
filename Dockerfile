@@ -17,6 +17,11 @@ RUN npm --prefix frontend ci
 COPY frontend ./frontend
 RUN npm --prefix frontend run build
 
+COPY worker/package.json worker/package-lock.json ./worker/
+RUN npm --prefix worker ci
+COPY worker ./worker
+RUN npm --prefix worker run build:bundle
+
 FROM node:24-bookworm-slim AS runtime
 
 ENV NODE_ENV=production
@@ -32,6 +37,12 @@ COPY --from=build /app/backend/package.json /app/backend/package.json
 COPY --from=build /app/backend/node_modules /app/backend/node_modules
 COPY --from=build /app/backend/dist /app/backend/dist
 COPY --from=build /app/frontend/dist /app/frontend/dist
+COPY --from=build /app/worker/dist/worker-bundle.mjs /app/worker/dist/worker-bundle.mjs
+COPY --from=build /app/worker/native/keychain-helper.swift /app/worker/native/keychain-helper.swift
+COPY --from=build /app/worker/install/macos/portable-setup.sh /app/worker/install/macos/portable-setup.sh
+COPY --from=build /app/worker/install/macos/portable-launcher.sh /app/worker/install/macos/portable-launcher.sh
+COPY --from=build /app/worker/install/macos/portable-terminal.command /app/worker/install/macos/portable-terminal.command
+COPY --from=build /app/worker/install/macos/portable-handler.applescript /app/worker/install/macos/portable-handler.applescript
 
 RUN mkdir -p /app/data && chown -R node:node /app
 USER node

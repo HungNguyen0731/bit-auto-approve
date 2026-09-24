@@ -110,6 +110,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
 
   app.addHook('preHandler', async (request) => {
     if (!controlPlaneAuth.enabled || !request.url.startsWith('/api/')) return;
+    if (request.method === 'GET' && request.url.startsWith('/api/worker-installer/bootstrap/')) return;
     if (
       request.url === '/api/health' ||
       request.url.startsWith('/api/session') ||

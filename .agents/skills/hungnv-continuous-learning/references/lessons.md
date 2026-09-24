@@ -1,5 +1,14 @@
 # Lessons
 
+## 2026-09-24T07:00:27Z - Cloud browser needs a Mac-side handler for Terminal launch
+
+- Symptom: Cloud UI disabled Run in Terminal because its old endpoint could only open Terminal on the server's own macOS loopback host.
+- Root cause: A website cannot directly spawn a user's local process, and the Linux Coolify image did not contain distributable Mac Worker resources.
+- Correction: Keep local server-side launch separate; after explicit one-time Mac setup, register a dedicated URL handler pinned to a valid HTTPS Control Plane. Build the portable Worker bundle into the Docker image, require owner/CSRF to mint a short-lived pairing code, and retain encrypted Worker token delivery.
+- Prevention: Verify bootstrap resource availability/authorization, URL-handler registration, same-origin binding, reused pairing, unsupported architectures, and certificate-verified remote pairing before declaring cloud rollout successful.
+- Evidence: Builds, 69 backend tests, resource smoke, shell syntax, and temporary Mac app/Swift signing checks passed; Docker runtime and public HTTPS pairing remain unverified.
+- Recurrence keys: `Run in Terminal`, `Coolify`, `portable Worker`, `custom URL handler`, `Keychain`, `HTTPS`, `Mac bootstrap`.
+
 ## 2026-09-24T04:05:40Z - Same-host public access must be accepted by API CORS
 
 - Symptom: After static assets loaded through a direct public IP, owner sign-in still returned `Origin is not allowed`.

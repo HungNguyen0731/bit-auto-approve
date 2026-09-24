@@ -1,5 +1,14 @@
 # Prompt History
 
+## 2026-09-24T07:00:27Z - Enable cloud Run in Terminal after one-time Mac setup
+
+- Sanitized prompt: Implement the agreed plan so a user can click Run in Terminal from the Coolify UI and start a VPN-local Worker on their Mac after a one-time setup.
+- Previous match: `2026-09-24T03:30:00Z - Deploy Bitbucket PR Approver to Coolify`; that release intentionally disabled server-side Terminal launch in Linux. The subsequent IP/CORS repairs enabled UI and login, but did not provide a Mac-side launcher.
+- Result: Built a portable Worker bundle into the container, added public no-secret HTTPS bootstrap resources, a one-time Mac setup script that downloads a verified Node runtime and compiles the Keychain helper locally, and a dedicated custom URL scheme opening Terminal on the user's Mac. Cloud UI creates an owner/CSRF-protected pairing session, with fallback launch link; public HTTP cannot initiate the cloud setup. Existing local launch remains unchanged.
+- Changed files: `Dockerfile`, `README.md`, `backend/src/server.ts`, `backend/src/routes/worker-installer.ts`, `frontend/src/components/WorkerSetup.tsx`, `frontend/src/types/index.ts`, `worker/install/macos/portable-*`, `CHANGELOG.md`, and local learning records.
+- Verification: Backend/Frontend production builds, Worker bundle build and clean Worker dependency install, 69 backend tests, Compose config, resource/authorization smoke, zsh syntax, temporary AppleScript app compilation and URL-scheme plist, Swift helper compilation, and ad-hoc signing passed. Docker daemon unavailable. Public HTTPS certificate validation failed, so remote Mac-to-Coolify end-to-end pairing remains unverified.
+- Outcome: PASS locally, BLOCKED for public rollout until a valid HTTPS certificate and Coolify redeploy; no commit or push was requested.
+
 ## 2026-09-24T04:05:40Z - Owner sign-in rejected through public IP
 
 - Sanitized prompt: Correct the `Origin is not allowed` error displayed when signing in through the public IP.

@@ -299,6 +299,7 @@ export interface WorkerInstallerManifest {
   fileName: string;
   downloadUrl: string;
   terminalRunAvailable: boolean;
+  portableRunAvailable: boolean;
 }
 
 export type WorkerLogStatus =

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { CheckCircle2, Download, ExternalLink, KeyRound, Loader2, RefreshCw, TerminalSquare } from 'lucide-react';
+import { CheckCircle2, Copy, Download, ExternalLink, KeyRound, Loader2, RefreshCw, TerminalSquare } from 'lucide-react';
 import { api, encryptTokenForWorker } from '../api/client';
 import type { PairingSessionView, WorkerInstallerManifest, WorkerRecord } from '../types';
 import { WorkerStatus } from './WorkerStatus';
@@ -17,6 +17,9 @@ export const WorkerSetup: React.FC<WorkerSetupProps> = ({ workers, configHasToke
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const terminalPairingWorkerIds = useRef<Set<string> | null>(null);
+  const localTerminal = Boolean(manifest?.terminalRunAvailable);
+  const secureCloud = window.location.protocol === 'https:';
+  const bootstrapCommand = `curl -fLSs --proto '=https' --tlsv1.2 '${window.location.origin}/api/worker-installer/bootstrap/setup' -o "$HOME/Downloads/bitbucket-worker-setup.sh" && /bin/zsh "$HOME/Downloads/bitbucket-worker-setup.sh" '${window.location.origin}'`;
 
   useEffect(() => {
     api.getWorkerInstallerManifest().then(setManifest).catch(() => setManifest(null));
@@ -71,13 +74,27 @@ export const WorkerSetup: React.FC<WorkerSetupProps> = ({ workers, configHasToke
       terminalPairingWorkerIds.current = new Set(workers.map((worker) => worker.id));
       const next = await api.createPairingSession(window.location.origin);
       setPairing(next);
-      await api.runTerminalWorker(next.pairUrl);
-      setMessage('Terminal opened. Pairing and saved-token delivery continue automatically; keep that Terminal window open while jobs run.');
+      if (localTerminal) {
+        await api.runTerminalWorker(next.pairUrl);
+        setMessage('Terminal opened. Pairing and saved-token delivery continue automatically; keep that Terminal window open while jobs run.');
+      } else {
+        window.location.href = next.pairUrl.replace(/^bitbucket-pr-worker:/, 'bitbucket-pr-worker-portable:');
+        setMessage('Approve opening Bitbucket PR Worker in your browser. If nothing opens, run the one-time Mac setup command below first.');
+      }
     } catch (error) {
       terminalPairingWorkerIds.current = null;
       setMessage(error instanceof Error ? error.message : 'Unable to run Terminal Worker');
     } finally {
       setBusy(null);
+    }
+  };
+
+  const copyBootstrapCommand = async () => {
+    try {
+      await navigator.clipboard.writeText(bootstrapCommand);
+      setMessage('One-time setup command copied. Review it, then paste it into Terminal on your Mac. Return here and click Run in Terminal.');
+    } catch {
+      setMessage('Clipboard unavailable. Copy the command shown below manually.');
     }
   };
 
@@ -127,13 +144,26 @@ export const WorkerSetup: React.FC<WorkerSetupProps> = ({ workers, configHasToke
         <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <button
             onClick={runTerminalWorker}
-            disabled={!manifest?.terminalRunAvailable || busy === 'terminal'}
+            disabled={!(localTerminal || (manifest?.portableRunAvailable && secureCloud)) || busy === 'terminal'}
             className="min-h-24 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-left text-emerald-900 hover:bg-emerald-100 disabled:opacity-50"
           >
             {busy === 'terminal' ? <Loader2 className="h-5 w-5 animate-spin" /> : <TerminalSquare className="h-5 w-5" />}
             <div className="mt-2 text-sm font-bold">1. Run in Terminal</div>
-            <div className="mt-1 text-[11px]">Recommended on localhost — no download or installation</div>
+            <div className="mt-1 text-[11px]">{localTerminal ? 'Runs on this Mac without setup' : 'Opens the Mac launcher after one-time setup'}</div>
           </button>
+          {!localTerminal && (
+            <div className="min-h-24 rounded-2xl border border-brand-200 bg-brand-50 p-4 text-brand-800 sm:col-span-2">
+              <Copy className="h-5 w-5" />
+              <div className="mt-2 text-sm font-bold">Set up this Mac once</div>
+              <p className="mt-1 text-xs">{secureCloud ? 'Copy, review, then run this command in Terminal. Requires Apple Command Line Tools; no .pkg or app administrator permission.' : 'Connect through the HTTPS domain first. Pairing and setup are disabled over public HTTP.'}</p>
+              {secureCloud && manifest?.portableRunAvailable && (
+                <>
+                  <button type="button" onClick={copyBootstrapCommand} className="mt-3 min-h-11 rounded-xl bg-brand-700 px-4 text-xs font-semibold text-white">Copy setup command</button>
+                  <code className="mt-3 block break-all rounded-lg bg-white p-2 text-[10px] select-all">{bootstrapCommand}</code>
+                </>
+              )}
+            </div>
+          )}
           <a
             href={manifest?.available ? manifest.downloadUrl : undefined}
             className={`min-h-24 rounded-2xl border p-4 ${manifest?.available ? 'border-brand-200 bg-brand-50 text-brand-800' : 'pointer-events-none border-slate-200 bg-slate-100 text-slate-500'}`}
@@ -157,6 +187,7 @@ export const WorkerSetup: React.FC<WorkerSetupProps> = ({ workers, configHasToke
         {pairing && (
           <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-900">
             Pairing code <strong className="font-mono">{pairing.code}</strong> expires at {new Date(pairing.expiresAt).toLocaleTimeString()}.
+            {!localTerminal && <a className="ml-2 font-semibold underline" href={pairing.pairUrl.replace(/^bitbucket-pr-worker:/, 'bitbucket-pr-worker-portable:')}>Open Mac launcher</a>}
           </div>
         )}
         {message && <div role="status" className="mt-4 text-xs text-app-muted">{message}</div>}
