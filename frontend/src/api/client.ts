@@ -84,7 +84,8 @@ export const api = {
   updateJob: (id: string, dto: UpdateJobDto) => request<ApprovalJob>(`/jobs/${id}`, { method: 'PUT', body: JSON.stringify(dto) }),
   deleteJob: (id: string) => request<{ success: boolean }>(`/jobs/${id}`, { method: 'DELETE' }),
   toggleJob: (id: string) => request<ApprovalJob>(`/jobs/${id}/toggle`, { method: 'POST' }),
-  runJobNow: (id: string) => request<{ success: boolean; message: string }>(`/jobs/${id}/run-now`, { method: 'POST' }),
+  runJobNow: (id: string, credential: { username?: string; token?: string; tokenCiphertext?: string }) =>
+    ownerMutation<{ success: boolean; message: string }>(`/jobs/${encodeURIComponent(id)}/run-now`, credential),
   async getLogs(params?: { limit?: number; status?: string }) { return items(await request<ApprovalLogEntry[] | { items?: ApprovalLogEntry[] }>(`/logs?${qs(params || {})}`)); },
   clearLogs: () => request<{ success: boolean }>('/logs', { method: 'DELETE' }),
   previewRules: (rules: JobFilterRules) => request<PreviewRulesResponse>('/prs/preview', { method: 'POST', body: JSON.stringify({ rules }) }),

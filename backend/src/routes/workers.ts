@@ -291,13 +291,14 @@ export async function registerWorkerRoutes(
     async (request, reply) => {
       try {
         const worker = workerContext(request, workerAuth, request.params.workerId);
-        if (worker.state !== 'ONLINE') {
+        if (!['ONLINE', 'STARTING', 'ERROR_AUTH'].includes(worker.state)) {
           return reply.status(409).send({
             success: false,
             error: { code: 'WORKER_NOT_ONLINE', message: 'Worker is not online' },
           });
         }
-        const lease = executionDispatcher.claim(worker.id);
+        const manualOnly = worker.state !== 'ONLINE' || (request.body as { manualOnly?: boolean } | undefined)?.manualOnly === true;
+        const lease = executionDispatcher.claim(worker.id, manualOnly);
         return reply.send({ success: true, data: { lease, serverTime: new Date().toISOString() } });
       } catch (error: any) {
         return reply.status(error.statusCode || 400).send({

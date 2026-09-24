@@ -72,6 +72,12 @@ bitbucket-pr-approver/
 
 ## Local Worker cho VPN / IP Allowlist
 
+### Run thủ công với token riêng
+
+Trong **Jobs**, bấm **Select job & run** (hoặc **Run Now** trên một job), chọn job và nhập Bitbucket token. Username chỉ cần cho Basic auth; bỏ trống để dùng Bearer. Với job **Local Worker**, trình duyệt mã hóa token bằng public key của Worker trước khi gửi, Worker giải mã chỉ cho execution này và không ghi đè token lịch trong Keychain. Với job **Server**, token gửi tới backend cho đúng lượt chạy; chỉ dùng trên HTTPS hoặc localhost. Worker cần đang kết nối để nhận job, và Mac vẫn cần VPN/IP allowlist nếu Bitbucket yêu cầu.
+
+**Remember on this browser** là tùy chọn và lưu token dạng đọc được trong `localStorage` của trình duyệt đó; không bật trên máy dùng chung. Bỏ chọn để xóa bản lưu. Lượt chạy theo lịch tiếp tục dùng token cấu hình/Keychain riêng; token của nút Run không cấp cho lịch. Owner session, danh sách job và log hiện vẫn dùng chung, chưa tách tài khoản hay quyền truy cập theo người dùng.
+
 - `local`: backend hiện tại chạy job trực tiếp; mọi job cũ mặc định giữ chế độ này.
 - `worker`: Control Plane chỉ lập lịch và lưu tối đa 300 log mới nhất, Local Worker trên macOS gọi Bitbucket qua VPN của máy người dùng.
 

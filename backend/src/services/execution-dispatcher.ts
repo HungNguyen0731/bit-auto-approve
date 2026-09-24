@@ -106,7 +106,11 @@ export class ExecutionDispatcher {
     return lease;
   }
 
-  manualRun(jobId: string, now: Date = new Date()): ExecutionLease {
+  manualRun(
+    jobId: string,
+    credential?: { username?: string; ciphertext: string },
+    now: Date = new Date()
+  ): ExecutionLease {
     const job = this.storage.getJobById(jobId);
     if (!job) {
       throw Object.assign(new Error('Job not found'), { code: 'JOB_NOT_FOUND', statusCode: 404 });
@@ -118,13 +122,19 @@ export class ExecutionDispatcher {
       });
     }
     const worker = this.workerStore.getWorker(job.workerId);
-    if (!worker || worker.revokedAt || worker.state !== 'ONLINE') {
+    if (!worker || worker.revokedAt ||
+        !worker.lastHeartbeatAt ||
+        now.getTime() - new Date(worker.lastHeartbeatAt).getTime() > 35_000 ||
+        (!credential && worker.state !== 'ONLINE') ||
+        (credential && !['ONLINE', 'STARTING', 'ERROR_AUTH'].includes(worker.state))) {
       throw Object.assign(new Error('Assigned local worker is not online'), {
         code: 'WORKER_NOT_ONLINE',
         statusCode: 409,
       });
     }
-    const lease = this.schedule({ ...job, enabled: true }, now, 'MANUAL');
+    const lease = credential
+      ? this.scheduleManualWithCredential(job, credential, now)
+      : this.schedule({ ...job, enabled: true }, now, 'MANUAL');
     if (!lease) {
       throw Object.assign(new Error('Unable to create worker execution'), {
         code: 'EXECUTION_NOT_CREATED',
@@ -134,11 +144,46 @@ export class ExecutionDispatcher {
     return lease;
   }
 
-  claim(workerId: string, now: Date = new Date()): ExecutionLease | null {
+  private scheduleManualWithCredential(
+    job: ApprovalJob,
+    credential: { username?: string; ciphertext: string },
+    now: Date
+  ): ExecutionLease {
+    const config = this.storage.getConfig();
+    const { token: _token, ...bitbucketConfig } = config || {
+      serverType: 'cloud' as const,
+      baseUrl: 'https://api.bitbucket.org/2.0',
+      authType: 'basic' as const,
+    };
+    const lease: ExecutionLease = {
+      executionId: crypto.randomUUID(),
+      idempotencyKey: `${job.id}:manual:${crypto.randomUUID()}`,
+      jobId: job.id,
+      jobRevision: jobRevision(job),
+      workerId: job.workerId!,
+      trigger: 'MANUAL',
+      status: 'QUEUED',
+      scheduledFor: now.toISOString(),
+      createdAt: now.toISOString(),
+      lastSequence: 0,
+      job: { ...job, revision: jobRevision(job) },
+      bitbucketConfig: { ...bitbucketConfig, authType: credential.username ? 'basic' : 'bearer', username: credential.username },
+      manualTokenCiphertext: credential.ciphertext,
+    };
+    const leases = this.workerStore.getLeases();
+    if (leases.some((item) => item.jobId === job.id && ['QUEUED', 'LEASED', 'RUNNING', 'RETRYABLE'].includes(item.status))) {
+      throw Object.assign(new Error('Job already has an active execution'), { code: 'JOB_ALREADY_RUNNING', statusCode: 409 });
+    }
+    this.workerStore.saveLeases([...leases, lease]);
+    return lease;
+  }
+
+  claim(workerId: string, manualOnly = false, now: Date = new Date()): ExecutionLease | null {
     const leases = this.workerStore.getLeases();
     const available = leases.find(
       (lease) =>
         lease.workerId === workerId &&
+        (!manualOnly || Boolean(lease.manualTokenCiphertext)) &&
         (lease.status === 'QUEUED' ||
           (lease.status === 'RETRYABLE' &&
             (!lease.leasedUntil || new Date(lease.leasedUntil).getTime() <= now.getTime())) ||
@@ -196,6 +241,7 @@ export class ExecutionDispatcher {
       status: result.status,
       completedAt: result.completedAt,
       leasedUntil: undefined,
+      manualTokenCiphertext: ['COMPLETED', 'FAILED'].includes(result.status) ? undefined : current.manualTokenCiphertext,
     };
     this.workerStore.saveLeases(
       leases.map((lease) => (lease.executionId === result.executionId ? completed : lease))

@@ -171,11 +171,11 @@ export class SchedulerService {
     }
   }
 
-  async runJobNow(jobId: string): Promise<void> {
-    return this.executeJob(jobId, true);
+  async runJobNow(jobId: string, manualCredential?: { token: string; username?: string }): Promise<void> {
+    return this.executeJob(jobId, true, manualCredential);
   }
 
-  async executeJob(jobId: string, force: boolean = false): Promise<void> {
+  async executeJob(jobId: string, force: boolean = false, manualCredential?: { token: string; username?: string }): Promise<void> {
     const job = this.storage.getJobById(jobId);
     if (!job) return;
     if (this.executingJobIds.has(jobId) && !force) return;
@@ -184,22 +184,31 @@ export class SchedulerService {
     const startTime = Date.now();
 
     try {
-      const config = this.storage.getConfig();
+      const savedConfig = this.storage.getConfig();
+      const config = manualCredential
+        ? { ...(savedConfig || { serverType: 'cloud' as const, baseUrl: 'https://api.bitbucket.org/2.0', authType: 'basic' as const }),
+            token: manualCredential.token,
+            username: manualCredential.username,
+            authType: manualCredential.username ? 'basic' as const : 'bearer' as const }
+        : savedConfig;
       if (!config) {
         this.bitbucketStatus = 'UNCONFIGURED';
         return;
       }
 
-      const client = this.getClient(config);
+      const client = manualCredential ? createBitbucketClient(config) : this.getClient(config);
 
-      // Verify connection / current user
-      if (!this.cachedUser) {
+      let currentUser = manualCredential ? undefined : this.cachedUser;
+      if (!currentUser) {
         try {
-          this.cachedUser = await client.getCurrentUser();
-          this.updateStatus(true, 'CONNECTED');
+          currentUser = await client.getCurrentUser();
+          if (!manualCredential) {
+            this.cachedUser = currentUser;
+            this.updateStatus(true, 'CONNECTED');
+          }
         } catch (err: any) {
           const isVpnErr = err.code === 'VPN_REQUIRED';
-          this.updateStatus(!isVpnErr, isVpnErr ? 'DISCONNECTED' : 'ERROR');
+          if (!manualCredential) this.updateStatus(!isVpnErr, isVpnErr ? 'DISCONNECTED' : 'ERROR');
           this.events.broadcast('error', {
             jobId,
             error: err.message,
@@ -239,7 +248,7 @@ export class SchedulerService {
         for (const pr of openPrs) {
           scannedCount++;
           const evalStart = Date.now();
-          const evaluation = RuleFilteringEngine.evaluate(pr, job.rules, this.cachedUser);
+          const evaluation = RuleFilteringEngine.evaluate(pr, job.rules, currentUser);
 
           this.events.broadcast('pr_evaluated', {
             jobId: job.id,
@@ -252,7 +261,7 @@ export class SchedulerService {
           });
 
           const cacheKey = `${repo.projectOrWorkspace}/${repo.slug}/${pr.id}`;
-          const isCachedApproved = this.approvedCache.has(cacheKey);
+          const isCachedApproved = !manualCredential && this.approvedCache.has(cacheKey);
 
           if (evaluation.wouldApprove && !isCachedApproved) {
             if (job.dryRun) {
@@ -285,7 +294,7 @@ export class SchedulerService {
               // Actual Approval via API
               try {
                 const approveRes = await client.approvePullRequest(repo, pr.id);
-                this.approvedCache.set(cacheKey, { approvedAt: Date.now() });
+                if (!manualCredential) this.approvedCache.set(cacheKey, { approvedAt: Date.now() });
 
                 this.storage.addLog({
                   jobId: job.id,
@@ -336,7 +345,7 @@ export class SchedulerService {
               }
             }
           } else if (evaluation.isAlreadyApproved || isCachedApproved) {
-            if (!isCachedApproved) {
+            if (!isCachedApproved && !manualCredential) {
               this.approvedCache.set(cacheKey, { approvedAt: Date.now() });
             }
             this.storage.addLog({
@@ -396,7 +405,7 @@ export class SchedulerService {
       const jobIdx = allJobs.findIndex((j) => j.id === job.id);
       if (jobIdx !== -1) {
         allJobs[jobIdx].lastRunAt = nowIso;
-        allJobs[jobIdx].nextRunAt = nextRunIso;
+        if (!manualCredential) allJobs[jobIdx].nextRunAt = nextRunIso;
         this.storage.saveJobs(allJobs);
       }
 

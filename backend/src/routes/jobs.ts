@@ -132,7 +132,7 @@ export async function registerJobRoutes(
     }
   );
 
-  app.post<{ Params: { id: string } }>('/api/jobs/:id/run-now', async (req, reply) => {
+  app.post<{ Params: { id: string }; Body?: { username?: string; token?: string; tokenCiphertext?: string } }>('/api/jobs/:id/run-now', async (req, reply) => {
     const { id } = req.params;
     const job = storage.getJobById(id);
     if (!job) {
@@ -147,7 +147,12 @@ export async function registerJobRoutes(
 
     if ((job.executionMode ?? 'local') === 'worker') {
       try {
-        const lease = executionDispatcher?.manualRun(id);
+        const ciphertext = req.body?.tokenCiphertext;
+        if (req.body?.token || (ciphertext && (!/^[A-Za-z0-9_-]{64,8192}$/.test(ciphertext) ||
+            (req.body?.username && req.body.username.length > 320)))) {
+          return reply.status(400).send({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Use a valid encrypted Worker token' } });
+        }
+        const lease = executionDispatcher?.manualRun(id, ciphertext ? { ciphertext, username: req.body?.username?.trim() } : undefined);
         if (!lease) {
           throw Object.assign(new Error('Worker execution dispatcher is unavailable'), {
             code: 'WORKER_DISPATCH_UNAVAILABLE',
@@ -157,7 +162,7 @@ export async function registerJobRoutes(
         return reply.status(202).send({
           success: true,
           message: `Job '${job.name}' queued for local worker`,
-          data: lease,
+          data: { executionId: lease.executionId },
         });
       } catch (error: any) {
         return reply.status(error.statusCode || 409).send({
@@ -167,7 +172,11 @@ export async function registerJobRoutes(
       }
     }
 
-    scheduler.runJobNow(id).catch(() => {});
+    if (req.body?.tokenCiphertext || (req.body?.token && (req.body.token.length > 8192 ||
+        (req.body.username && req.body.username.length > 320)))) {
+      return reply.status(400).send({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Invalid manual credential' } });
+    }
+    scheduler.runJobNow(id, req.body?.token ? { token: req.body.token, username: req.body.username?.trim() } : undefined).catch(() => {});
 
     return reply.send({
       success: true,

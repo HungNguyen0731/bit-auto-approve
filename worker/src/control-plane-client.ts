@@ -28,8 +28,10 @@ export class ControlPlaneClient {
     });
   }
 
-  claim(): Promise<ClaimResponse> {
-    return this.request(`/api/workers/${this.requireWorkerId()}/claims`, { method: 'POST' });
+  claim(manualOnly = false): Promise<ClaimResponse> {
+    return this.request(`/api/workers/${this.requireWorkerId()}/claims`, {
+      method: 'POST', body: JSON.stringify({ manualOnly }),
+    });
   }
 
   renew(executionId: string) {

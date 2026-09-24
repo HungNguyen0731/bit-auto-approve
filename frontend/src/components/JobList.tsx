@@ -168,7 +168,7 @@ export const JobList: React.FC<JobListProps> = ({
                     {/* Run Now Button */}
                     <button
                       onClick={() => onRunNow(job.id)}
-                      disabled={isRunningNow || !job.enabled}
+                      disabled={isRunningNow}
                       className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-app-panel-strong hover:bg-brand-50 text-app-ink hover:text-brand-800 text-xs font-medium border border-slate-300 transition-colors disabled:opacity-40"
                       title="Trigger immediate execution"
                     >

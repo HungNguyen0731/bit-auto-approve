@@ -113,6 +113,7 @@ export interface ExecutionLease {
   lastSequence: number;
   job: ApprovalJob;
   bitbucketConfig: Omit<BitbucketConnectionConfig, 'token'>;
+  manualTokenCiphertext?: string;
 }
 
 export interface ClaimResponse {

@@ -151,37 +151,47 @@ async function run(): Promise<void> {
         recordProbe(true);
         await heartbeat();
       }
-      if (!bitbucketToken) {
-        recordProbe(false, 'AUTH_INVALID_TOKEN');
-        delay = config.claimIntervalMs;
-      } else if (stateMachine.currentState === 'PAUSED_VPN' && lastLease) {
+      if (stateMachine.currentState === 'PAUSED_VPN' && lastLease) {
         try {
-          await executor.probe(lastLease, bitbucketToken);
+          const probeToken = lastLease.manualTokenCiphertext
+            ? await identityStore.decryptEnvelope(lastLease.manualTokenCiphertext)
+            : bitbucketToken;
+          if (!probeToken) throw Object.assign(new Error('Missing token'), { code: 'AUTH_INVALID_TOKEN' });
+          await executor.probe(lastLease, probeToken);
           delay = recordProbe(true).nextProbeDelayMs;
         } catch (error: any) {
           delay = recordProbe(false, error.code || 'NETWORK_OFFLINE').nextProbeDelayMs;
         }
-      } else if (stateMachine.currentState === 'ONLINE') {
+      } else if (['ONLINE', 'STARTING', 'ERROR_AUTH'].includes(stateMachine.currentState)) {
+        if (!bitbucketToken && stateMachine.currentState === 'ONLINE') recordProbe(false, 'AUTH_INVALID_TOKEN');
         await flushOutbox();
-        const claim = await client.claim();
+        const claim = await client.claim(!bitbucketToken);
         if (claim.lease) {
           lastLease = claim.lease;
           activeExecutionId = claim.lease.executionId;
           await client.renew(claim.lease.executionId);
           try {
-            const result = await executor.execute(claim.lease, bitbucketToken);
+            const executionToken = claim.lease.manualTokenCiphertext
+              ? await identityStore.decryptEnvelope(claim.lease.manualTokenCiphertext)
+              : bitbucketToken;
+            if (!executionToken) throw Object.assign(new Error('Missing token'), { code: 'AUTH_INVALID_TOKEN' });
+            const result = await executor.execute(claim.lease, executionToken);
             outbox.append(result.logs);
             await flushOutbox();
             await client.complete(claim.lease.executionId, result.summary);
-            recordProbe(true);
+            lastLease = null;
+            if (!claim.lease.manualTokenCiphertext || bitbucketToken) recordProbe(true);
           } catch (error: any) {
             const classification = error.code || 'WORKER_EXECUTION_FAILED';
-            const transition = recordProbe(false, classification);
+            const networkFailure = ['VPN_REQUIRED', 'NETWORK_OFFLINE', 'IP_ALLOWLIST'].includes(classification);
+            const transition = claim.lease.manualTokenCiphertext && !networkFailure
+              ? { state: stateMachine.currentState, nextProbeDelayMs: config.claimIntervalMs }
+              : recordProbe(false, classification);
             await client.complete(claim.lease.executionId, {
               executionId: claim.lease.executionId,
               workerId: config.workerId,
               jobId: claim.lease.jobId,
-              status: transition.state === 'PAUSED_VPN' ? 'RETRYABLE' : 'FAILED',
+              status: networkFailure ? 'RETRYABLE' : 'FAILED',
               startedAt: claim.lease.startedAt || new Date().toISOString(),
               completedAt: new Date().toISOString(),
               durationMs: 0,
@@ -194,6 +204,7 @@ async function run(): Promise<void> {
               alreadyApproved: 0,
               failureReason: error.message,
             });
+            if (!networkFailure) lastLease = null;
             delay = transition.nextProbeDelayMs;
           } finally {
             activeExecutionId = undefined;

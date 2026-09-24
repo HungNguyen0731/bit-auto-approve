@@ -13,7 +13,7 @@ import {
   WorkerLogEntry,
   WorkerRecord,
 } from './types';
-import { api } from './api/client';
+import { api, encryptTokenForWorker } from './api/client';
 import { useSseEvents } from './api/sse';
 import { Header } from './components/Header';
 import { OnboardingGatekeeper } from './components/OnboardingGatekeeper';
@@ -21,6 +21,7 @@ import { StatsOverview } from './components/StatsOverview';
 import { TokenCard } from './components/TokenCard';
 import { JobList } from './components/JobList';
 import { JobFormModal } from './components/JobFormModal';
+import { RunJobModal, type ManualRunCredential } from './components/RunJobModal';
 import { RulePreviewModal } from './components/RulePreviewModal';
 import { ActionLogTable } from './components/ActionLogTable';
 import { ToastContainer } from './components/Toast';
@@ -75,6 +76,8 @@ export function App() {
   // Modals
   const [isJobModalOpen, setIsJobModalOpen] = useState<boolean>(false);
   const [editingJob, setEditingJob] = useState<ApprovalJob | null>(null);
+  const [runJobId, setRunJobId] = useState<string | null>(null);
+  const [isSubmittingRun, setIsSubmittingRun] = useState(false);
   const [isPreviewOpen, setIsPreviewOpen] = useState<boolean>(false);
   const [previewRules, setPreviewRules] = useState<JobFilterRules | null>(null);
 
@@ -150,6 +153,7 @@ export function App() {
 
       const storedConfig = await loadData();
       if (cancelled) return;
+      await loadWorkerData();
 
       if (!storedConfig?.hasToken) {
         setIsRestoringSession(false);
@@ -165,7 +169,6 @@ export function App() {
           bitbucketStatus: 'CONNECTED',
           vpnConnected: restored.user.vpnConnected,
         }));
-        await loadWorkerData();
       } catch (err) {
         if (!cancelled) {
           console.warn('Stored Bitbucket session could not be restored:', err);
@@ -299,17 +302,30 @@ export function App() {
   };
 
   // Run job now
-  const handleRunNow = async (id: string) => {
+  const handleRunNow = async (id: string, credential: ManualRunCredential) => {
     setRunningJobIds((prev) => new Set(prev).add(id));
+    setIsSubmittingRun(true);
     try {
-      const res = await api.runJobNow(id);
-      addToast('info', 'Job Triggered', res.message);
+      const job = jobs.find((item) => item.id === id);
+      if (!job) throw new Error('Selected job is no longer available');
+      if (!window.isSecureContext) throw new Error('Sending a Bitbucket token requires HTTPS or localhost.');
+      let payload: { username?: string; token?: string; tokenCiphertext?: string } = { ...credential };
+      if (job.executionMode === 'worker') {
+        const worker = workers.find((item) => item.id === job.workerId);
+        if (!worker?.publicKey) throw new Error('Assigned Worker is unavailable. Check Worker connection.');
+        if (!window.isSecureContext || !crypto?.subtle) throw new Error('Worker token encryption requires HTTPS or localhost.');
+        payload = { username: credential.username, tokenCiphertext: await encryptTokenForWorker(worker.publicKey, credential.token) };
+      }
+      const res = await api.runJobNow(id, payload);
+      addToast('info', 'Job Triggered', res.message || `Job “${job.name}” has been queued.`);
       setTimeout(() => {
         loadData();
       }, 1000);
     } catch (err) {
       addToast('error', 'Run Failed', String(err));
+      throw err;
     } finally {
+      setIsSubmittingRun(false);
       setTimeout(() => {
         setRunningJobIds((prev) => {
           const next = new Set(prev);
@@ -386,8 +402,8 @@ export function App() {
     setIsPreviewOpen(true);
   };
 
-  // A stored token alone never unlocks the dashboard in this session; a live Cloud profile is required.
-  const showGatekeeper = isOnboardingManual || !config?.hasToken || !userProfile;
+  // Existing jobs remain available for manual runs even without a configured scheduled token.
+  const showGatekeeper = isOnboardingManual || ((!config?.hasToken || !userProfile) && jobs.length === 0);
 
   if (ownerAuthenticated === false) {
     return (
@@ -427,7 +443,7 @@ export function App() {
               Restoring secure Bitbucket session
             </div>
             <p className="mt-3 text-xs leading-5 text-app-muted">
-              Verifying the encrypted local credential and active workspace. No token is stored in browser storage.
+              Checking the configured Bitbucket session. Manual tokens are remembered in this browser only if you opt in.
             </p>
           </div>
         </main>
@@ -644,10 +660,17 @@ export function App() {
 
         {activeTab === 'jobs' && (
           <div className="space-y-6">
+            {jobs.length > 0 && (
+              <div className="flex justify-end">
+                <button type="button" onClick={() => setRunJobId(jobs[0].id)} className="rounded-xl bg-brand-700 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-800">
+                  Select job &amp; run
+                </button>
+              </div>
+            )}
             <JobList
               jobs={jobs}
               onToggleJob={handleToggleJob}
-              onRunNow={handleRunNow}
+              onRunNow={setRunJobId}
               onEditJob={(job) => {
                 setEditingJob(job);
                 setIsJobModalOpen(true);
@@ -706,6 +729,17 @@ export function App() {
         isSaving={isSavingJob}
         workers={workers}
       />
+
+      {runJobId && (
+        <RunJobModal
+          key={runJobId}
+          jobs={jobs}
+          initialJobId={runJobId}
+          busy={isSubmittingRun}
+          onClose={() => setRunJobId(null)}
+          onRun={handleRunNow}
+        />
+      )}
 
       {/* Rule Preview / Test Modal */}
       {previewRules && (
