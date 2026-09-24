@@ -69,7 +69,20 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
 
       callback(null, {
         origin: (origin, originCallback) => {
-          if (!origin || allowedOrigins.has(origin)) return originCallback(null, true);
+          const requestHost = request.headers.host?.toLowerCase();
+          const isSameHostOrigin = (() => {
+            if (!origin) return true;
+            if (!requestHost) return false;
+            try {
+              return new URL(origin).host.toLowerCase() === requestHost;
+            } catch {
+              return false;
+            }
+          })();
+
+          if (!origin || isSameHostOrigin || allowedOrigins.has(origin)) {
+            return originCallback(null, true);
+          }
           return originCallback(
             Object.assign(new Error('Origin is not allowed'), {
               code: 'CORS_ORIGIN_DENIED',

@@ -1,5 +1,14 @@
 # Prompt History
 
+## 2026-09-24T04:05:40Z - Owner sign-in rejected through public IP
+
+- Sanitized prompt: Correct the `Origin is not allowed` error displayed when signing in through the public IP.
+- Previous match: `2026-09-24T03:58:13Z - Coolify UI renders blank through public IP`; the prior correction exempted static assets but correctly retained strict CORS for APIs, exposing that a same-host IP API Origin was not part of the configured domain allowlist.
+- Result: API CORS now accepts a browser Origin only when its host exactly matches the current request Host, as well as the configured allowlist; other Origins remain rejected.
+- Changed files: `backend/src/server.ts`, `CHANGELOG.md`, and local learning records.
+- Verification: Backend production build and `npm test` passed (69 tests). A same-host IP-origin owner-login request returned `409 AUTH_DISABLED` with a matching CORS header (the expected state without initialized owner storage); an untrusted Origin still returned `403`.
+- Outcome: PASS locally; Coolify redeployment is required for sign-in through the public endpoint.
+
 ## 2026-09-24T03:58:13Z - Coolify UI renders blank through public IP
 
 - Sanitized prompt: Diagnose and correct the blank UI at the public Coolify IP address.

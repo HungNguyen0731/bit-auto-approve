@@ -1,5 +1,14 @@
 # Lessons
 
+## 2026-09-24T04:05:40Z - Same-host public access must be accepted by API CORS
+
+- Symptom: After static assets loaded through a direct public IP, owner sign-in still returned `Origin is not allowed`.
+- Root cause: API CORS allowlisted `CONTROL_PLANE_ORIGIN`, but a browser accessing the same service through the temporary IP sends that IP as its Origin, which is not the configured public-domain Origin.
+- Correction: Permit API CORS when the parsed Origin host exactly equals the incoming request Host, while retaining the configured allowlist and rejecting every other Origin.
+- Prevention: Validate owner-login API CORS through each supported public host, including temporary IP access, and verify an unrelated Origin receives `403`.
+- Evidence: Backend build and 69 tests passed; same-host IP login CORS header was returned and untrusted Origin remained `403`.
+- Recurrence keys: `Origin is not allowed`, `CORS_ORIGIN_DENIED`, `owner sign-in`, `public IP`, `Fastify`, `CONTROL_PLANE_ORIGIN`.
+
 ## 2026-09-24T03:58:13Z - Strict API CORS must not block same-origin static assets
 
 - Symptom: The public deployment returned `200` for its HTML shell but rendered a blank page; JavaScript and CSS asset requests with the public IP Origin returned `403 CORS_ORIGIN_DENIED`.
