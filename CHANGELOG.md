@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed macOS portable setup failing with `ld: unknown file type .../keychain-source`: save the downloaded helper as `.swift` before compiling, and reject root/sudo setup before any downloads so the launcher and Keychain belong to the logged-in Mac user. Verified the original error and a successful Swift compile from a `.swift` filename, shell syntax, and frontend build.
 - Added a portable Mac Worker bootstrap for HTTPS Coolify deployments: downloadable Worker bundle and setup resources, SHA-256-checked Node runtime, locally built Keychain helper, user-owned custom URL handler, cloud Run in Terminal pairing, and origin pinning. Kept the localhost-only launch and API owner/CSRF pairing controls. Verified builds, 69 backend tests, resource/authorization smoke, shell syntax, AppleScript/Swift compilation, and ad-hoc app signing; Docker daemon and valid public HTTPS were unavailable for an end-to-end cloud smoke.
 - Fixed owner sign-in through a direct public IP: API CORS now accepts an Origin only when it matches the request host, in addition to the configured allowlist. Untrusted Origins remain rejected.
 - Fixed the deployed UI rendering blank when accessed by IP or a domain not yet configured as `CONTROL_PLANE_ORIGIN`: CORS validation now applies only to `/api/*`, while same-origin frontend assets remain loadable. Verified backend/frontend production builds, all 69 backend tests, and Origin-specific static/API smoke checks.

@@ -1,5 +1,14 @@
 # Prompt History
 
+## 2026-09-24T09:19:10Z - Portable Mac setup Swift linker failure
+
+- Sanitized prompt: Setup run from a root Mac shell failed with `ld: unknown file type in '/tmp/bitbucket-worker.../keychain-source'` and `clang: error: linker command failed with exit code 1`.
+- Previous match: `2026-09-24T07:00:27Z - Enable cloud Run in Terminal after one-time Mac setup`; the prior smoke compiled the helper from its repository `.swift` filename rather than through the downloaded extensionless resource, so it missed this deployment path.
+- Result: Rename the downloaded source to `keychain-helper.swift` before invoking `swiftc` and refuse root/sudo setup before downloading or writing user files. Document the normal-user requirement in UI and README.
+- Changed files: `worker/install/macos/portable-setup.sh`, `frontend/src/components/WorkerSetup.tsx`, `README.md`, `CHANGELOG.md`, and local learning records.
+- Verification: Reproduced the exact linker error with the extensionless source, confirmed successful arm64 Mach-O compilation with `.swift`, checked zsh syntax, frontend production build, and `git diff --check`.
+- Outcome: PASS locally; deployed bootstrap requires a new Coolify image and a retry from the non-root Mac user.
+
 ## 2026-09-24T07:00:27Z - Enable cloud Run in Terminal after one-time Mac setup
 
 - Sanitized prompt: Implement the agreed plan so a user can click Run in Terminal from the Coolify UI and start a VPN-local Worker on their Mac after a one-time setup.

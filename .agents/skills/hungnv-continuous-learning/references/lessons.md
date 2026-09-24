@@ -1,5 +1,14 @@
 # Lessons
 
+## 2026-09-24T09:19:10Z - Test downloaded source with its real filename and user identity
+
+- Symptom: Portable setup reported `ld: unknown file type .../keychain-source` after downloading the Keychain helper; the user ran it from a root shell.
+- Root cause: `swiftc` treats an extensionless downloaded file as a linker input rather than Swift source. The earlier local smoke used `keychain-helper.swift` directly and missed the staged filename; root execution would also install the handler and Keychain under the wrong account.
+- Correction: Rename the downloaded resource to `.swift` before compilation, and fail immediately when the effective UID is root.
+- Prevention: Smoke test bootstrap inputs using their downloaded filenames and normal Mac user identity; reject root before any side effects.
+- Evidence: Extensionless compile reproduced linker failure; `.swift` compile produced a Mach-O arm64 helper; zsh syntax and frontend build passed.
+- Recurrence keys: `keychain-source`, `unknown file type`, `swiftc`, `portable setup`, `root shell`, `sudo`.
+
 ## 2026-09-24T07:00:27Z - Cloud browser needs a Mac-side handler for Terminal launch
 
 - Symptom: Cloud UI disabled Run in Terminal because its old endpoint could only open Terminal on the server's own macOS loopback host.

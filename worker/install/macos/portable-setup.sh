@@ -5,6 +5,10 @@ if [[ "$(uname -s)" != Darwin ]]; then
   echo "This launcher must be set up on a Mac." >&2
   exit 1
 fi
+if [[ "$(id -u)" -eq 0 ]]; then
+  echo "Do not run this setup as root or with sudo. Exit the root shell and run it as the Mac user who will open the browser and Terminal." >&2
+  exit 1
+fi
 
 control_plane="${1:-}"
 if [[ "$control_plane" != https://* || "$control_plane" == https://*/* || "$control_plane" == *'@'* || "$control_plane" == *'?'* || "$control_plane" == *'#'* ]]; then
@@ -22,6 +26,7 @@ base="$control_plane/api/worker-installer/bootstrap"
 for resource in launcher terminal applescript bundle keychain-source; do
   /usr/bin/curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 "$base/$resource" -o "$stage/$resource"
 done
+/bin/mv "$stage/keychain-source" "$stage/keychain-helper.swift"
 
 node_version=24.14.0
 case "$(uname -m)" in
@@ -57,7 +62,7 @@ resources="$app/Contents/Resources"
 /bin/cp "$stage/bundle" "$resources/worker-bundle.mjs"
 /bin/cp "$stage/node-v${node_version}-darwin-${node_arch}/bin/node" "$resources/node"
 /usr/bin/printf '%s' "$control_plane" > "$resources/control-plane-origin"
-/usr/bin/swiftc "$stage/keychain-source" -o "$resources/keychain-helper"
+/usr/bin/swiftc "$stage/keychain-helper.swift" -o "$resources/keychain-helper"
 /bin/chmod 755 "$app/Contents/MacOS/WorkerLauncher" "$resources/Run Worker.command" "$resources/node" "$resources/keychain-helper"
 /usr/bin/codesign --force --deep --sign - "$app"
 backup=""

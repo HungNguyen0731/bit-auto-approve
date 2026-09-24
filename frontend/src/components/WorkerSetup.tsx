@@ -155,7 +155,7 @@ export const WorkerSetup: React.FC<WorkerSetupProps> = ({ workers, configHasToke
             <div className="min-h-24 rounded-2xl border border-brand-200 bg-brand-50 p-4 text-brand-800 sm:col-span-2">
               <Copy className="h-5 w-5" />
               <div className="mt-2 text-sm font-bold">Set up this Mac once</div>
-              <p className="mt-1 text-xs">{secureCloud ? 'Copy, review, then run this command in Terminal. Requires Apple Command Line Tools; no .pkg or app administrator permission.' : 'Connect through the HTTPS domain first. Pairing and setup are disabled over public HTTP.'}</p>
+              <p className="mt-1 text-xs">{secureCloud ? 'Copy, review, then run as your normal Mac user — not root or sudo. Requires Apple Command Line Tools; no .pkg.' : 'Connect through the HTTPS domain first. Pairing and setup are disabled over public HTTP.'}</p>
               {secureCloud && manifest?.portableRunAvailable && (
                 <>
                   <button type="button" onClick={copyBootstrapCommand} className="mt-3 min-h-11 rounded-xl bg-brand-700 px-4 text-xs font-semibold text-white">Copy setup command</button>
