@@ -1,0 +1,108 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  html {
+    min-width: 320px;
+    background: #e8eef6;
+  }
+
+  body {
+    @apply bg-app-canvas text-app-ink antialiased;
+    min-height: 100dvh;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    background-image:
+      radial-gradient(circle at 8% 0%, rgb(197 221 255 / 0.52), transparent 26rem),
+      linear-gradient(180deg, #edf3fa 0%, #e8eef6 48%, #e4ebf4 100%);
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #e8eef6;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #aab9cc;
+    border: 2px solid #e8eef6;
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #7f91aa;
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-slide-up {
+  animation: slideUp 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-scale-in {
+  animation: scaleIn 0.15s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+}
+:focus-visible { outline: 3px solid #1d4ed8; outline-offset: 2px; }
+
+@layer utilities {
+  .soft-canvas {
+    background-color: #e8eef6;
+    background-image:
+      radial-gradient(circle at 8% 0%, rgb(197 221 255 / 0.52), transparent 26rem),
+      linear-gradient(180deg, #edf3fa 0%, #e8eef6 48%, #e4ebf4 100%);
+  }
+
+  .visual-grid {
+    background-image:
+      linear-gradient(rgb(255 255 255 / 0.12) 1px, transparent 1px),
+      linear-gradient(90deg, rgb(255 255 255 / 0.12) 1px, transparent 1px),
+      radial-gradient(circle at 72% 18%, rgb(87 157 255 / 0.5), transparent 28rem);
+    background-size: 32px 32px, 32px 32px, 100% 100%;
+    mask-image: linear-gradient(to bottom, black, transparent 92%);
+  }
+
+  .visual-grid + * {
+    isolation: isolate;
+  }
+}

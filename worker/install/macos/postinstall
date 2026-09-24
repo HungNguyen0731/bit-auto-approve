@@ -1,0 +1,28 @@
+#!/bin/zsh
+set -euo pipefail
+
+console_user="$(stat -f '%Su' /dev/console)"
+if [[ -z "$console_user" || "$console_user" == "root" || "$console_user" == "loginwindow" ]]; then
+  exit 0
+fi
+
+user_id="$(id -u "$console_user")"
+user_home="$(dscl . -read "/Users/$console_user" NFSHomeDirectory | awk '{print $2}')"
+launch_agents="$user_home/Library/LaunchAgents"
+logs_dir="$user_home/Library/Logs/BitbucketPRWorker"
+support_dir="$user_home/Library/Application Support/BitbucketPRWorker"
+plist_path="$launch_agents/com.hungnv.bitbucket-pr-worker.plist"
+
+install -d -m 700 -o "$console_user" -g staff "$launch_agents" "$logs_dir" "$support_dir"
+chown -R "$console_user":staff "/Applications/Bitbucket PR Worker.app"
+sed "s|__USER_HOME__|$user_home|g" \
+  "/Applications/Bitbucket PR Worker.app/Contents/Resources/com.hungnv.bitbucket-pr-worker.plist.template" \
+  > "$plist_path"
+chown "$console_user":staff "$plist_path"
+chmod 600 "$plist_path"
+
+launchctl bootout "gui/$user_id/com.hungnv.bitbucket-pr-worker" >/dev/null 2>&1 || true
+launchctl bootstrap "gui/$user_id" "$plist_path"
+launchctl enable "gui/$user_id/com.hungnv.bitbucket-pr-worker"
+
+exit 0

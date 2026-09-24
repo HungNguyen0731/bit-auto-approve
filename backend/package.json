@@ -1,0 +1,42 @@
+{
+  "name": "@bitbucket-pr-approver/backend",
+  "version": "1.0.0",
+  "description": "Ultra-lightweight Fastify backend for Bitbucket PR Auto-Approver",
+  "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "import": "./dist/runtime.js"
+    }
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "tsx --test src/**/*.test.ts"
+  },
+  "keywords": [
+    "bitbucket",
+    "pull-request",
+    "approver",
+    "fastify",
+    "scheduler"
+  ],
+  "author": "HungNV & Agent Team",
+  "license": "MIT",
+  "dependencies": {
+    "@bitbucket-pr-approver/shared": "file:../shared",
+    "@fastify/cookie": "^11.1.2",
+    "@fastify/cors": "^11.3.0",
+    "@fastify/static": "^10.1.4",
+    "fastify": "^5.12.5",
+    "undici": "^8.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

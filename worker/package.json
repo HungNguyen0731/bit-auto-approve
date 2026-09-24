@@ -1,0 +1,23 @@
+{
+  "name": "@bitbucket-pr-approver/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build:keychain": "swiftc native/keychain-helper.swift -o native/keychain-helper",
+    "build:bundle": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node24 --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outfile=dist/worker-bundle.mjs",
+    "build": "tsc && npm run build:keychain && npm run build:bundle",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@bitbucket-pr-approver/backend": "file:../backend",
+    "@bitbucket-pr-approver/shared": "file:../shared",
+    "undici": "^8.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

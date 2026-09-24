@@ -1,0 +1,22 @@
+{
+  "name": "@bitbucket-pr-approver/shared",
+  "version": "1.0.0",
+  "description": "Shared contracts, schemas and types for Bitbucket PR Approver",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": [
+    "bitbucket",
+    "pull-request",
+    "approver",
+    "automation"
+  ],
+  "author": "HungNV & Agent Team",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

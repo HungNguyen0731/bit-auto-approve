@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+*.log
+server.pid
+.bitbucket-pr-approver-data/
+backend/.bitbucket-pr-approver-data/
+.env
+.env.*
+!.env.example
+.DS_Store
+worker/dist-packages/
+worker/native/keychain-helper

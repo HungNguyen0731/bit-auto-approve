@@ -1,0 +1,20 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3100"
+      BITBUCKET_APPROVER_DATA_DIR: /app/data
+      CONTROL_PLANE_ORIGIN: ${CONTROL_PLANE_ORIGIN:?Set the public HTTPS URL in Coolify}
+      CONTROL_PLANE_OWNER_PASSWORD: ${CONTROL_PLANE_OWNER_PASSWORD:?Set a strong owner password in Coolify}
+    volumes:
+      - bitbucket-approver-data:/app/data
+    ports:
+      - "${APP_PORT:-3100}:3100"
+
+volumes:
+  bitbucket-approver-data:

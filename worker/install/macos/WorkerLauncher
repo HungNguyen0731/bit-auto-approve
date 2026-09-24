@@ -1,0 +1,19 @@
+#!/bin/zsh
+set -euo pipefail
+
+resources_dir="$(cd "$(dirname "$0")/../Resources" && pwd)"
+support_dir="$HOME/Library/Application Support/BitbucketPRWorker"
+runtime_dir="$resources_dir"
+if [[ -L "$support_dir/current" && -f "$support_dir/current/worker-bundle.mjs" ]]; then
+  runtime_dir="$support_dir/current"
+fi
+export BITBUCKET_WORKER_KEYCHAIN_HELPER="${runtime_dir}/keychain-helper"
+if [[ ! -x "$BITBUCKET_WORKER_KEYCHAIN_HELPER" ]]; then
+  export BITBUCKET_WORKER_KEYCHAIN_HELPER="$resources_dir/keychain-helper"
+fi
+
+if [[ "${1:-}" == bitbucket-pr-worker://* ]]; then
+  exec "$resources_dir/node" "$runtime_dir/worker-bundle.mjs" --pair-url "$1"
+fi
+
+exec "$resources_dir/node" "$runtime_dir/worker-bundle.mjs" "$@"

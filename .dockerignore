@@ -1,0 +1,14 @@
+.git
+.github
+.bitbucket-pr-approver-data
+backend/.bitbucket-pr-approver-data
+**/node_modules
+**/dist
+**/*.log
+server.pid
+.env
+.env.*
+!.env.example
+coverage
+worker/dist-packages
+worker/native/keychain-helper
