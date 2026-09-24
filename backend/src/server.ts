@@ -57,20 +57,31 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
     logger: false, // Lean & fast, keep console clean
   });
 
-  // 1. Register CORS
+  // 1. Register CORS for API requests only. Static frontend files are served
+  // from the same origin and must remain reachable when the control plane is
+  // accessed through a temporary IP address before its public domain is live.
   await app.register(cors, {
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.has(origin)) return callback(null, true);
-      return callback(
-        Object.assign(new Error('Origin is not allowed'), {
-          code: 'CORS_ORIGIN_DENIED',
-          statusCode: 403,
-        }),
-        false
-      );
+    delegator: (request, callback) => {
+      if (!request.url.startsWith('/api/')) {
+        callback(null, { origin: false });
+        return;
+      }
+
+      callback(null, {
+        origin: (origin, originCallback) => {
+          if (!origin || allowedOrigins.has(origin)) return originCallback(null, true);
+          return originCallback(
+            Object.assign(new Error('Origin is not allowed'), {
+              code: 'CORS_ORIGIN_DENIED',
+              statusCode: 403,
+            }),
+            false
+          );
+        },
+        methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+        credentials: true,
+      });
     },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    credentials: true,
   });
   await app.register(fastifyCookie);
 
