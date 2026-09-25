@@ -11,3 +11,6 @@ backend/.bitbucket-pr-approver-data/
 .DS_Store
 worker/dist-packages/
 worker/native/keychain-helper
+
+# Keep Markdown files local
+*.md
