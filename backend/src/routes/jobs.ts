@@ -38,6 +38,12 @@ export async function registerJobRoutes(
       });
     }
 
+    if (process.env.NODE_ENV === 'production' && body.executionMode !== 'worker') {
+      return reply.status(409).send({ success: false, error: {
+        code: 'LOCAL_WORKER_REQUIRED', message: 'Assign a paired Mac Worker; jobs cannot run on the cloud server',
+      } });
+    }
+
     if (body.executionMode === 'worker') {
       const worker = body.workerId ? workerStore?.getWorker(body.workerId) : null;
       if (!worker || worker.revokedAt) {
@@ -71,6 +77,11 @@ export async function registerJobRoutes(
     const currentJob = storage.getJobById(id);
     const nextMode = body.executionMode ?? currentJob?.executionMode ?? 'local';
     const nextAccountId = body.accountId ?? currentJob?.accountId;
+    if (process.env.NODE_ENV === 'production' && nextMode !== 'worker') {
+      return reply.status(409).send({ success: false, error: {
+        code: 'LOCAL_WORKER_REQUIRED', message: 'Assign a paired Mac Worker; legacy Server jobs cannot run on the cloud server',
+      } });
+    }
     if (nextMode === 'worker') {
       const workerId = body.workerId ?? currentJob?.workerId;
       const worker = workerId ? workerStore?.getWorker(workerId) : null;
@@ -193,6 +204,12 @@ export async function registerJobRoutes(
           error: { code: error.code || 'WORKER_NOT_ONLINE', message: error.message },
         });
       }
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      return reply.status(409).send({ success: false, error: {
+        code: 'LOCAL_WORKER_REQUIRED', message: 'This Server job cannot run on Coolify. Assign a paired Mac Worker and Bitbucket account first',
+      } });
     }
 
     if (req.body?.tokenCiphertext || (req.body?.token && (req.body.token.length > 8192 ||

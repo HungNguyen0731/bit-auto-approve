@@ -308,6 +308,9 @@ export function App() {
     try {
       const job = jobs.find((item) => item.id === id);
       if (!job) throw new Error('Selected job is no longer available');
+      if (job.executionMode !== 'worker') {
+        throw new Error('This legacy Server job cannot run on Coolify. Assign a paired Mac Worker first.');
+      }
       if (!window.isSecureContext) throw new Error('Sending a Bitbucket token requires HTTPS or localhost.');
       let payload: { username?: string; token?: string; tokenCiphertext?: string } = { ...credential };
       if (job.executionMode === 'worker') {
@@ -580,7 +583,7 @@ export function App() {
             }`}
           >
             <Laptop className="w-4 h-4" />
-            <span>Local Workers ({workers.length})</span>
+            <span>App cho Mac ({workers.length})</span>
           </button>
         </div>
 
@@ -702,7 +705,6 @@ export function App() {
           <div className="space-y-6">
             <WorkerSetup
               workers={workers}
-              configHasToken={Boolean(config?.hasToken)}
               onRefresh={loadWorkerData}
             />
             <WorkerExecutionLog logs={workerLogs} workers={workers} />

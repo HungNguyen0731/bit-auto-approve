@@ -4,6 +4,7 @@ import type {
   EncryptedTokenEnvelope,
   HeartbeatRequest,
   PairWorkerRequest,
+  WorkerRunRecord,
 } from '@bitbucket-pr-approver/shared';
 import type { ControlPlaneAuth } from '../services/control-plane-auth.js';
 import type { WorkerAuth } from '../services/worker-auth.js';
@@ -385,6 +386,37 @@ export async function registerWorkerRoutes(
       return reply.status(error.statusCode || 400).send({
         success: false,
         error: { code: error.code || 'WORKER_LOG_QUERY_FAILED', message: error.message },
+      });
+    }
+  });
+
+  app.get('/api/worker-executions', async (request, reply) => {
+    try {
+      ownerContext(request, auth, false);
+      const query = request.query as { limit?: string; workerId?: string };
+      const requested = Number(query.limit ?? 100);
+      const limit = Number.isFinite(requested) ? Math.min(Math.max(Math.floor(requested), 1), 300) : 100;
+      const runs: WorkerRunRecord[] = workerStore.getLeases()
+        .filter((lease) => !query.workerId || lease.workerId === query.workerId)
+        .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime())
+        .slice(0, limit)
+        .map((lease) => ({
+          executionId: lease.executionId,
+          jobId: lease.jobId,
+          jobName: lease.job.name,
+          workerId: lease.workerId,
+          trigger: lease.trigger,
+          status: lease.status,
+          createdAt: lease.createdAt,
+          startedAt: lease.startedAt,
+          completedAt: lease.completedAt,
+          result: lease.result,
+        }));
+      return reply.send({ success: true, data: runs });
+    } catch (error: any) {
+      return reply.status(error.statusCode || 400).send({
+        success: false,
+        error: { code: error.code || 'WORKER_EXECUTION_QUERY_FAILED', message: error.message },
       });
     }
   });

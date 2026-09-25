@@ -119,7 +119,7 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
   const [intervalSeconds, setIntervalSeconds] = useState(60);
   const [dryRun, setDryRun] = useState(false);
   const [enabled, setEnabled] = useState(true);
-  const [executionMode, setExecutionMode] = useState<'local' | 'worker'>('local');
+  const [executionMode, setExecutionMode] = useState<'local' | 'worker'>('worker');
   const [workerId, setWorkerId] = useState('');
 
   // Filter Rules
@@ -144,7 +144,7 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
       setIntervalSeconds(editingJob.intervalSeconds || 60);
       setDryRun(editingJob.dryRun);
       setEnabled(editingJob.enabled);
-      setExecutionMode(editingJob.executionMode ?? 'local');
+      setExecutionMode('worker');
       setWorkerId(editingJob.workerId || '');
       setRepositories(editingJob.rules.repositories || []);
       setAuthorWhitelist(editingJob.rules.authorWhitelist || []);
@@ -162,7 +162,7 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
       setIntervalSeconds(60);
       setDryRun(false);
       setEnabled(true);
-      setExecutionMode(workers.some((worker) => worker.state === 'ONLINE') ? 'worker' : 'local');
+      setExecutionMode('worker');
       setWorkerId(workers.find((worker) => worker.state === 'ONLINE')?.id || '');
       setRepositories([]);
       setAuthorWhitelist([]);
@@ -273,12 +273,9 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <label className="text-xs font-semibold text-slate-700">Execution Location</label>
-                <p className="mt-1 text-[11px] text-slate-600">Worker mode uses the workstation VPN and keeps running after the browser closes.</p>
+                <p className="mt-1 text-[11px] text-slate-600">Coolify only coordinates jobs. A paired Mac Worker makes every Bitbucket request.</p>
               </div>
-              <div className="flex rounded-xl border border-app-line bg-white p-1 text-xs font-semibold">
-                <button type="button" onClick={() => setExecutionMode('local')} className={`min-h-11 rounded-lg px-3 ${executionMode === 'local' ? 'bg-brand-700 text-white' : 'text-app-muted'}`}>This backend</button>
-                <button type="button" onClick={() => setExecutionMode('worker')} disabled={workers.length === 0} className={`min-h-11 rounded-lg px-3 ${executionMode === 'worker' ? 'bg-brand-700 text-white' : 'text-app-muted'} disabled:opacity-40`}>Local Worker</button>
-              </div>
+              <span className="rounded-lg bg-brand-700 px-3 py-2 text-xs font-semibold text-white">Mac Worker</span>
             </div>
             {executionMode === 'worker' && (
               <select value={workerId} onChange={(event) => setWorkerId(event.target.value)} className="mt-3 min-h-11 w-full rounded-xl border border-app-line bg-white px-3 text-xs text-app-ink">

@@ -270,6 +270,10 @@ export class WorkerStore {
   }
 
   saveLeases(leases: ExecutionLease[]): void {
-    this.store.update((data) => ({ ...data, leases }));
+    const active = leases.filter((lease) => !['COMPLETED', 'FAILED'].includes(lease.status));
+    const recent = leases.filter((lease) => ['COMPLETED', 'FAILED'].includes(lease.status))
+      .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime())
+      .slice(0, 300);
+    this.store.update((data) => ({ ...data, leases: [...active, ...recent] }));
   }
 }

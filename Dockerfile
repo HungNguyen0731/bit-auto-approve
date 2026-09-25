@@ -43,6 +43,7 @@ COPY --from=build /app/worker/install/macos/portable-setup.sh /app/worker/instal
 COPY --from=build /app/worker/install/macos/portable-launcher.sh /app/worker/install/macos/portable-launcher.sh
 COPY --from=build /app/worker/install/macos/portable-terminal.command /app/worker/install/macos/portable-terminal.command
 COPY --from=build /app/worker/install/macos/portable-handler.applescript /app/worker/install/macos/portable-handler.applescript
+COPY macos-app/releases/Bitbucket-PR-Approver-0.3.0-macOS.zip /app/macos-app/releases/Bitbucket-PR-Approver-0.3.0-macOS.zip
 
 RUN mkdir -p /app/data && chown -R node:node /app
 USER node

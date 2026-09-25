@@ -73,6 +73,19 @@ export async function registerWorkerInstallerRoutes(
   app: FastifyInstance,
   options: { auth: ControlPlaneAuth }
 ): Promise<void> {
+  const macAppName = 'Bitbucket-PR-Approver-0.3.0-macOS.zip';
+  const macAppPath = path.resolve(process.cwd(), '../macos-app/releases', macAppName);
+  app.get('/downloads/Bitbucket-PR-Approver-0.3.0-macOS.zip', async (_request, reply) => {
+    if (!fs.existsSync(macAppPath)) {
+      return reply.status(404).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app download is unavailable' } });
+    }
+    reply.header('Content-Disposition', `attachment; filename="${macAppName}"`);
+    reply.header('Cache-Control', 'public, max-age=3600');
+    reply.header('Content-Length', fs.statSync(macAppPath).size);
+    reply.type('application/zip');
+    return reply.send(fs.createReadStream(macAppPath));
+  });
+
   const packagePath = path.resolve(process.cwd(), '../worker/dist-packages', FILE_NAME);
   const portableResources = new Map([
     ['setup', { path: path.resolve(process.cwd(), '../worker/install/macos/portable-setup.sh'), type: 'text/plain' }],

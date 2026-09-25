@@ -66,11 +66,37 @@ private struct Job: Identifiable, Decodable {
 
 private struct ExecutionLog: Identifiable, Decodable {
     let id: String
+    let executionId: String
     let jobId: String
     let status: String
     let timestamp: String
     let repository: String?
     let prTitle: String?
+    let failureReason: String?
+}
+
+private struct WorkerRun: Identifiable, Decodable {
+    var id: String { executionId }
+    let executionId: String
+    let jobId: String
+    let jobName: String
+    let workerId: String
+    let trigger: String
+    let status: String
+    let createdAt: String
+    let startedAt: String?
+    let completedAt: String?
+    let result: RunSummary?
+}
+
+private struct RunSummary: Decodable {
+    let repositoriesScanned: Int
+    let pullRequestsScanned: Int
+    let matched: Int
+    let approved: Int
+    let skipped: Int
+    let failed: Int
+    let alreadyApproved: Int
     let failureReason: String?
 }
 
@@ -152,11 +178,14 @@ private struct JobDraft {
     @Published var password = ""
     @Published var authenticated = false
     @Published var busy = false
+    @Published var needsReauth = false
     @Published var message = ""
     @Published var accounts: [Account] = []
     @Published var workers: [Worker] = []
     @Published var jobs: [Job] = []
     @Published var logs: [ExecutionLog] = []
+    @Published var runs: [WorkerRun] = []
+    @Published var runHistoryAvailable = true
     private var csrf = ""
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
@@ -172,7 +201,29 @@ private struct JobDraft {
         return url
     }
 
-    private func call<T: Decodable>(_ method: String, _ path: String, _ body: [String: Any]? = nil) async throws -> T {
+    private func localWorkerConfiguration() -> (url: URL, keychainAccount: String) {
+        let support = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/BitbucketPRWorker")
+        let legacy = support.appendingPathComponent("config.json")
+        if let data = try? Data(contentsOf: legacy),
+           let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let saved = config["controlPlaneUrl"] as? String,
+           URL(string: saved)?.originString == origin?.originString {
+            return (legacy, "default")
+        }
+        return (support.appendingPathComponent("gui-cloud/config.json"), "gui-cloud")
+    }
+
+    var localWorkerId: String? {
+        let configURL = localWorkerConfiguration().url
+        guard let data = try? Data(contentsOf: configURL),
+              let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let saved = config["controlPlaneUrl"] as? String,
+              URL(string: saved)?.originString == origin?.originString else { return nil }
+        return config["workerId"] as? String
+    }
+
+    private func call<T: Decodable>(_ method: String, _ path: String, _ body: [String: Any]? = nil, emptyValue: T? = nil) async throws -> T {
         guard let base = origin, let url = URL(string: path, relativeTo: base)?.absoluteURL else {
             throw NSError(domain: "App", code: 1, userInfo: [NSLocalizedDescriptionKey: "Dùng HTTPS, hoặc HTTP trên localhost."])
         }
@@ -187,7 +238,8 @@ private struct JobDraft {
         let (data, response) = try await session.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 500
         let envelope = try? JSONDecoder().decode(Envelope<T>.self, from: data)
-        guard (200..<300).contains(status), envelope?.success == true, let value = envelope?.data else {
+        guard (200..<300).contains(status), envelope?.success == true, let value = envelope?.data ?? emptyValue else {
+            if (status == 401 || status == 403) && path != "/api/session/login" { needsReauth = true }
             let detail: String
             if status == 404 && path.hasPrefix("/api/accounts") {
                 detail = "Server chưa có API account (HTTP 404). Cần deploy backend mới lên Coolify rồi thử lại."
@@ -209,7 +261,7 @@ private struct JobDraft {
             let session: SessionData = try await (password.isEmpty
                 ? call("GET", "/api/session")
                 : call("POST", "/api/session/login", ["password": password]))
-            csrf = session.csrfToken; password = ""; authenticated = true
+            csrf = session.csrfToken; password = ""; authenticated = true; needsReauth = false
             UserDefaults.standard.set(server, forKey: "controlPlaneOrigin")
             await refresh()
         } catch { message = error.localizedDescription }
@@ -217,18 +269,46 @@ private struct JobDraft {
     }
 
     func refresh() async {
-        guard authenticated else { return }
+        guard authenticated && !needsReauth else { return }
         do {
             accounts = try await call("GET", "/api/accounts")
             workers = try await call("GET", "/api/workers")
             jobs = try await call("GET", "/api/jobs")
-            logs = try await call("GET", "/api/worker-logs?limit=100")
+            if let workerId = localWorkerId {
+                do {
+                    runs = try await call("GET", "/api/worker-executions?limit=300&workerId=\(workerId)")
+                    runHistoryAvailable = true
+                } catch {
+                    if (error as NSError).code == 404 {
+                        runs = []
+                        runHistoryAvailable = false
+                    } else { throw error }
+                }
+                logs = try await call("GET", "/api/worker-logs?limit=300&workerId=\(workerId)")
+            } else {
+                runs = []
+                logs = []
+            }
         } catch { message = error.localizedDescription }
+    }
+
+    func reauthenticate(_ ownerPassword: String) async -> Bool {
+        busy = true; defer { busy = false }
+        do {
+            let session: SessionData = try await call("POST", "/api/session/login", ["password": ownerPassword])
+            csrf = session.csrfToken
+            needsReauth = false
+            message = "Đã đăng nhập lại."
+            return true
+        } catch {
+            message = error.localizedDescription
+            return false
+        }
     }
 
     func logout() async {
         let _: EmptyData? = try? await call("POST", "/api/session/logout", [:])
-        csrf = ""; authenticated = false; accounts = []; workers = []; jobs = []; logs = []
+        csrf = ""; authenticated = false; needsReauth = false; accounts = []; workers = []; jobs = []; logs = []; runs = []; runHistoryAvailable = true
         message = ""
     }
 
@@ -257,6 +337,7 @@ private struct JobDraft {
 
     func saveJob(_ draft: JobDraft) async -> Bool {
         guard !draft.accountId.isEmpty, !draft.workerId.isEmpty else { message = "Chọn account và Mac Worker."; return false }
+        guard draft.workerId == localWorkerId else { message = "Chỉ được chọn Worker đã ghép trên Mac này."; return false }
         busy = true; defer { busy = false }
         do {
             let path = draft.id.map { "/api/jobs/\($0)" } ?? "/api/jobs"
@@ -267,9 +348,14 @@ private struct JobDraft {
     }
 
     func runJob(_ job: Job) async {
+        guard job.executionMode == "worker", let workerId = job.workerId,
+              workerId == localWorkerId, !(job.accountId ?? "").isEmpty else {
+            message = "Job này chưa gắn account và Worker của Mac này. Bấm Thiết lập Mac để chuyển từ chế độ Server; không chạy trên Coolify."
+            return
+        }
         do {
-            let _: EmptyData = try await call("POST", "/api/jobs/\(job.id)/run-now", [:])
-            message = "Đã đưa job vào hàng đợi của Mac Worker."
+            let _: EmptyData = try await call("POST", "/api/jobs/\(job.id)/run-now", [:], emptyValue: EmptyData(removed: nil, executionId: nil))
+            message = "Đã đưa lệnh đến Worker trên Mac này. Bitbucket chỉ được gọi từ Mac; xem trạng thái trong Logs."
             await refresh()
         } catch { message = error.localizedDescription }
     }
@@ -310,8 +396,8 @@ private struct JobDraft {
             if FileManager.default.fileExists(atPath: oldPackageAgent.path) || FileManager.default.fileExists(atPath: oldPackageApp.path) {
                 throw NSError(domain: "Worker", code: 7, userInfo: [NSLocalizedDescriptionKey: "LaunchAgent của Worker .pkg đang tồn tại. Hãy dừng/gỡ Worker cũ trước để tránh chạy hai bản cùng lúc."])
             }
-            let support = home.appendingPathComponent("Library/Application Support/BitbucketPRWorker")
-            let terminalPID = support.appendingPathComponent("terminal-pid")
+            let existingSupport = home.appendingPathComponent("Library/Application Support/BitbucketPRWorker")
+            let terminalPID = existingSupport.appendingPathComponent("terminal-pid")
             if let raw = try? String(contentsOf: terminalPID, encoding: .utf8), let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)), kill(pid, 0) == 0 {
                 throw NSError(domain: "Worker", code: 6, userInfo: [NSLocalizedDescriptionKey: "Worker đang chạy trong Terminal. Đóng cửa sổ đó trước khi bật chạy nền."])
             }
@@ -323,7 +409,7 @@ private struct JobDraft {
             if FileManager.default.fileExists(atPath: pinnedOrigin.path) {
                 let saved = try String(contentsOf: pinnedOrigin, encoding: .utf8)
                 guard URL(string: saved)?.originString == origin.originString else {
-                    throw NSError(domain: "Worker", code: 3, userInfo: [NSLocalizedDescriptionKey: "Worker hiện ghép với server khác. Không tự ghi đè cấu hình cũ."])
+                    throw NSError(domain: "Worker", code: 3, userInfo: [NSLocalizedDescriptionKey: "Portable Worker hiện dùng server khác. Không tự ghi đè launcher cũ."])
                 }
                 setupNeeded = (try? String(contentsOf: protocolVersion, encoding: .utf8)) != "2"
             }
@@ -331,11 +417,14 @@ private struct JobDraft {
                 guard let setup = Bundle.main.resourceURL?.appendingPathComponent("portable-setup.sh") else { throw NSError(domain: "Worker", code: 4) }
                 try await runProcess(URL(fileURLWithPath: "/bin/zsh"), [setup.path, origin.originString])
             }
-            let configURL = support.appendingPathComponent("config.json")
+            let workerConfiguration = localWorkerConfiguration()
+            let configURL = workerConfiguration.url
+            let support = configURL.deletingLastPathComponent()
             let node = resources.appendingPathComponent("node")
             let bundle = resources.appendingPathComponent("worker-bundle.mjs")
             let helper = resources.appendingPathComponent("keychain-helper")
-            let env = ["BITBUCKET_WORKER_DATA_DIR": support.path, "BITBUCKET_WORKER_KEYCHAIN_HELPER": helper.path]
+            let env = ["BITBUCKET_WORKER_DATA_DIR": support.path, "BITBUCKET_WORKER_KEYCHAIN_HELPER": helper.path,
+                       "BITBUCKET_WORKER_KEYCHAIN_ACCOUNT": workerConfiguration.keychainAccount]
             if FileManager.default.fileExists(atPath: configURL.path) {
                 let raw = try Data(contentsOf: configURL)
                 let config = try JSONSerialization.jsonObject(with: raw) as? [String: Any]
@@ -402,6 +491,7 @@ private struct AppView: View {
     @State private var jobError = ""
     @State private var accountSubmitting = false
     @State private var jobSubmitting = false
+    @State private var ownerPassword = ""
     @State private var accountToDelete: Account?
     @State private var jobToDelete: Job?
 
@@ -427,7 +517,7 @@ private struct AppView: View {
             }
         } message: { Text("Job sẽ ngừng được xếp lịch. Lượt đã nhận/chờ Worker vẫn có thể hoàn tất; không thể khôi phục job từ GUI.") }
         .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { _ in
-            if model.authenticated { Task { await model.refresh() } }
+            if model.authenticated && !model.needsReauth && !model.busy { Task { await model.refresh() } }
         }
     }
 
@@ -497,14 +587,14 @@ private struct AppView: View {
     private var accounts: some View {
         VStack(alignment: .leading) {
             HStack { Text("Bitbucket accounts").font(.title2.bold()); Spacer()
-                Button { draftAccount = AccountDraft(); accountError = ""; showingAccount = true } label: { Label("Thêm account", systemImage: "plus") }.buttonStyle(.borderedProminent) }
+                Button { draftAccount = AccountDraft(); accountError = ""; ownerPassword = ""; showingAccount = true } label: { Label("Thêm account", systemImage: "plus") }.buttonStyle(.borderedProminent) }
             Text("Token không được tải ngược về Mac sau khi lưu. Để đổi token, mở account và nhập token mới.").font(.caption).foregroundStyle(.secondary)
             List(model.accounts) { account in
                 HStack {
                     Image(systemName: "key.fill").foregroundStyle(.blue)
                     VStack(alignment: .leading) { Text(account.name).font(.headline); Text("\(account.username ?? "Bearer") • \(account.tokenPreview)").font(.caption).foregroundStyle(.secondary) }
                     Spacer()
-                    Button("Sửa / đổi token") { draftAccount = AccountDraft(account); accountError = ""; showingAccount = true }
+                    Button("Sửa / đổi token") { draftAccount = AccountDraft(account); accountError = ""; ownerPassword = ""; showingAccount = true }
                     Button(role: .destructive) { accountToDelete = account } label: { Image(systemName: "trash") }
                 }.padding(.vertical, 5)
             }
@@ -525,41 +615,66 @@ private struct AppView: View {
             if !accountError.isEmpty {
                 Text(accountError).foregroundStyle(.red).font(.callout).accessibilityLabel("Lỗi lưu account: \(accountError)")
             }
+            if model.needsReauth {
+                SecureField("Owner password để đăng nhập lại", text: $ownerPassword)
+                    .textFieldStyle(.roundedBorder)
+                Text("Phiên hết hạn sau khi server khởi động lại. Đăng nhập lại rồi app sẽ thử lưu, không xóa token đang nhập.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             HStack {
                 if accountSubmitting { ProgressView().controlSize(.small); Text("Đang lưu…").font(.caption) }
                 Spacer()
                 Button("Hủy") { showingAccount = false }.disabled(accountSubmitting)
-                Button("Lưu") {
+                Button(model.needsReauth ? "Đăng nhập & lưu" : "Lưu") {
                     accountError = ""; accountSubmitting = true
                     Task {
+                        if model.needsReauth {
+                            let loggedIn = await model.reauthenticate(ownerPassword)
+                            ownerPassword = ""
+                            if !loggedIn { accountSubmitting = false; accountError = model.message; return }
+                        }
                         let saved = await model.saveAccount(draftAccount)
                         accountSubmitting = false
                         if saved { draftAccount.token = ""; showingAccount = false }
                         else { accountError = model.message }
                     }
                 }.buttonStyle(.borderedProminent)
-                    .disabled(accountSubmitting || model.busy || draftAccount.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (draftAccount.id == nil && draftAccount.token.isEmpty))
+                    .disabled(accountSubmitting || model.busy || (model.needsReauth && ownerPassword.isEmpty) || draftAccount.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (draftAccount.id == nil && draftAccount.token.isEmpty))
             }
           }.padding()
-        }.frame(width: 520, height: 380)
+        }.frame(width: 520, height: model.needsReauth ? 440 : 380)
     }
 
     private var jobs: some View {
         VStack(alignment: .leading) {
             HStack { Text("Approval jobs").font(.title2.bold()); Spacer()
-                Button { draftJob = JobDraft(); jobError = ""; showingJob = true } label: { Label("Tạo job", systemImage: "plus") }.buttonStyle(.borderedProminent) }
+                Button { draftJob = JobDraft(); draftJob.workerId = model.localWorkerId ?? ""; jobError = ""; ownerPassword = ""; showingJob = true } label: { Label("Tạo job", systemImage: "plus") }.buttonStyle(.borderedProminent) }
+            Text("Chỉ job gán đúng Worker của Mac này mới được Run từ ứng dụng. Job Server cũ cần chuyển sang Mac Worker; khi chuyển sẽ tạm dừng và bật Dry Run để kiểm tra trước.")
+                .font(.caption).foregroundStyle(.secondary)
             List(model.jobs) { job in
                 HStack {
                     Image(systemName: job.enabled ? "bolt.circle.fill" : "pause.circle.fill").foregroundStyle(job.enabled ? .green : .orange)
                     VStack(alignment: .leading, spacing: 4) {
                         Text(job.name).font(.headline)
-                        Text("\(model.accounts.first { $0.id == job.accountId }?.name ?? "Token cũ") • \(job.dryRun ? "Dry Run" : "Live") • mỗi \(job.intervalSeconds)s")
+                        Text("\(job.executionMode == "worker" ? "Mac Worker" : "Server") • \(model.accounts.first { $0.id == job.accountId }?.name ?? "Token cũ") • \(job.dryRun ? "Dry Run" : "Live") • mỗi \(job.intervalSeconds)s")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("Run") { Task { await model.runJob(job) } }
+                    if job.executionMode == "worker", job.workerId == model.localWorkerId, !(job.accountId ?? "").isEmpty {
+                        Button("Run") { Task { await model.runJob(job) } }
+                    } else {
+                        Button("Thiết lập Mac") {
+                            draftJob = JobDraft(job)
+                            draftJob.workerId = model.localWorkerId ?? ""
+                            draftJob.enabled = false
+                            draftJob.dryRun = true
+                            jobError = "Chọn Bitbucket account và Worker của Mac này. Job sẽ được tạm dừng, chạy Dry Run trước khi bật lịch/approve thật."
+                            ownerPassword = ""
+                            showingJob = true
+                        }
+                    }
                     Button(job.enabled ? "Pause" : "Resume") { Task { await model.toggle(job) } }
-                    Button("Sửa") { draftJob = JobDraft(job); jobError = ""; showingJob = true }
+                    Button("Sửa") { draftJob = JobDraft(job); jobError = ""; ownerPassword = ""; showingJob = true }
                     Button(role: .destructive) { jobToDelete = job } label: { Image(systemName: "trash") }
                 }.padding(.vertical, 5)
             }
@@ -578,9 +693,13 @@ private struct AppView: View {
             }
             Picker("Mac Worker", selection: $draftJob.workerId) {
                 Text("Chọn Worker").tag("")
-                ForEach(model.workers.filter { $0.revokedAt == nil }) { worker in
+                ForEach(model.workers.filter { $0.revokedAt == nil && $0.id == model.localWorkerId }) { worker in
                     Text("\(worker.name) (\(worker.state)\(worker.supportsAccountLeases == true ? "" : ", cần nâng cấp"))").tag(worker.id)
                 }
+            }
+            if model.localWorkerId == nil {
+                Text("Mac này chưa ghép Worker với server đang chọn. Vào tab Mac Worker để ghép đôi trước.")
+                    .font(.caption).foregroundStyle(.orange)
             }
             TextField("Repository: workspace/repo, ngăn bằng dấu phẩy", text: $draftJob.repositories)
             TextField("Target branches: dev, main, release/*", text: $draftJob.targetBranches)
@@ -602,20 +721,31 @@ private struct AppView: View {
             if !jobError.isEmpty {
                 Text(jobError).foregroundStyle(.red).font(.callout).accessibilityLabel("Lỗi lưu job: \(jobError)")
             }
+            if model.needsReauth {
+                SecureField("Owner password để đăng nhập lại", text: $ownerPassword)
+                    .textFieldStyle(.roundedBorder)
+                Text("Phiên hết hạn. Đăng nhập lại rồi app sẽ thử lưu job mà không xóa dữ liệu form.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             HStack {
                 if jobSubmitting { ProgressView().controlSize(.small); Text("Đang lưu…").font(.caption) }
                 Spacer()
                 Button("Hủy") { showingJob = false }.disabled(jobSubmitting)
-                Button("Lưu job") {
+                Button(model.needsReauth ? "Đăng nhập & lưu job" : "Lưu job") {
                     jobError = ""; jobSubmitting = true
                     Task {
+                        if model.needsReauth {
+                            let loggedIn = await model.reauthenticate(ownerPassword)
+                            ownerPassword = ""
+                            if !loggedIn { jobSubmitting = false; jobError = model.message; return }
+                        }
                         let saved = await model.saveJob(draftJob)
                         jobSubmitting = false
                         if saved { showingJob = false }
                         else { jobError = model.message }
                     }
                 }.buttonStyle(.borderedProminent)
-                    .disabled(jobSubmitting || model.busy || draftJob.name.isEmpty || draftJob.repositories.split(separator: ",").allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } || draftJob.accountId.isEmpty || draftJob.workerId.isEmpty)
+                    .disabled(jobSubmitting || model.busy || (model.needsReauth && ownerPassword.isEmpty) || draftJob.name.isEmpty || draftJob.repositories.split(separator: ",").allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } || draftJob.accountId.isEmpty || draftJob.workerId.isEmpty)
             }
           }.padding()
         }.frame(width: 680, height: 640)
@@ -628,7 +758,11 @@ private struct AppView: View {
                 .foregroundStyle(.secondary)
             Button { Task { await model.connectWorker() } } label: { Label("Ghép đôi & chạy nền trên Mac này", systemImage: "desktopcomputer.and.arrow.down") }
                 .buttonStyle(.borderedProminent).disabled(model.busy)
-            List(model.workers) { item in
+            if model.localWorkerId == nil {
+                Text("Mac này chưa ghép với Control Plane hiện tại. Bấm nút trên để tạo Worker local; cấu hình Worker localhost cũ sẽ được giữ riêng.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            List(model.workers.filter { $0.id == model.localWorkerId }) { item in
                 HStack { Image(systemName: "desktopcomputer"); Text(item.name); Spacer(); Text(item.supportsAccountLeases == true ? item.state : "Cần nâng cấp Worker").foregroundStyle(item.state == "ONLINE" && item.supportsAccountLeases == true ? .green : .orange) }
             }
             Text("Nếu VPN mất kết nối, Worker tạm dừng và thử lại khi đường Bitbucket hoạt động. Đóng GUI không dừng LaunchAgent.")
@@ -638,16 +772,46 @@ private struct AppView: View {
 
     private var logs: some View {
         VStack(alignment: .leading) {
-            Text("Execution logs").font(.title2.bold())
-            List(model.logs) { item in
-                HStack {
-                    Image(systemName: item.status == "APPROVED" ? "checkmark.circle.fill" : "doc.text").foregroundStyle(item.status == "APPROVED" ? .green : .secondary)
-                    VStack(alignment: .leading) {
-                        Text("\(item.status) • \(item.repository ?? "Worker") • \(item.prTitle ?? "Job \(item.jobId.prefix(8))")")
-                        if let reason = item.failureReason { Text(reason).font(.caption).foregroundStyle(.secondary) }
+            Text("Lượt chạy Worker").font(.title2.bold())
+            if !model.runHistoryAvailable {
+                Text("Server chưa có API lịch sử lượt chạy. Cần deploy backend mới lên Coolify.")
+                    .font(.callout).foregroundStyle(.orange)
+            }
+            Text("Mỗi lượt chạy có một record riêng, kể cả khi không có PR khớp. Mở record để xem kết quả và log PR.")
+                .font(.caption).foregroundStyle(.secondary)
+            List {
+                if model.runs.isEmpty {
+                    Text("Chưa có lượt chạy Worker. Job chạy trên server không xuất hiện ở đây.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(model.runs) { run in
+                    DisclosureGroup {
+                        Text("Execution: \(run.executionId)").font(.caption.monospaced()).textSelection(.enabled)
+                        Text("Worker: \(run.workerId) • \(run.trigger)").font(.caption).foregroundStyle(.secondary)
+                        if let result = run.result {
+                            Text("Repo \(result.repositoriesScanned) • PR \(result.pullRequestsScanned) • Khớp \(result.matched) • Approve \(result.approved) • Bỏ qua \(result.skipped) • Lỗi \(result.failed)")
+                                .font(.caption)
+                            if let reason = result.failureReason { Text(reason).font(.caption).foregroundStyle(.red) }
+                        }
+                        let details = model.logs.filter { $0.executionId == run.executionId }
+                        if details.isEmpty { Text("Không có log PR trong lượt này.").font(.caption).foregroundStyle(.secondary) }
+                        ForEach(details) { item in
+                            VStack(alignment: .leading) {
+                                Text("\(item.status) • \(item.repository ?? "Worker") • \(item.prTitle ?? "PR")")
+                                if let reason = item.failureReason { Text(reason).font(.caption).foregroundStyle(.secondary) }
+                            }.padding(.vertical, 3)
+                        }
+                    } label: {
+                        HStack {
+                            Image(systemName: run.status == "COMPLETED" ? "checkmark.circle.fill" : run.status == "FAILED" ? "xmark.circle.fill" : "clock")
+                                .foregroundStyle(run.status == "COMPLETED" ? .green : run.status == "FAILED" ? .red : .orange)
+                            VStack(alignment: .leading) {
+                                Text("\(run.jobName) • \(run.status)").font(.headline)
+                                Text(run.createdAt).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
                     }
-                    Spacer(); Text(item.timestamp).font(.caption).foregroundStyle(.secondary)
-                }.padding(.vertical, 4)
+                }
             }
         }.padding()
     }

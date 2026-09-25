@@ -61,6 +61,23 @@ async function run(): Promise<void> {
   let lastLease: ExecutionLease | null = null;
   let stopped = false;
   let workTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastControlPlaneFailure: string | undefined;
+
+  const reportControlPlaneFailure = (stage: string, error: any) => {
+    const code = typeof error?.code === 'string' && /^[A-Z0-9_]+$/.test(error.code)
+      ? error.code : error?.name || 'REQUEST_FAILED';
+    const status = Number.isInteger(error?.statusCode) ? error.statusCode : undefined;
+    const signature = `${stage}:${code}:${status || ''}`;
+    if (signature !== lastControlPlaneFailure) {
+      const frame = typeof error?.stack === 'string'
+        ? error.stack.match(/worker-bundle\.mjs:\d+:\d+/)?.[0] : undefined;
+      const endpoint = typeof error?.endpoint === 'string' ? ` ${error.endpoint}` : '';
+      const response = typeof error?.responseType === 'string'
+        ? `; response ${error.responseType}/${error.responseKind || 'unknown'} ${error.responseBytes ?? '?'} bytes at ${error.responsePath || 'unknown'}` : '';
+      console.error(`Control plane ${stage}${endpoint} failed: ${code}${status ? ` (HTTP ${status})` : ''}${response}${frame ? ` at ${frame}` : ''}`);
+      lastControlPlaneFailure = signature;
+    }
+  };
 
   const synchronizeToken = async () => {
     const envelope = await client.claimTokenEnvelope();
@@ -112,7 +129,7 @@ async function run(): Promise<void> {
 
   const heartbeat = async () => {
     try {
-      await client.heartbeat({
+      const request = {
         state: stateMachine.currentState,
         version: config.version,
         platform: 'darwin',
@@ -121,9 +138,21 @@ async function run(): Promise<void> {
         queueDepth: outbox.size(),
         hasLegacyToken: Boolean(bitbucketToken),
         supportsAccountLeases: true,
-      });
+      } as const;
+      await client.heartbeat(request);
+      // Account-bound Workers do not have a legacy Bitbucket token. A healthy
+      // control-plane heartbeat must still move them out of STARTING/OFFLINE.
+      if (!bitbucketToken && ['STARTING', 'OFFLINE_CONTROL_PLANE'].includes(stateMachine.currentState)) {
+        recordProbe(true);
+        // Publish the recovered state before the next claim; otherwise a claim
+        // can receive WORKER_NOT_ONLINE and send this Worker offline again.
+        await client.heartbeat({ ...request, state: stateMachine.currentState });
+      }
+      if (lastControlPlaneFailure) console.info('Control plane connection restored');
+      lastControlPlaneFailure = undefined;
       updater.markHealthy();
-    } catch {
+    } catch (error: any) {
+      reportControlPlaneFailure('heartbeat', error);
       stateMachine.markControlPlaneOffline();
     }
   };
@@ -214,7 +243,8 @@ async function run(): Promise<void> {
           }
         }
       }
-    } catch {
+    } catch (error: any) {
+      reportControlPlaneFailure('work loop', error);
       stateMachine.markControlPlaneOffline();
       delay = Math.min(Math.max(delay * 2, 10_000), 60_000);
     }

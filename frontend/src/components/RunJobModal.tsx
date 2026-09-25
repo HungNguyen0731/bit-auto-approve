@@ -20,6 +20,7 @@ export function RunJobModal({ jobs, initialJobId, busy, onClose, onRun }: {
   const [token, setToken] = useState('');
   const [remember, setRemember] = useState(false);
   const [error, setError] = useState('');
+  const legacyServerJob = jobs.find((job) => job.id === jobId)?.executionMode !== 'worker';
 
   useEffect(() => {
     try {
@@ -35,7 +36,7 @@ export function RunJobModal({ jobs, initialJobId, busy, onClose, onRun }: {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (!jobId || !token.trim()) return;
+    if (!jobId || !token.trim() || legacyServerJob) return;
     setError('');
     try {
       if (remember) localStorage.setItem(STORAGE_KEY, JSON.stringify({ username: username.trim(), token: token.trim() }));
@@ -56,9 +57,10 @@ export function RunJobModal({ jobs, initialJobId, busy, onClose, onRun }: {
         </div>
         <label className="block text-sm font-medium">Job
           <select required value={jobId} onChange={(e) => setJobId(e.target.value)} className="mt-1 w-full rounded-xl border border-app-line bg-white p-2.5">
-            {jobs.map((job) => <option key={job.id} value={job.id}>{job.name} ({job.executionMode === 'worker' ? 'Local Worker' : 'Server'})</option>)}
+            {jobs.map((job) => <option key={job.id} value={job.id}>{job.name} ({job.executionMode === 'worker' ? 'Local Worker' : 'Legacy Server — unavailable'})</option>)}
           </select>
         </label>
+        {legacyServerJob && <p role="alert" className="text-sm text-amber-800">This job must be moved to a paired Mac Worker before Run. Coolify cannot call Bitbucket for it.</p>}
         <label className="block text-sm font-medium">Bitbucket username (optional for bearer token)
           <input value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="username" maxLength={320} className="mt-1 w-full rounded-xl border border-app-line p-2.5" />
         </label>
@@ -72,7 +74,7 @@ export function RunJobModal({ jobs, initialJobId, busy, onClose, onRun }: {
         {error && <p role="alert" className="text-sm text-red-700">{error}</p>}
         <div className="flex justify-end gap-2">
           <button type="button" disabled={busy} onClick={onClose} className="rounded-xl border border-app-line px-4 py-2">Cancel</button>
-          <button type="submit" disabled={busy || !jobId || !token.trim()} className="rounded-xl bg-brand-700 px-4 py-2 font-semibold text-white disabled:opacity-50">{busy ? 'Starting…' : 'Run selected job'}</button>
+          <button type="submit" disabled={busy || !jobId || !token.trim() || legacyServerJob} className="rounded-xl bg-brand-700 px-4 py-2 font-semibold text-white disabled:opacity-50">{busy ? 'Starting…' : 'Run selected job'}</button>
         </div>
       </form>
     </div>

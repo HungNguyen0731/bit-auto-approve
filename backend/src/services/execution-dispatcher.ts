@@ -273,6 +273,7 @@ export class ExecutionDispatcher {
       ...current,
       status: result.status,
       completedAt: result.completedAt,
+      result,
       leasedUntil: undefined,
       manualTokenCiphertext: ['COMPLETED', 'FAILED'].includes(result.status) ? undefined : current.manualTokenCiphertext,
       accountTokenCiphertext: ['COMPLETED', 'FAILED'].includes(result.status) ? undefined : current.accountTokenCiphertext,

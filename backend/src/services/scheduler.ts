@@ -151,6 +151,9 @@ export class SchedulerService {
           this.executionDispatcher?.schedule(job, new Date(now));
           continue;
         }
+        // Coolify is only a control plane. Legacy Server jobs must be explicitly
+        // migrated to a paired Mac Worker before they can run again.
+        if (process.env.NODE_ENV === 'production') continue;
         if (!config?.token) continue;
         // Execute job in background
         this.executeJob(job.id).catch(() => {});
@@ -177,6 +180,11 @@ export class SchedulerService {
   async executeJob(jobId: string, force: boolean = false, manualCredential?: { token: string; username?: string }): Promise<void> {
     const job = this.storage.getJobById(jobId);
     if (!job) return;
+    if (process.env.NODE_ENV === 'production') {
+      throw Object.assign(new Error('Bitbucket jobs must run on an assigned Mac Worker, not the control plane'), {
+        code: 'LOCAL_WORKER_REQUIRED',
+      });
+    }
     if (this.executingJobIds.has(jobId) && !force) return;
 
     this.executingJobIds.add(jobId);

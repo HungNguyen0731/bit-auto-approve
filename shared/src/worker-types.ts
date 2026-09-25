@@ -119,6 +119,20 @@ export interface ExecutionLease {
   bitbucketConfig: Omit<BitbucketConnectionConfig, 'token'>;
   manualTokenCiphertext?: string;
   accountTokenCiphertext?: string;
+  result?: ExecutionResultSummary;
+}
+
+export interface WorkerRunRecord {
+  executionId: string;
+  jobId: string;
+  jobName: string;
+  workerId: string;
+  trigger: ExecutionTrigger;
+  status: ExecutionStatus;
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  result?: ExecutionResultSummary;
 }
 
 export interface ClaimResponse {
