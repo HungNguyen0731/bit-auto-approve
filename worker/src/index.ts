@@ -119,6 +119,8 @@ async function run(): Promise<void> {
         architecture: os.arch(),
         activeExecutionId,
         queueDepth: outbox.size(),
+        hasLegacyToken: Boolean(bitbucketToken),
+        supportsAccountLeases: true,
       });
       updater.markHealthy();
     } catch {
@@ -153,8 +155,9 @@ async function run(): Promise<void> {
       }
       if (stateMachine.currentState === 'PAUSED_VPN' && lastLease) {
         try {
-          const probeToken = lastLease.manualTokenCiphertext
-            ? await identityStore.decryptEnvelope(lastLease.manualTokenCiphertext)
+          const encryptedToken = lastLease.accountTokenCiphertext || lastLease.manualTokenCiphertext;
+          const probeToken = encryptedToken
+            ? await identityStore.decryptEnvelope(encryptedToken)
             : bitbucketToken;
           if (!probeToken) throw Object.assign(new Error('Missing token'), { code: 'AUTH_INVALID_TOKEN' });
           await executor.probe(lastLease, probeToken);
@@ -163,7 +166,6 @@ async function run(): Promise<void> {
           delay = recordProbe(false, error.code || 'NETWORK_OFFLINE').nextProbeDelayMs;
         }
       } else if (['ONLINE', 'STARTING', 'ERROR_AUTH'].includes(stateMachine.currentState)) {
-        if (!bitbucketToken && stateMachine.currentState === 'ONLINE') recordProbe(false, 'AUTH_INVALID_TOKEN');
         await flushOutbox();
         const claim = await client.claim(!bitbucketToken);
         if (claim.lease) {
@@ -171,8 +173,9 @@ async function run(): Promise<void> {
           activeExecutionId = claim.lease.executionId;
           await client.renew(claim.lease.executionId);
           try {
-            const executionToken = claim.lease.manualTokenCiphertext
-              ? await identityStore.decryptEnvelope(claim.lease.manualTokenCiphertext)
+            const encryptedToken = claim.lease.accountTokenCiphertext || claim.lease.manualTokenCiphertext;
+            const executionToken = encryptedToken
+              ? await identityStore.decryptEnvelope(encryptedToken)
               : bitbucketToken;
             if (!executionToken) throw Object.assign(new Error('Missing token'), { code: 'AUTH_INVALID_TOKEN' });
             const result = await executor.execute(claim.lease, executionToken);
@@ -180,11 +183,11 @@ async function run(): Promise<void> {
             await flushOutbox();
             await client.complete(claim.lease.executionId, result.summary);
             lastLease = null;
-            if (!claim.lease.manualTokenCiphertext || bitbucketToken) recordProbe(true);
+            recordProbe(true);
           } catch (error: any) {
             const classification = error.code || 'WORKER_EXECUTION_FAILED';
             const networkFailure = ['VPN_REQUIRED', 'NETWORK_OFFLINE', 'IP_ALLOWLIST'].includes(classification);
-            const transition = claim.lease.manualTokenCiphertext && !networkFailure
+            const transition = (claim.lease.manualTokenCiphertext || claim.lease.accountTokenCiphertext) && !networkFailure
               ? { state: stateMachine.currentState, nextProbeDelayMs: config.claimIntervalMs }
               : recordProbe(false, classification);
             await client.complete(claim.lease.executionId, {

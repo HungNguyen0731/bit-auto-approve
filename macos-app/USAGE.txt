@@ -1,0 +1,34 @@
+Bitbucket PR Approver for macOS
+================================
+
+Ứng dụng SwiftUI này thay thế thao tác cấu hình job qua website. Người dùng nhập
+URL HTTPS của Control Plane và Owner password trong cửa sổ Mac, tạo các
+Bitbucket account (tên, username nếu dùng Basic, token), chọn account + Mac
+Worker cho từng job, cấu hình bộ lọc và chu kỳ, rồi bật chạy nền. Token được
+mã hóa trên server; cửa sổ Mac chỉ nhận tên và phần token đã che. Owner password
+và token không được lưu vào UserDefaults.
+
+Trên Mac có Apple Command Line Tools, từ repo chạy:
+
+  /bin/zsh macos-app/build.sh
+  /usr/bin/open "macos-app/dist/Bitbucket PR Approver.app"
+
+Trong tab Mac Worker, chọn "Ghép đôi & chạy nền trên Mac này". Ứng dụng tải
+portable Worker từ Control Plane HTTPS, ghép đôi và tạo LaunchAgent trong
+~/Library/LaunchAgents để Worker tiếp tục chạy sau khi đóng GUI và tự khởi
+động khi đăng nhập Mac. Nếu Mac đã ghép với server khác hoặc Worker đang chạy
+trong Terminal/.pkg, ứng dụng dừng và yêu cầu xử lý bản cũ; không ghi đè pairing.
+Mac vẫn cần VPN hoặc IP allowlist khi Bitbucket yêu cầu.
+
+Job mới mặc định Dry Run. Kiểm tra log rồi mới tắt Dry Run để approve thật.
+Token chưa được xác minh tại lúc lưu account; lỗi xác thực sẽ xuất hiện khi Worker
+thực hiện job. Xóa job không hủy lượt đã nhận hoặc đang chờ Worker.
+Lịch và account nằm trên Control Plane; nếu Mac tắt hoặc VPN mất, Worker không
+thể gọi Bitbucket. Job cũ không gắn account vẫn dùng token Worker Keychain theo
+luồng cũ. Owner session, account, job và log hiện dùng chung, chưa có phân quyền
+từng người. Tạo hoặc sửa account cần Owner password, và mọi kết nối ngoài
+localhost phải dùng HTTPS.
+
+Sau khi cập nhật server, bấm "Ghép đôi & chạy nền" một lần để GUI nâng cấp
+portable Worker lên phiên bản hỗ trợ account theo job. Khi triển khai lên
+Coolify, cần deploy bản server mới trước bước này.

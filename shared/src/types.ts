@@ -159,6 +159,7 @@ export interface ApprovalJob {
   dryRun: boolean; // When true, checks and logs matching PRs without actually sending approve API call
   executionMode?: 'local' | 'worker'; // Missing values remain local for backward compatibility
   workerId?: string; // Required when executionMode is worker
+  accountId?: string; // Server-stored Bitbucket credential for this Worker job
   revision?: string; // Immutable rules snapshot hash used by worker leases
   rules: JobFilterRules;
   lastRunAt?: string; // ISO 8601
@@ -268,6 +269,7 @@ export interface CreateJobDto {
   dryRun?: boolean;
   executionMode?: 'local' | 'worker';
   workerId?: string;
+  accountId?: string;
   rules: JobFilterRules;
 }
 

@@ -198,6 +198,7 @@ export class StorageService {
       dryRun: Boolean(dto.dryRun),
       executionMode: dto.executionMode ?? 'local',
       workerId: dto.executionMode === 'worker' ? dto.workerId : undefined,
+      accountId: dto.executionMode === 'worker' ? dto.accountId : undefined,
       rules: {
         repositories: dto.rules.repositories || [],
         authorWhitelist: dto.rules.authorWhitelist || [],
@@ -247,6 +248,12 @@ export class StorageService {
           : dto.workerId !== undefined
           ? dto.workerId
           : current.workerId,
+      accountId:
+        dto.executionMode === 'local'
+          ? undefined
+          : dto.accountId !== undefined
+          ? dto.accountId
+          : current.accountId,
       rules: dto.rules ? { ...current.rules, ...dto.rules } : current.rules,
       updatedAt: new Date().toISOString(),
     };

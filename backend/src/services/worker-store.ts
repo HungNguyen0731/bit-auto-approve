@@ -172,6 +172,8 @@ export class WorkerStore {
           architecture: heartbeat.architecture,
           activeExecutionId: heartbeat.activeExecutionId,
           queueDepth: heartbeat.queueDepth,
+          hasLegacyToken: heartbeat.hasLegacyToken,
+          supportsAccountLeases: heartbeat.supportsAccountLeases === true,
           lastBitbucketProbeAt: heartbeat.lastBitbucketProbeAt,
           lastHeartbeatAt: now.toISOString(),
         };

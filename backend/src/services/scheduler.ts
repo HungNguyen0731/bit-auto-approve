@@ -134,10 +134,7 @@ export class SchedulerService {
   private async tick(): Promise<void> {
     this.executionDispatcher?.markOfflineWorkers();
     const config = this.storage.getConfig();
-    if (!config || !config.baseUrl || !config.token) {
-      this.bitbucketStatus = 'UNCONFIGURED';
-      return;
-    }
+    if (!config?.token) this.bitbucketStatus = 'UNCONFIGURED';
 
     const jobs = this.storage.getJobs().filter((j) => j.enabled);
     const now = Date.now();
@@ -150,9 +147,11 @@ export class SchedulerService {
       const nextRun = job.nextRunAt ? new Date(job.nextRunAt).getTime() : 0;
       if (now >= nextRun) {
         if ((job.executionMode ?? 'local') === 'worker') {
+          if (!job.accountId && !config?.token) continue;
           this.executionDispatcher?.schedule(job, new Date(now));
           continue;
         }
+        if (!config?.token) continue;
         // Execute job in background
         this.executeJob(job.id).catch(() => {});
       }

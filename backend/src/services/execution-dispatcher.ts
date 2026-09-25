@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type {
   ApprovalJob,
+  BitbucketConnectionConfig,
   ExecutionLease,
   ExecutionResultSummary,
   ExecutionTrigger,
@@ -8,6 +9,7 @@ import type {
 import type { EventHub } from './events.js';
 import type { StorageService } from './storage.js';
 import type { WorkerStore } from './worker-store.js';
+import type { AccountStore } from './account-store.js';
 
 const LEASE_DURATION_MS = 45 * 1000;
 
@@ -32,6 +34,7 @@ function jobRevision(job: ApprovalJob): string {
         intervalSeconds: job.intervalSeconds,
         executionMode: job.executionMode ?? 'local',
         workerId: job.workerId,
+        accountId: job.accountId,
         rules: job.rules,
       })
     )
@@ -42,7 +45,8 @@ export class ExecutionDispatcher {
   constructor(
     private readonly storage: StorageService,
     private readonly workerStore: WorkerStore,
-    private readonly events: EventHub
+    private readonly events: EventHub,
+    private readonly accounts?: AccountStore
   ) {}
 
   markOfflineWorkers(now: Date = new Date()): string[] {
@@ -68,20 +72,33 @@ export class ExecutionDispatcher {
     );
     if (active) return active;
 
-    if (!worker || worker.revokedAt || worker.state !== 'ONLINE') {
+    const stateAllowed = job.accountId
+      ? worker?.supportsAccountLeases === true && ['ONLINE', 'STARTING', 'ERROR_AUTH'].includes(worker.state)
+      : worker?.state === 'ONLINE' && worker.hasLegacyToken !== false;
+    if (!worker || worker.revokedAt || !stateAllowed || !worker.lastHeartbeatAt ||
+        now.getTime() - new Date(worker.lastHeartbeatAt).getTime() > 35_000) {
       this.advanceJobSchedule(job, now);
       return null;
     }
 
     const revision = jobRevision(job);
     const config = this.storage.getConfig();
-    if (!config) {
+    if (!job.accountId && !config) {
       throw Object.assign(new Error('Bitbucket connection is not configured'), {
         code: 'CONFIG_MISSING',
         statusCode: 409,
       });
     }
-    const { token: _token, ...bitbucketConfig } = config;
+    const { token: _token, ...legacyConfig } = config || {
+      serverType: 'cloud' as const, baseUrl: 'https://api.bitbucket.org/2.0', authType: 'bearer' as const,
+    };
+    let bitbucketConfig: Omit<BitbucketConnectionConfig, 'token'> = legacyConfig;
+    if (job.accountId) {
+      if (!this.accounts) throw Object.assign(new Error('Account store is unavailable'), { code: 'ACCOUNT_STORE_UNAVAILABLE', statusCode: 503 });
+      const account = this.accounts.get(job.accountId);
+      if (!account) throw Object.assign(new Error('Bitbucket account not found'), { code: 'ACCOUNT_NOT_FOUND', statusCode: 404 });
+      bitbucketConfig = { serverType: 'cloud', baseUrl: 'https://api.bitbucket.org/2.0', authType: account.authType, username: account.username };
+    }
     const scheduledFor = trigger === 'MANUAL' ? now.toISOString() : job.nextRunAt || now.toISOString();
     const idempotencyKey = `${job.id}:${scheduledFor}:${revision}`;
     const existing = leases.find((lease) => lease.idempotencyKey === idempotencyKey);
@@ -125,7 +142,8 @@ export class ExecutionDispatcher {
     if (!worker || worker.revokedAt ||
         !worker.lastHeartbeatAt ||
         now.getTime() - new Date(worker.lastHeartbeatAt).getTime() > 35_000 ||
-        (!credential && worker.state !== 'ONLINE') ||
+        (!credential && !job.accountId && worker.state !== 'ONLINE') ||
+        (!credential && job.accountId && !['ONLINE', 'STARTING', 'ERROR_AUTH'].includes(worker.state)) ||
         (credential && !['ONLINE', 'STARTING', 'ERROR_AUTH'].includes(worker.state))) {
       throw Object.assign(new Error('Assigned local worker is not online'), {
         code: 'WORKER_NOT_ONLINE',
@@ -178,12 +196,13 @@ export class ExecutionDispatcher {
     return lease;
   }
 
-  claim(workerId: string, manualOnly = false, now: Date = new Date()): ExecutionLease | null {
+  claim(workerId: string, manualOnly = false, now: Date = new Date(), supportsAccountLeases = false): ExecutionLease | null {
     const leases = this.workerStore.getLeases();
     const available = leases.find(
       (lease) =>
         lease.workerId === workerId &&
-        (!manualOnly || Boolean(lease.manualTokenCiphertext)) &&
+        (!lease.job.accountId || Boolean(lease.manualTokenCiphertext) || supportsAccountLeases) &&
+        (!manualOnly || Boolean(lease.manualTokenCiphertext || lease.job.accountId)) &&
         (lease.status === 'QUEUED' ||
           (lease.status === 'RETRYABLE' &&
             (!lease.leasedUntil || new Date(lease.leasedUntil).getTime() <= now.getTime())) ||
@@ -193,8 +212,22 @@ export class ExecutionDispatcher {
     );
     if (!available) return null;
 
+    let accountTokenCiphertext = available.accountTokenCiphertext;
+    let bitbucketConfig = available.bitbucketConfig;
+    if (available.job.accountId && !available.manualTokenCiphertext) {
+      if (!this.accounts) throw Object.assign(new Error('Account store is unavailable'), { code: 'ACCOUNT_STORE_UNAVAILABLE', statusCode: 503 });
+      const worker = this.workerStore.getWorker(workerId);
+      if (!worker || worker.revokedAt) throw Object.assign(new Error('Worker is unavailable'), { code: 'WORKER_NOT_FOUND', statusCode: 404 });
+      const { account, token } = this.accounts.getCredential(available.job.accountId);
+      const publicKey = crypto.createPublicKey({ key: worker.publicKey, format: 'jwk' });
+      accountTokenCiphertext = crypto.publicEncrypt({ key: publicKey, oaepHash: 'sha256' }, Buffer.from(token, 'utf8')).toString('base64url');
+      bitbucketConfig = { ...bitbucketConfig, authType: account.authType, username: account.username };
+    }
+
     const claimed: ExecutionLease = {
       ...available,
+      accountTokenCiphertext,
+      bitbucketConfig,
       status: 'LEASED',
       leasedUntil: new Date(now.getTime() + LEASE_DURATION_MS).toISOString(),
       startedAt: available.startedAt || now.toISOString(),
@@ -242,6 +275,7 @@ export class ExecutionDispatcher {
       completedAt: result.completedAt,
       leasedUntil: undefined,
       manualTokenCiphertext: ['COMPLETED', 'FAILED'].includes(result.status) ? undefined : current.manualTokenCiphertext,
+      accountTokenCiphertext: ['COMPLETED', 'FAILED'].includes(result.status) ? undefined : current.accountTokenCiphertext,
     };
     this.workerStore.saveLeases(
       leases.map((lease) => (lease.executionId === result.executionId ? completed : lease))

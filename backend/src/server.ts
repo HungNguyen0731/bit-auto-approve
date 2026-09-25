@@ -10,6 +10,7 @@ import { SchedulerService } from './services/scheduler.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerConfigRoutes } from './routes/config.js';
 import { registerJobRoutes } from './routes/jobs.js';
+import { registerAccountRoutes } from './routes/accounts.js';
 import { registerLogsRoutes } from './routes/logs.js';
 import { registerPreviewRoutes } from './routes/preview.js';
 import { registerSseRoutes } from './routes/sse.js';
@@ -20,6 +21,7 @@ import { ControlPlaneAuth } from './services/control-plane-auth.js';
 import { WorkerAuth } from './services/worker-auth.js';
 import { WorkerLogStore } from './services/worker-log-store.js';
 import { WorkerStore } from './services/worker-store.js';
+import { AccountStore } from './services/account-store.js';
 import { ExecutionDispatcher } from './services/execution-dispatcher.js';
 import { registerWorkerInstallerRoutes } from './routes/worker-installer.js';
 import { ownerSessionId } from './routes/session.js';
@@ -30,6 +32,7 @@ export interface ServerInstance {
   scheduler: SchedulerService;
   events: EventHub;
   workerStore: WorkerStore;
+  accounts: AccountStore;
   workerLogs: WorkerLogStore;
   executionDispatcher: ExecutionDispatcher;
 }
@@ -102,8 +105,9 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
   const storage = new StorageService(options.dataDir);
   const events = new EventHub();
   const workerStore = new WorkerStore(storage.getDataDir());
+  const accounts = new AccountStore(storage.getDataDir());
   const workerLogs = new WorkerLogStore(storage.getDataDir());
-  const executionDispatcher = new ExecutionDispatcher(storage, workerStore, events);
+  const executionDispatcher = new ExecutionDispatcher(storage, workerStore, events, accounts);
   const scheduler = new SchedulerService(storage, events, executionDispatcher);
   const controlPlaneAuth = new ControlPlaneAuth(storage.getDataDir());
   const workerAuth = new WorkerAuth(workerStore);
@@ -135,11 +139,13 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
   // 3. Register REST API Routes
   await registerHealthRoutes(app, { scheduler });
   await registerConfigRoutes(app, { storage });
+  await registerAccountRoutes(app, { accounts, storage, workers: workerStore });
   await registerJobRoutes(app, {
     storage,
     scheduler,
     executionDispatcher,
     workerStore,
+    accounts,
   });
   await registerLogsRoutes(app, { storage });
   await registerPreviewRoutes(app, { storage });
@@ -222,6 +228,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
     scheduler,
     events,
     workerStore,
+    accounts,
     workerLogs,
     executionDispatcher,
   };

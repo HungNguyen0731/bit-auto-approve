@@ -47,6 +47,8 @@ export interface WorkerRecord extends WorkerMetadata {
   lastBitbucketProbeAt?: string;
   activeExecutionId?: string;
   queueDepth: number;
+  hasLegacyToken?: boolean;
+  supportsAccountLeases?: boolean;
   revokedAt?: string;
 }
 
@@ -84,6 +86,8 @@ export interface HeartbeatRequest {
   architecture: string;
   activeExecutionId?: string;
   queueDepth: number;
+  hasLegacyToken?: boolean;
+  supportsAccountLeases?: boolean;
   lastBitbucketProbeAt?: string;
 }
 
@@ -114,6 +118,7 @@ export interface ExecutionLease {
   job: ApprovalJob;
   bitbucketConfig: Omit<BitbucketConnectionConfig, 'token'>;
   manualTokenCiphertext?: string;
+  accountTokenCiphertext?: string;
 }
 
 export interface ClaimResponse {

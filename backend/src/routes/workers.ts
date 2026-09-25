@@ -297,8 +297,8 @@ export async function registerWorkerRoutes(
             error: { code: 'WORKER_NOT_ONLINE', message: 'Worker is not online' },
           });
         }
-        const manualOnly = worker.state !== 'ONLINE' || (request.body as { manualOnly?: boolean } | undefined)?.manualOnly === true;
-        const lease = executionDispatcher.claim(worker.id, manualOnly);
+        const manualOnly = worker.state !== 'ONLINE' || worker.hasLegacyToken === false || (request.body as { manualOnly?: boolean } | undefined)?.manualOnly === true;
+        const lease = executionDispatcher.claim(worker.id, manualOnly, new Date(), worker.supportsAccountLeases === true);
         return reply.send({ success: true, data: { lease, serverTime: new Date().toISOString() } });
       } catch (error: any) {
         return reply.status(error.statusCode || 400).send({
