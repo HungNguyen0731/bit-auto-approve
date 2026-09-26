@@ -198,6 +198,9 @@ export class ExecutionDispatcher {
 
   claim(workerId: string, manualOnly = false, now: Date = new Date(), supportsAccountLeases = false): ExecutionLease | null {
     const leases = this.workerStore.getLeases();
+    if (leases.some((lease) => lease.workerId === workerId &&
+        ['LEASED', 'RUNNING'].includes(lease.status) && lease.leasedUntil &&
+        new Date(lease.leasedUntil).getTime() > now.getTime())) return null;
     const available = leases.find(
       (lease) =>
         lease.workerId === workerId &&
@@ -293,4 +296,5 @@ export class ExecutionDispatcher {
     jobs[index] = { ...jobs[index], nextRunAt, updatedAt: now.toISOString() };
     this.storage.saveJobs(jobs);
   }
+
 }

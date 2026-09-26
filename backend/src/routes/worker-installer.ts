@@ -73,9 +73,9 @@ export async function registerWorkerInstallerRoutes(
   app: FastifyInstance,
   options: { auth: ControlPlaneAuth }
 ): Promise<void> {
-  const macAppName = 'Bitbucket-PR-Approver-0.3.0-macOS.zip';
+  const macAppName = 'Bitbucket-PR-Approver-0.3.3-macOS.zip';
   const macAppPath = path.resolve(process.cwd(), '../macos-app/releases', macAppName);
-  app.get('/downloads/Bitbucket-PR-Approver-0.3.0-macOS.zip', async (_request, reply) => {
+  app.get('/downloads/Bitbucket-PR-Approver-0.3.3-macOS.zip', async (_request, reply) => {
     if (!fs.existsSync(macAppPath)) {
       return reply.status(404).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app download is unavailable' } });
     }

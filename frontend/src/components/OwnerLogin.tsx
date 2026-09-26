@@ -38,7 +38,7 @@ export const OwnerLogin: React.FC<{ onAuthenticated: () => void }> = ({ onAuthen
         <button type="submit" disabled={!password || busy} className="mt-5 min-h-11 w-full rounded-xl bg-brand-700 text-sm font-semibold text-white disabled:opacity-50">
           {busy ? <><Loader2 className="mr-2 inline h-4 w-4 animate-spin" /> Signing in...</> : 'Sign in'}
         </button>
-        <a href="/downloads/Bitbucket-PR-Approver-0.3.0-macOS.zip" download className="mt-5 flex min-h-11 items-center justify-center gap-2 rounded-xl border border-app-line bg-white text-sm font-semibold text-brand-700 hover:bg-brand-50">
+        <a href="/downloads/Bitbucket-PR-Approver-0.3.3-macOS.zip" download className="mt-5 flex min-h-11 items-center justify-center gap-2 rounded-xl border border-app-line bg-white text-sm font-semibold text-brand-700 hover:bg-brand-50">
           <Download className="h-4 w-4" aria-hidden="true" /> Tải app cho Mac
         </a>
       </form>

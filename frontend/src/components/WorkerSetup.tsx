@@ -1,8 +1,8 @@
-import { ArrowRight, Download, Laptop, RefreshCw, ShieldCheck } from 'lucide-react';
+import { ArrowRight, Download, RefreshCw, ShieldCheck } from 'lucide-react';
 import type { WorkerRecord } from '../types';
 import { WorkerStatus } from './WorkerStatus';
 
-const APP_DOWNLOAD = '/downloads/Bitbucket-PR-Approver-0.3.0-macOS.zip';
+const APP_DOWNLOAD = '/downloads/Bitbucket-PR-Approver-0.3.3-macOS.zip';
 
 export function WorkerSetup({ workers, onRefresh }: {
   workers: WorkerRecord[];
@@ -39,7 +39,7 @@ export function WorkerSetup({ workers, onRefresh }: {
 
           <div className="flex flex-col justify-between gap-8 border-t border-app-line bg-brand-50 px-6 py-8 sm:px-9 lg:border-l lg:border-t-0">
             <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-brand-700 text-white shadow-soft">
-              <Laptop className="h-7 w-7" strokeWidth={1.8} aria-hidden="true" />
+              <img src="/app-logo.svg" width="56" height="56" alt="" className="h-14 w-14 rounded-2xl" />
             </div>
             <div>
               <p className="text-xl font-bold text-app-ink">Một app, đủ mọi thứ.</p>

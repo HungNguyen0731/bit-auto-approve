@@ -97,6 +97,12 @@ export async function registerJobRoutes(
       if (nextAccountId && worker.supportsAccountLeases !== true) {
         return reply.status(409).send({ success: false, error: { code: 'WORKER_UPGRADE_REQUIRED', message: 'Update and reconnect this Mac Worker before assigning an account' } });
       }
+      if (currentJob?.workerId && currentJob.workerId !== workerId &&
+          workerStore?.getLeases().some((lease) => lease.jobId === id && ['LEASED', 'RUNNING'].includes(lease.status))) {
+        return reply.status(409).send({ success: false, error: {
+          code: 'JOB_EXECUTION_ACTIVE', message: 'Wait for the current Worker execution to finish before assigning a different Worker',
+        } });
+      }
     } else if (body.accountId) {
       return reply.status(400).send({ success: false, error: { code: 'ACCOUNT_REQUIRES_WORKER', message: 'Stored Bitbucket accounts require a Local Worker job' } });
     }
@@ -110,6 +116,28 @@ export async function registerJobRoutes(
           message: `Job with ID '${id}' not found`,
         },
       });
+    }
+
+    if (currentJob?.workerId && currentJob.workerId !== updated.workerId && workerStore) {
+      const now = new Date().toISOString();
+      workerStore.saveLeases(workerStore.getLeases().map((lease) => {
+        if (lease.jobId !== id || !['QUEUED', 'RETRYABLE'].includes(lease.status)) return lease;
+        return {
+          ...lease,
+          status: 'FAILED' as const,
+          completedAt: now,
+          leasedUntil: undefined,
+          manualTokenCiphertext: undefined,
+          accountTokenCiphertext: undefined,
+          result: {
+            executionId: lease.executionId, workerId: lease.workerId, jobId: id,
+            status: 'FAILED' as const, startedAt: lease.startedAt || lease.createdAt,
+            completedAt: now, durationMs: 0, repositoriesScanned: 0, pullRequestsScanned: 0,
+            matched: 0, approved: 0, skipped: 0, failed: 1, alreadyApproved: 0,
+            failureReason: 'Job was assigned to another Worker before execution',
+          },
+        };
+      }));
     }
 
     return reply.send({

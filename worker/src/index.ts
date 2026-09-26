@@ -140,6 +140,13 @@ async function run(): Promise<void> {
         supportsAccountLeases: true,
       } as const;
       await client.heartbeat(request);
+      if (activeExecutionId) {
+        // Keep long-running scans leased while the Worker is still busy.
+        // A second process with the same pairing must not claim another task.
+        try { await client.renew(activeExecutionId); } catch (error: any) {
+          if (error?.code !== 'LEASE_NOT_ACTIVE') reportControlPlaneFailure('lease renew', error);
+        }
+      }
       // Account-bound Workers do not have a legacy Bitbucket token. A healthy
       // control-plane heartbeat must still move them out of STARTING/OFFLINE.
       if (!bitbucketToken && ['STARTING', 'OFFLINE_CONTROL_PLANE'].includes(stateMachine.currentState)) {

@@ -186,6 +186,10 @@ private struct JobDraft {
     @Published var logs: [ExecutionLog] = []
     @Published var runs: [WorkerRun] = []
     @Published var runHistoryAvailable = true
+    @Published var selectedWorkerId = ""
+    @Published var historyError = ""
+    @Published var historyLoading = false
+    private var historyGeneration = 0
     private var csrf = ""
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
@@ -274,22 +278,48 @@ private struct JobDraft {
             accounts = try await call("GET", "/api/accounts")
             workers = try await call("GET", "/api/workers")
             jobs = try await call("GET", "/api/jobs")
-            if let workerId = localWorkerId {
-                do {
-                    runs = try await call("GET", "/api/worker-executions?limit=300&workerId=\(workerId)")
-                    runHistoryAvailable = true
-                } catch {
-                    if (error as NSError).code == 404 {
-                        runs = []
-                        runHistoryAvailable = false
-                    } else { throw error }
-                }
-                logs = try await call("GET", "/api/worker-logs?limit=300&workerId=\(workerId)")
-            } else {
-                runs = []
-                logs = []
-            }
         } catch { message = error.localizedDescription }
+        await refreshHistory()
+    }
+
+    func refreshHistory() async {
+        guard authenticated && !needsReauth else { return }
+        historyGeneration += 1
+        let generation = historyGeneration
+        historyLoading = true
+        defer { if generation == historyGeneration { historyLoading = false } }
+        historyError = ""
+        if selectedWorkerId.isEmpty {
+            let localId = localWorkerId
+            selectedWorkerId = workers.first(where: { $0.id == localId })?.id ??
+                workers.first(where: { $0.revokedAt == nil })?.id ?? ""
+        }
+        guard !selectedWorkerId.isEmpty else {
+            runs = []; logs = []
+            historyError = "Chưa có Worker để xem lịch sử. Ghép đôi Mac Worker hoặc chọn Worker trên server."
+            return
+        }
+        let id = selectedWorkerId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? selectedWorkerId
+        do {
+            let fetched: [WorkerRun] = try await call("GET", "/api/worker-executions?limit=300&workerId=\(id)")
+            guard generation == historyGeneration else { return }
+            runs = fetched
+            runHistoryAvailable = true
+        } catch {
+            guard generation == historyGeneration else { return }
+            runs = []
+            runHistoryAvailable = (error as NSError).code != 404
+            historyError = error.localizedDescription
+        }
+        do {
+            let fetched: [ExecutionLog] = try await call("GET", "/api/worker-logs?limit=300&workerId=\(id)")
+            guard generation == historyGeneration else { return }
+            logs = fetched
+        } catch {
+            guard generation == historyGeneration else { return }
+            logs = []
+            historyError = error.localizedDescription
+        }
     }
 
     func reauthenticate(_ ownerPassword: String) async -> Bool {
@@ -308,7 +338,8 @@ private struct JobDraft {
 
     func logout() async {
         let _: EmptyData? = try? await call("POST", "/api/session/logout", [:])
-        csrf = ""; authenticated = false; needsReauth = false; accounts = []; workers = []; jobs = []; logs = []; runs = []; runHistoryAvailable = true
+        historyGeneration += 1
+        csrf = ""; authenticated = false; needsReauth = false; accounts = []; workers = []; jobs = []; logs = []; runs = []; runHistoryAvailable = true; historyError = ""; selectedWorkerId = ""
         message = ""
     }
 
@@ -481,6 +512,48 @@ private extension URL {
     }
 }
 
+private enum AppPalette {
+    static let navy = Color(red: 0.055, green: 0.105, blue: 0.205)
+    static let blue = Color(red: 0.20, green: 0.45, blue: 0.91)
+    static let mint = Color(red: 0.18, green: 0.68, blue: 0.53)
+    static let surface = Color(nsColor: .controlBackgroundColor)
+    static let canvas = Color(nsColor: .windowBackgroundColor)
+}
+
+private struct AppLogo: View {
+    let size: CGFloat
+    var body: some View {
+        Group {
+            if let url = Bundle.main.url(forResource: "app-logo", withExtension: "png"),
+               let picture = NSImage(contentsOf: url) {
+                Image(nsImage: picture).resizable().interpolation(.high)
+                    .accessibilityHidden(true)
+            } else {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                    .resizable().scaledToFit().foregroundStyle(AppPalette.mint)
+                    .accessibilityHidden(true)
+            }
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+private struct WorkflowArtwork: View {
+    var body: some View {
+        Group {
+            if let url = Bundle.main.url(forResource: "pr-workflow", withExtension: "png"),
+               let picture = NSImage(contentsOf: url) {
+                Image(nsImage: picture).resizable().aspectRatio(contentMode: .fit)
+                    .accessibilityLabel("Minh họa quy trình pull request được kiểm tra và phê duyệt")
+            } else {
+                RoundedRectangle(cornerRadius: 24).fill(AppPalette.navy)
+                    .overlay(Text("Pull request → Review → Approve").foregroundStyle(.white))
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 24))
+    }
+}
+
 private struct AppView: View {
     @StateObject private var model = AppModel()
     @State private var draftAccount = AccountDraft()
@@ -494,12 +567,16 @@ private struct AppView: View {
     @State private var ownerPassword = ""
     @State private var accountToDelete: Account?
     @State private var jobToDelete: Job?
+    @State private var selectedTab = 0
+    @State private var selectedRunId: String?
+    @State private var runFilter = "Tất cả"
 
     var body: some View {
         Group {
             if model.authenticated { content } else { login }
         }
-        .frame(minWidth: 880, minHeight: 650)
+        .frame(minWidth: 1100, minHeight: 700)
+        .tint(AppPalette.blue)
         .sheet(isPresented: $showingAccount) { accountForm }
         .sheet(isPresented: $showingJob) { jobForm }
         .confirmationDialog("Xóa Bitbucket account?", isPresented: Binding(
@@ -522,83 +599,294 @@ private struct AppView: View {
     }
 
     private var login: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Image(systemName: "checkmark.shield.fill").font(.system(size: 50)).foregroundStyle(.blue)
-            Text("Bitbucket PR Approver").font(.largeTitle.bold())
-            Text("Quản lý account, job và Worker trên Mac. Token lưu mã hóa trên Control Plane; job chạy qua VPN của Mac.")
-                .foregroundStyle(.secondary)
-            TextField("Control Plane HTTPS", text: $model.server).textFieldStyle(.roundedBorder)
-            SecureField("Owner password", text: $model.password).textFieldStyle(.roundedBorder)
-                .onSubmit { Task { await model.login() } }
-            HStack {
-                Button("Kết nối / đăng nhập") { Task { await model.login() } }.buttonStyle(.borderedProminent).disabled(model.busy)
-                Button("URL mặc định") { model.resetServer() }.disabled(model.busy)
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 22) {
+                HStack(spacing: 12) {
+                    AppLogo(size: 36)
+                    Text("BITBUCKET PR APPROVER").font(.caption.bold()).tracking(1.7).foregroundStyle(.white)
+                }
+                Spacer(minLength: 12)
+                Text("Review đúng lúc.\nChạy ngay trên Mac.")
+                    .font(.system(size: 38, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white).fixedSize(horizontal: false, vertical: true)
+                Text("Một nơi để quản lý account, job và lịch sử approve. Worker gọi Bitbucket qua kết nối của máy bạn.")
+                    .font(.body).foregroundStyle(Color.white.opacity(0.82))
+                    .fixedSize(horizontal: false, vertical: true)
+                WorkflowArtwork().frame(maxWidth: .infinity).frame(height: 270)
+                HStack(spacing: 10) {
+                    Label("Token mã hóa", systemImage: "lock.shield")
+                    Label("Worker trên Mac", systemImage: "desktopcomputer")
+                }.font(.caption).foregroundStyle(Color.white.opacity(0.8))
+                Spacer(minLength: 12)
             }
-            if !model.message.isEmpty { Text(model.message).foregroundStyle(.red) }
-        }.padding(40).frame(maxWidth: 540)
-    }
-
-    private var content: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Image(systemName: "checkmark.shield.fill").foregroundStyle(.blue)
-                Text("Bitbucket PR Approver").font(.title2.bold())
+            .padding(36).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .background(AppPalette.navy)
+            VStack(alignment: .leading, spacing: 22) {
                 Spacer()
-                Text(model.server).font(.caption).foregroundStyle(.secondary)
-                Button { Task { await model.refresh() } } label: { Label("Làm mới", systemImage: "arrow.clockwise") }
-                Button("Đăng xuất") { Task { await model.logout() } }
-            }.padding()
-            Divider()
-            TabView {
-                overview.tabItem { Label("Tổng quan", systemImage: "square.grid.2x2.fill") }
-                accounts.tabItem { Label("Accounts", systemImage: "key.horizontal.fill") }
-                jobs.tabItem { Label("Jobs", systemImage: "list.bullet.rectangle.fill") }
-                worker.tabItem { Label("Mac Worker", systemImage: "desktopcomputer") }
-                logs.tabItem { Label("Logs", systemImage: "text.alignleft") }
-            }.padding()
-            if !model.message.isEmpty { Text(model.message).font(.caption).foregroundStyle(.secondary).padding(.bottom, 8) }
+                Text("Chào mừng trở lại").font(.largeTitle.bold())
+                Text("Đăng nhập Control Plane để tiếp tục quản lý job.")
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Control Plane URL").font(.subheadline.bold())
+                    TextField("https://...", text: $model.server).textFieldStyle(.roundedBorder)
+                        .accessibilityHint("Dùng HTTPS hoặc localhost")
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Owner password").font(.subheadline.bold())
+                    SecureField("Nhập mật khẩu", text: $model.password).textFieldStyle(.roundedBorder)
+                        .onSubmit { Task { await model.login() } }
+                }
+                if !model.message.isEmpty {
+                    Label(model.message, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red).textSelection(.enabled)
+                }
+                Button {
+                    Task { await model.login() }
+                } label: {
+                    HStack {
+                        if model.busy { ProgressView().controlSize(.small) }
+                        Text(model.busy ? "Đang kết nối…" : "Kết nối & đăng nhập")
+                        Spacer()
+                        Image(systemName: "arrow.right").accessibilityHidden(true)
+                    }.frame(maxWidth: .infinity).padding(.vertical, 8)
+                }.buttonStyle(.borderedProminent).disabled(model.busy)
+                Button("Khôi phục URL mặc định") { model.resetServer() }
+                    .buttonStyle(.plain).foregroundStyle(AppPalette.blue).disabled(model.busy)
+                Spacer()
+                Text("Owner password không lưu trên Mac. Token account được mã hóa trên server.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: 430).padding(44)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(AppPalette.canvas)
         }
     }
 
-    private var overview: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Tự động duyệt PR trên Mac").font(.largeTitle.bold())
-            Text("Tạo Bitbucket account → ghép Mac Worker → chọn account và rule cho job → bật lịch tự động.")
-                .foregroundStyle(.secondary)
-            HStack(spacing: 12) {
-                stat("Accounts", model.accounts.count, "key.fill")
-                stat("Jobs", model.jobs.count, "tray.full.fill")
-                stat("Workers", model.workers.filter { $0.revokedAt == nil }.count, "desktopcomputer")
+    private var content: some View {
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    AppLogo(size: 42)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("PR Approver").font(.headline).foregroundStyle(.white)
+                        Text("MAC CONTROL").font(.caption2.bold()).tracking(1.2).foregroundStyle(Color.white.opacity(0.58))
+                    }
+                }.padding(.bottom, 20)
+                sidebarButton("Tổng quan", "square.grid.2x2", 0)
+                sidebarButton("Accounts", "key.horizontal", 1)
+                sidebarButton("Jobs", "list.bullet.rectangle", 2)
+                sidebarButton("Mac Worker", "desktopcomputer", 3)
+                sidebarButton("Lịch sử chạy", "clock.arrow.circlepath", 4)
+                Spacer()
+                if let local = model.workers.first(where: { $0.id == model.localWorkerId }) {
+                    Label(local.state == "ONLINE" ? "Worker online" : "Worker: \(local.state)",
+                          systemImage: local.state == "ONLINE" ? "checkmark.circle.fill" : "exclamationmark.circle")
+                        .font(.caption).foregroundStyle(local.state == "ONLINE" ? AppPalette.mint : .orange)
+                } else {
+                    Label("Chưa ghép Worker", systemImage: "exclamationmark.circle")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                Button("Đăng xuất") { Task { await model.logout() } }
+                    .buttonStyle(.plain).foregroundStyle(Color.white.opacity(0.72)).padding(.top, 8)
             }
-            Text("Job mới mặc định Dry Run. Hãy kiểm tra log trước khi chuyển sang approve thật.")
-                .font(.callout).foregroundStyle(.orange)
-            Spacer()
-        }.frame(maxWidth: .infinity, alignment: .leading).padding()
+            .padding(18).frame(width: 218)
+            .background(AppPalette.navy)
+            VStack(spacing: 0) {
+                HStack {
+                    Circle().fill(AppPalette.mint).frame(width: 8, height: 8).accessibilityHidden(true)
+                    Text("Control Plane").font(.caption.bold())
+                    Text(model.server).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Spacer()
+                    Button { Task { await model.refresh() } } label: { Label("Làm mới", systemImage: "arrow.clockwise") }
+                }.padding(.horizontal, 28).padding(.vertical, 14)
+                Divider()
+                selectedPage
+                if !model.message.isEmpty {
+                    Text(model.message).font(.caption).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                }
+            }.background(AppPalette.canvas)
+        }
     }
 
-    private func stat(_ title: String, _ value: Int, _ icon: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Image(systemName: icon).foregroundStyle(.blue)
-            Text("\(value)").font(.title.bold())
-            Text(title).foregroundStyle(.secondary)
-        }.frame(maxWidth: .infinity, alignment: .leading).padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+    @ViewBuilder private var selectedPage: some View {
+        switch selectedTab {
+        case 1: accounts
+        case 2: jobs
+        case 3: worker
+        case 4: logs
+        default: overview
+        }
+    }
+
+    private func sidebarButton(_ title: String, _ icon: String, _ tab: Int) -> some View {
+        Button { selectedTab = tab } label: {
+            HStack(spacing: 12) {
+                Image(systemName: icon).frame(width: 20).accessibilityHidden(true)
+                Text(title)
+                Spacer()
+                if tab == 4 && model.runs.contains(where: { $0.status == "FAILED" }) {
+                    Circle().fill(.red).frame(width: 7, height: 7).accessibilityHidden(true)
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .foregroundStyle(selectedTab == tab ? Color.white : Color.white.opacity(0.7))
+            .background(selectedTab == tab ? Color.white.opacity(0.15) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 9))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selectedTab == tab ? [.isSelected] : [])
+    }
+
+    private var overview: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                HStack(alignment: .top, spacing: 20) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("CONTROL CENTER").font(.caption.bold()).tracking(1.6)
+                            .foregroundStyle(AppPalette.mint)
+                        Text("Tự động duyệt PR,\nkiểm soát từng lượt.")
+                            .font(.system(size: 32, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("Tạo job trên Mac, theo dõi Worker và xem kết quả phê duyệt trong cùng một nơi.")
+                            .foregroundStyle(Color.white.opacity(0.8))
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 10) {
+                            Button("Tạo job") {
+                                draftJob = JobDraft(); draftJob.workerId = model.localWorkerId ?? ""
+                                jobError = ""; showingJob = true
+                            }.buttonStyle(.borderedProminent)
+                            Button("Xem lịch sử") { selectedTab = 4 }
+                                .buttonStyle(.bordered).foregroundStyle(.white)
+                        }.padding(.top, 6)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    WorkflowArtwork().frame(width: 308, height: 210)
+                }
+                .padding(26)
+                .background(AppPalette.navy, in: RoundedRectangle(cornerRadius: 22))
+
+                HStack(spacing: 14) {
+                    stat("Accounts", model.accounts.count, "key.horizontal", "Token quản lý")
+                    stat("Jobs", model.jobs.count, "list.bullet.rectangle", "Quy tắc đã tạo")
+                    stat("Workers", model.workers.filter { $0.revokedAt == nil }.count,
+                         "desktopcomputer", "Máy đã ghép")
+                }
+
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Hoạt động gần đây").font(.title2.bold())
+                        Text("Lượt chạy trên Worker đang chọn").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Xem tất cả") { selectedTab = 4 }
+                }
+                if model.runs.isEmpty {
+                    HStack(spacing: 14) {
+                        Image(systemName: "clock.arrow.circlepath").font(.title2)
+                            .foregroundStyle(AppPalette.blue).accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Chưa có lượt chạy").font(.headline)
+                            Text("Tạo job Dry Run và chọn Run để kiểm tra kết nối trước khi approve thật.")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(20)
+                        .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 14))
+                } else {
+                    ForEach(Array(model.runs.prefix(3))) { run in
+                        HStack(spacing: 12) {
+                            Image(systemName: statusIcon(run.status))
+                                .foregroundStyle(statusColor(run.status)).accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(run.jobName).font(.headline)
+                                Text(displayDate(run.createdAt)).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text(statusLabel(run.status)).font(.caption.bold()).foregroundStyle(statusColor(run.status))
+                        }.padding(14).background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 12))
+                    }
+                }
+                Label("Job mới mặc định Dry Run. Kiểm tra lịch sử trước khi bật approve thật.",
+                      systemImage: "info.circle")
+                    .font(.callout).foregroundStyle(.secondary)
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(28)
+        }
+    }
+
+    private func stat(_ title: String, _ value: Int, _ icon: String, _ subtitle: String) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: icon).font(.title3).foregroundStyle(AppPalette.blue)
+                .frame(width: 38, height: 38)
+                .background(AppPalette.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(value)").font(.title2.bold()).monospacedDigit()
+                Text(title).font(.headline)
+                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
+            .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 14))
     }
 
     private var accounts: some View {
-        VStack(alignment: .leading) {
-            HStack { Text("Bitbucket accounts").font(.title2.bold()); Spacer()
-                Button { draftAccount = AccountDraft(); accountError = ""; ownerPassword = ""; showingAccount = true } label: { Label("Thêm account", systemImage: "plus") }.buttonStyle(.borderedProminent) }
-            Text("Token không được tải ngược về Mac sau khi lưu. Để đổi token, mở account và nhập token mới.").font(.caption).foregroundStyle(.secondary)
-            List(model.accounts) { account in
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
                 HStack {
-                    Image(systemName: "key.fill").foregroundStyle(.blue)
-                    VStack(alignment: .leading) { Text(account.name).font(.headline); Text("\(account.username ?? "Bearer") • \(account.tokenPreview)").font(.caption).foregroundStyle(.secondary) }
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("ACCOUNTS").font(.caption.bold()).tracking(1.5).foregroundStyle(AppPalette.blue)
+                        Text("Bitbucket accounts").font(.largeTitle.bold())
+                        Text("Token được lưu mã hóa trên server và không tải ngược về Mac.")
+                            .foregroundStyle(.secondary)
+                    }
                     Spacer()
-                    Button("Sửa / đổi token") { draftAccount = AccountDraft(account); accountError = ""; ownerPassword = ""; showingAccount = true }
-                    Button(role: .destructive) { accountToDelete = account } label: { Image(systemName: "trash") }
-                }.padding(.vertical, 5)
-            }
-        }.padding()
+                    Button {
+                        draftAccount = AccountDraft(); accountError = ""; ownerPassword = ""; showingAccount = true
+                    } label: { Label("Thêm account", systemImage: "plus") }.buttonStyle(.borderedProminent)
+                }
+                if model.accounts.isEmpty {
+                    emptyPanel("Chưa có account", "Tạo account để dùng token Bitbucket cho các job.", "key.horizontal")
+                }
+                ForEach(model.accounts) { account in
+                    HStack(spacing: 16) {
+                        Image(systemName: "key.horizontal")
+                            .font(.title3).foregroundStyle(AppPalette.blue)
+                            .frame(width: 48, height: 48)
+                            .background(AppPalette.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(account.name).font(.headline)
+                            Text("\(account.username ?? "Bearer") · \(account.tokenPreview)")
+                                .font(.callout).foregroundStyle(.secondary)
+                            Text("\(model.jobs.filter { $0.accountId == account.id }.count) job sử dụng")
+                                .font(.caption).foregroundStyle(AppPalette.blue)
+                        }
+                        Spacer()
+                        Button("Sửa / đổi token") {
+                            draftAccount = AccountDraft(account); accountError = ""; ownerPassword = ""; showingAccount = true
+                        }
+                        Button(role: .destructive) { accountToDelete = account } label: { Image(systemName: "trash") }
+                            .accessibilityLabel("Xóa account \(account.name)")
+                    }
+                    .padding(18).background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 14))
+                }
+                Label("Để đổi token, mở account và nhập token mới. Để trống sẽ giữ token hiện tại.",
+                      systemImage: "lock.shield")
+                    .font(.callout).foregroundStyle(.secondary)
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(28)
+        }
+    }
+
+    private func emptyPanel(_ title: String, _ detail: String, _ icon: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: icon).font(.system(size: 30)).foregroundStyle(AppPalette.blue)
+                .accessibilityHidden(true)
+            Text(title).font(.headline)
+            Text(detail).font(.callout).foregroundStyle(.secondary)
+        }.frame(maxWidth: .infinity).padding(36)
+            .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 14))
     }
 
     private var accountForm: some View {
@@ -646,39 +934,81 @@ private struct AppView: View {
     }
 
     private var jobs: some View {
-        VStack(alignment: .leading) {
-            HStack { Text("Approval jobs").font(.title2.bold()); Spacer()
-                Button { draftJob = JobDraft(); draftJob.workerId = model.localWorkerId ?? ""; jobError = ""; ownerPassword = ""; showingJob = true } label: { Label("Tạo job", systemImage: "plus") }.buttonStyle(.borderedProminent) }
-            Text("Chỉ job gán đúng Worker của Mac này mới được Run từ ứng dụng. Job Server cũ cần chuyển sang Mac Worker; khi chuyển sẽ tạm dừng và bật Dry Run để kiểm tra trước.")
-                .font(.caption).foregroundStyle(.secondary)
-            List(model.jobs) { job in
-                HStack {
-                    Image(systemName: job.enabled ? "bolt.circle.fill" : "pause.circle.fill").foregroundStyle(job.enabled ? .green : .orange)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(job.name).font(.headline)
-                        Text("\(job.executionMode == "worker" ? "Mac Worker" : "Server") • \(model.accounts.first { $0.id == job.accountId }?.name ?? "Token cũ") • \(job.dryRun ? "Dry Run" : "Live") • mỗi \(job.intervalSeconds)s")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if job.executionMode == "worker", job.workerId == model.localWorkerId, !(job.accountId ?? "").isEmpty {
-                        Button("Run") { Task { await model.runJob(job) } }
-                    } else {
-                        Button("Thiết lập Mac") {
-                            draftJob = JobDraft(job)
-                            draftJob.workerId = model.localWorkerId ?? ""
-                            draftJob.enabled = false
-                            draftJob.dryRun = true
-                            jobError = "Chọn Bitbucket account và Worker của Mac này. Job sẽ được tạm dừng, chạy Dry Run trước khi bật lịch/approve thật."
-                            ownerPassword = ""
-                            showingJob = true
-                        }
-                    }
-                    Button(job.enabled ? "Pause" : "Resume") { Task { await model.toggle(job) } }
-                    Button("Sửa") { draftJob = JobDraft(job); jobError = ""; ownerPassword = ""; showingJob = true }
-                    Button(role: .destructive) { jobToDelete = job } label: { Image(systemName: "trash") }
-                }.padding(.vertical, 5)
+        ScrollView {
+          VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("AUTOMATION").font(.caption.bold()).tracking(1.5).foregroundStyle(AppPalette.blue)
+                    Text("Approval jobs").font(.largeTitle.bold())
+                    Text("Mỗi job dùng một Worker. Một Worker có thể xử lý nhiều job tuần tự.")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    draftJob = JobDraft()
+                    draftJob.workerId = model.localWorkerId ?? ""
+                    jobError = ""; ownerPassword = ""; showingJob = true
+                } label: { Label("Tạo job", systemImage: "plus") }.buttonStyle(.borderedProminent) }
+            if model.jobs.isEmpty {
+                emptyPanel("Chưa có job", "Tạo job Dry Run đầu tiên để kiểm tra rule và kết nối Bitbucket.", "list.bullet.rectangle")
             }
-        }.padding()
+            ForEach(model.jobs) { job in
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack(alignment: .top, spacing: 14) {
+                        Image(systemName: job.enabled ? "bolt.circle.fill" : "pause.circle.fill")
+                            .font(.title3).foregroundStyle(job.enabled ? AppPalette.mint : .orange)
+                            .frame(width: 44, height: 44)
+                            .background((job.enabled ? AppPalette.mint : Color.orange).opacity(0.12),
+                                        in: RoundedRectangle(cornerRadius: 12))
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(job.name).font(.title3.bold())
+                            Text(job.description.flatMap { $0.isEmpty ? nil : $0 } ?? "Quy tắc tự động duyệt pull request")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(job.enabled ? "ĐANG BẬT" : "TẠM DỪNG")
+                            .font(.caption.bold())
+                            .foregroundStyle(job.enabled ? AppPalette.mint : .orange)
+                    }
+                    HStack(spacing: 12) {
+                        Label(job.dryRun ? "Dry Run" : "Approve thật", systemImage: "shield.lefthalf.filled")
+                        Label("Mỗi \(job.intervalSeconds)s", systemImage: "clock")
+                        Label("\(job.rules.repositories.count) repo", systemImage: "folder")
+                        Label(model.workers.first(where: { $0.id == job.workerId })?.name ?? "Worker chưa gán",
+                              systemImage: "desktopcomputer")
+                    }.font(.caption).foregroundStyle(.secondary)
+                    Divider()
+                    HStack(spacing: 10) {
+                        if job.executionMode == "worker", job.workerId == model.localWorkerId,
+                           !(job.accountId ?? "").isEmpty {
+                            Button { Task {
+                                model.selectedWorkerId = job.workerId ?? ""
+                                await model.runJob(job)
+                                selectedTab = 4; selectedRunId = nil
+                            } } label: { Label("Run ngay", systemImage: "play.fill") }
+                                .buttonStyle(.borderedProminent)
+                        } else {
+                            Button("Thiết lập Mac") {
+                                draftJob = JobDraft(job); draftJob.workerId = model.localWorkerId ?? ""
+                                draftJob.enabled = false; draftJob.dryRun = true
+                                jobError = "Chọn account và Worker của Mac này, sau đó kiểm tra Dry Run."
+                                ownerPassword = ""; showingJob = true
+                            }.buttonStyle(.borderedProminent)
+                        }
+                        Button(job.enabled ? "Tạm dừng" : "Bật lại") { Task { await model.toggle(job) } }
+                        Button("Sửa") { draftJob = JobDraft(job); jobError = ""; ownerPassword = ""; showingJob = true }
+                        Spacer()
+                        Button(role: .destructive) { jobToDelete = job } label: { Image(systemName: "trash") }
+                            .accessibilityLabel("Xóa job \(job.name)")
+                    }
+                }.padding(20).background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 16))
+            }
+            Label("Job Server cũ cần chuyển sang Mac Worker và kiểm tra Dry Run trước khi bật lại.",
+                  systemImage: "info.circle")
+                .font(.callout).foregroundStyle(.secondary)
+          }.frame(maxWidth: .infinity, alignment: .leading).padding(28)
+        }
     }
 
     private var jobForm: some View {
@@ -752,68 +1082,245 @@ private struct AppView: View {
     }
 
     private var worker: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Mac Worker").font(.title2.bold())
-            Text("Worker gọi Bitbucket qua VPN của Mac. Nút dưới tự chuẩn bị runtime, ghép đôi và bật chạy nền bằng LaunchAgent; không cần mở website để tạo job.")
-                .foregroundStyle(.secondary)
-            Button { Task { await model.connectWorker() } } label: { Label("Ghép đôi & chạy nền trên Mac này", systemImage: "desktopcomputer.and.arrow.down") }
-                .buttonStyle(.borderedProminent).disabled(model.busy)
-            if model.localWorkerId == nil {
-                Text("Mac này chưa ghép với Control Plane hiện tại. Bấm nút trên để tạo Worker local; cấu hình Worker localhost cũ sẽ được giữ riêng.")
-                    .font(.caption).foregroundStyle(.orange)
-            }
-            List(model.workers.filter { $0.id == model.localWorkerId }) { item in
-                HStack { Image(systemName: "desktopcomputer"); Text(item.name); Spacer(); Text(item.supportsAccountLeases == true ? item.state : "Cần nâng cấp Worker").foregroundStyle(item.state == "ONLINE" && item.supportsAccountLeases == true ? .green : .orange) }
-            }
-            Text("Nếu VPN mất kết nối, Worker tạm dừng và thử lại khi đường Bitbucket hoạt động. Đóng GUI không dừng LaunchAgent.")
-                .font(.caption).foregroundStyle(.secondary)
-        }.padding()
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                Text("MAC EXECUTION").font(.caption.bold()).tracking(1.5).foregroundStyle(AppPalette.blue)
+                Text("Worker trên Mac").font(.largeTitle.bold())
+                Text("Bitbucket được gọi từ máy của bạn. Một Worker có thể chạy nhiều job nhưng xử lý từng lượt một.")
+                    .foregroundStyle(.secondary)
+                HStack(alignment: .top, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 18) {
+                        if let local = model.workers.first(where: { $0.id == model.localWorkerId }) {
+                            HStack(alignment: .top, spacing: 14) {
+                                Image(systemName: "desktopcomputer")
+                                    .font(.title2).foregroundStyle(AppPalette.blue)
+                                    .frame(width: 48, height: 48)
+                                    .background(AppPalette.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 13))
+                                    .accessibilityHidden(true)
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text(local.name).font(.title3.bold()).textSelection(.enabled)
+                                    Text("Worker ID: \(local.id)").font(.caption.monospaced())
+                                        .foregroundStyle(.secondary).textSelection(.enabled)
+                                }
+                                Spacer()
+                                Text(local.supportsAccountLeases == true ? local.state : "CẦN NÂNG CẤP")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(local.state == "ONLINE" && local.supportsAccountLeases == true ? AppPalette.mint : .orange)
+                            }
+                            Divider()
+                            Text("\(model.jobs.filter { $0.executionMode == "worker" && $0.workerId == local.id }.count) job được giao")
+                                .font(.headline)
+                            Text("Các job chia sẻ Worker này sẽ được xếp hàng và thực hiện tuần tự.")
+                                .font(.callout).foregroundStyle(.secondary)
+                        } else {
+                            Text("Chưa ghép Worker trên Mac này").font(.title3.bold())
+                            Text("Ghép đôi để job chạy qua VPN và IP của Mac. App tự chuẩn bị runtime và chạy nền.")
+                                .foregroundStyle(.secondary)
+                        }
+                        Button { Task { await model.connectWorker() } } label: {
+                            Label(model.localWorkerId == nil ? "Ghép đôi & chạy nền" : "Kiểm tra / cập nhật Worker",
+                                  systemImage: "arrow.triangle.2.circlepath")
+                        }.buttonStyle(.borderedProminent).disabled(model.busy)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(24)
+                    .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 18))
+                    VStack(alignment: .leading, spacing: 12) {
+                        WorkflowArtwork().frame(height: 190)
+                        Text("Xử lý tại máy của bạn").font(.headline)
+                        Text("Worker tiếp tục chạy khi đóng cửa sổ app. Nếu mất VPN, job tạm chờ và tự thử lại khi kết nối phục hồi.")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                    .frame(width: 310).padding(18)
+                    .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 18))
+                }
+                Label("App không bật hoặc tắt VPN. Hãy tự duy trì kết nối VPN nếu Bitbucket nội bộ yêu cầu.",
+                      systemImage: "info.circle")
+                    .font(.callout).foregroundStyle(.secondary)
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(28)
+        }
     }
 
     private var logs: some View {
-        VStack(alignment: .leading) {
-            Text("Lượt chạy Worker").font(.title2.bold())
-            if !model.runHistoryAvailable {
-                Text("Server chưa có API lịch sử lượt chạy. Cần deploy backend mới lên Coolify.")
-                    .font(.callout).foregroundStyle(.orange)
-            }
-            Text("Mỗi lượt chạy có một record riêng, kể cả khi không có PR khớp. Mở record để xem kết quả và log PR.")
-                .font(.caption).foregroundStyle(.secondary)
-            List {
-                if model.runs.isEmpty {
-                    Text("Chưa có lượt chạy Worker. Job chạy trên server không xuất hiện ở đây.")
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Lịch sử chạy").font(.largeTitle.bold())
+                    Text("Một lượt chạy là một record, kể cả khi không tìm thấy PR. Tự cập nhật mỗi 10 giây.")
                         .foregroundStyle(.secondary)
                 }
-                ForEach(model.runs) { run in
-                    DisclosureGroup {
-                        Text("Execution: \(run.executionId)").font(.caption.monospaced()).textSelection(.enabled)
-                        Text("Worker: \(run.workerId) • \(run.trigger)").font(.caption).foregroundStyle(.secondary)
-                        if let result = run.result {
-                            Text("Repo \(result.repositoriesScanned) • PR \(result.pullRequestsScanned) • Khớp \(result.matched) • Approve \(result.approved) • Bỏ qua \(result.skipped) • Lỗi \(result.failed)")
-                                .font(.caption)
-                            if let reason = result.failureReason { Text(reason).font(.caption).foregroundStyle(.red) }
-                        }
-                        let details = model.logs.filter { $0.executionId == run.executionId }
-                        if details.isEmpty { Text("Không có log PR trong lượt này.").font(.caption).foregroundStyle(.secondary) }
-                        ForEach(details) { item in
-                            VStack(alignment: .leading) {
-                                Text("\(item.status) • \(item.repository ?? "Worker") • \(item.prTitle ?? "PR")")
-                                if let reason = item.failureReason { Text(reason).font(.caption).foregroundStyle(.secondary) }
-                            }.padding(.vertical, 3)
-                        }
-                    } label: {
-                        HStack {
-                            Image(systemName: run.status == "COMPLETED" ? "checkmark.circle.fill" : run.status == "FAILED" ? "xmark.circle.fill" : "clock")
-                                .foregroundStyle(run.status == "COMPLETED" ? .green : run.status == "FAILED" ? .red : .orange)
-                            VStack(alignment: .leading) {
-                                Text("\(run.jobName) • \(run.status)").font(.headline)
-                                Text(run.createdAt).font(.caption).foregroundStyle(.secondary)
-                            }
-                        }
+                Spacer()
+                if model.historyLoading { ProgressView().controlSize(.small).accessibilityLabel("Đang tải lịch sử") }
+                Button { Task { await model.refreshHistory() } } label: { Label("Làm mới", systemImage: "arrow.clockwise") }
+                    .disabled(model.historyLoading)
+            }
+            HStack {
+                Picker("Worker", selection: Binding(
+                    get: { model.selectedWorkerId },
+                    set: { workerId in
+                        model.selectedWorkerId = workerId
+                        selectedRunId = nil
+                        Task { await model.refreshHistory() }
+                    })) {
+                    if model.workers.isEmpty { Text("Chưa có Worker").tag("") }
+                    ForEach(model.workers) { item in
+                        Text("\(item.name)\(item.id == model.localWorkerId ? " — Mac này" : "")").tag(item.id)
                     }
                 }
+                .frame(maxWidth: 340)
+                Spacer()
+                Picker("Trạng thái", selection: $runFilter) {
+                    Text("Tất cả").tag("Tất cả")
+                    Text("Đang chờ/chạy").tag("Đang chờ/chạy")
+                    Text("Thành công").tag("Thành công")
+                    Text("Thất bại").tag("Thất bại")
+                }.frame(width: 220)
+            }
+            if !model.runHistoryAvailable {
+                Label("Server chưa có API lịch sử chạy. Cần deploy backend mới.", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+            }
+            if !model.historyError.isEmpty {
+                Label(model.historyError, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
+            HStack(spacing: 10) {
+                historyStat("Tổng lượt", model.runs.count, "clock.arrow.circlepath")
+                historyStat("Hoàn tất", model.runs.filter { $0.status == "COMPLETED" }.count, "checkmark.circle")
+                historyStat("Thất bại", model.runs.filter { $0.status == "FAILED" }.count, "xmark.circle")
+                historyStat("Đang chờ/chạy", model.runs.filter { !["COMPLETED", "FAILED"].contains($0.status) }.count, "hourglass")
+            }
+            HStack(spacing: 12) {
+                List(selection: $selectedRunId) {
+                    if filteredRuns.isEmpty {
+                        Text(model.historyLoading ? "Đang tải lượt chạy…" : "Không có lượt chạy phù hợp. Chọn Worker khác hoặc bấm Run để tạo lượt mới.")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(filteredRuns) { run in
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: statusIcon(run.status))
+                                .foregroundStyle(statusColor(run.status))
+                                .accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text(run.jobName).font(.headline).lineLimit(1)
+                                    Spacer(minLength: 8)
+                                    Text(statusLabel(run.status)).font(.caption.bold()).foregroundStyle(statusColor(run.status))
+                                }
+                                Text("\(displayDate(run.createdAt)) · \(run.trigger == "MANUAL" ? "Run thủ công" : "Lịch tự động")")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                if let result = run.result {
+                                    Text("PR \(result.pullRequestsScanned) · Approve \(result.approved) · Bỏ qua \(result.skipped) · Lỗi \(result.failed)")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }.padding(.vertical, 7).tag(run.executionId)
+                    }
+                }
+                .frame(minWidth: 330, maxWidth: 430)
+                Group {
+                    if let run = model.runs.first(where: { $0.executionId == selectedRunId }) {
+                        runDetail(run)
+                    } else {
+                        VStack(spacing: 12) {
+                            Image(systemName: "doc.text.magnifyingglass").font(.system(size: 34)).foregroundStyle(.secondary)
+                            Text("Chọn một lượt chạy để xem chi tiết").font(.headline)
+                            Text("Trạng thái, kết quả và từng PR sẽ hiển thị tại đây.").foregroundStyle(.secondary)
+                        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
             }
         }.padding()
+    }
+
+    private var filteredRuns: [WorkerRun] {
+        model.runs.filter { run in
+            switch runFilter {
+            case "Thành công": return run.status == "COMPLETED"
+            case "Thất bại": return run.status == "FAILED"
+            case "Đang chờ/chạy": return !["COMPLETED", "FAILED"].contains(run.status)
+            default: return true
+            }
+        }
+    }
+
+    private func historyStat(_ title: String, _ count: Int, _ icon: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon).foregroundStyle(.blue).accessibilityHidden(true)
+            VStack(alignment: .leading) {
+                Text("\(count)").font(.title3.bold()).monospacedDigit()
+                Text(title).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }.padding(12).frame(maxWidth: .infinity).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func runDetail(_ run: WorkerRun) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Image(systemName: statusIcon(run.status)).foregroundStyle(statusColor(run.status))
+                        .accessibilityHidden(true)
+                    Text(statusLabel(run.status)).font(.title2.bold())
+                }
+                Text(run.jobName).font(.headline)
+                Text("Bắt đầu: \(displayDate(run.startedAt ?? run.createdAt))")
+                if let completed = run.completedAt { Text("Kết thúc: \(displayDate(completed))") }
+                Text("Lượt chạy: \(run.executionId)").font(.caption.monospaced()).textSelection(.enabled)
+                Text("Worker: \(run.workerId)").font(.caption.monospaced()).textSelection(.enabled)
+                if let result = run.result {
+                    Divider()
+                    Text("Kết quả").font(.headline)
+                    Text("Repo \(result.repositoriesScanned) · PR \(result.pullRequestsScanned) · Khớp \(result.matched)")
+                    Text("Approve \(result.approved) · Đã approve \(result.alreadyApproved) · Bỏ qua \(result.skipped) · Lỗi \(result.failed)")
+                    if let reason = result.failureReason, !reason.isEmpty {
+                        Label(reason, systemImage: "exclamationmark.triangle").foregroundStyle(.red).textSelection(.enabled)
+                    }
+                } else {
+                    Text("Worker chưa gửi kết quả cuối. Lượt chạy sẽ tự cập nhật.").foregroundStyle(.secondary)
+                }
+                Divider()
+                Text("Chi tiết PR").font(.headline)
+                let details = model.logs.filter { $0.executionId == run.executionId }
+                if details.isEmpty { Text("Không có log PR trong lượt này.").foregroundStyle(.secondary) }
+                ForEach(details) { item in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("\(item.status) · \(item.repository ?? "Worker")").font(.subheadline.bold())
+                        if let title = item.prTitle { Text(title) }
+                        if let reason = item.failureReason { Text(reason).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
+        }
+    }
+
+    private func statusIcon(_ status: String) -> String {
+        status == "COMPLETED" ? "checkmark.circle.fill" : status == "FAILED" ? "xmark.circle.fill" : "clock.fill"
+    }
+
+    private func statusColor(_ status: String) -> Color {
+        status == "COMPLETED" ? .green : status == "FAILED" ? .red : .orange
+    }
+
+    private func statusLabel(_ status: String) -> String {
+        switch status {
+        case "COMPLETED": return "Hoàn tất"
+        case "FAILED": return "Thất bại"
+        case "QUEUED": return "Đang chờ"
+        case "LEASED", "RUNNING": return "Đang chạy"
+        case "RETRYABLE": return "Chờ kết nối"
+        default: return status
+        }
+    }
+
+    private func displayDate(_ value: String) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let date = formatter.date(from: value) ?? ISO8601DateFormatter().date(from: value) else { return value }
+        return date.formatted(date: .abbreviated, time: .standard)
     }
 }
 
