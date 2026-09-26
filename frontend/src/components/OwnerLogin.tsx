@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Download, KeyRound, Loader2 } from 'lucide-react';
 import { api } from '../api/client';
 import { BitbucketMark } from './VisualArtwork';
+import { MAC_APP_DOWNLOAD_URL, MAC_APP_FALLBACK_URL } from '../constants/macAppDownload';
 
 export const OwnerLogin: React.FC<{ onAuthenticated: () => void }> = ({ onAuthenticated }) => {
   const [password, setPassword] = useState('');
@@ -38,9 +39,10 @@ export const OwnerLogin: React.FC<{ onAuthenticated: () => void }> = ({ onAuthen
         <button type="submit" disabled={!password || busy} className="mt-5 min-h-11 w-full rounded-xl bg-brand-700 text-sm font-semibold text-white disabled:opacity-50">
           {busy ? <><Loader2 className="mr-2 inline h-4 w-4 animate-spin" /> Signing in...</> : 'Sign in'}
         </button>
-        <a href="/downloads/Bitbucket-PR-Approver-0.3.3-macOS.zip" download className="mt-5 flex min-h-11 items-center justify-center gap-2 rounded-xl border border-app-line bg-white text-sm font-semibold text-brand-700 hover:bg-brand-50">
+        <a href={MAC_APP_DOWNLOAD_URL} className="mt-5 flex min-h-11 items-center justify-center gap-2 rounded-xl border border-app-line bg-white text-sm font-semibold text-brand-700 hover:bg-brand-50">
           <Download className="h-4 w-4" aria-hidden="true" /> Tải app cho Mac
         </a>
+        <p className="mt-2 text-center text-xs text-app-muted">Tải từ GitHub. <a href={MAC_APP_FALLBACK_URL} download className="font-semibold text-brand-700 underline underline-offset-2 hover:text-brand-800">Dùng máy chủ dự phòng</a> nếu cần.</p>
       </form>
     </main>
   );

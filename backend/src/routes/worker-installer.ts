@@ -75,15 +75,37 @@ export async function registerWorkerInstallerRoutes(
 ): Promise<void> {
   const macAppName = 'Bitbucket-PR-Approver-0.3.3-macOS.zip';
   const macAppPath = path.resolve(process.cwd(), '../macos-app/releases', macAppName);
-  app.get('/downloads/Bitbucket-PR-Approver-0.3.3-macOS.zip', async (_request, reply) => {
+  app.get('/downloads/Bitbucket-PR-Approver-0.3.3-macOS.zip', async (request, reply) => {
     if (!fs.existsSync(macAppPath)) {
       return reply.status(404).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app download is unavailable' } });
     }
+    const fileSize = fs.statSync(macAppPath).size;
+    const range = request.headers.range;
+    let start = 0;
+    let end = fileSize - 1;
+    if (range) {
+      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+      if (!match || (!match[1] && !match[2])) {
+        return reply.status(416).header('Content-Range', `bytes */${fileSize}`).send();
+      }
+      if (match[1]) {
+        start = Number(match[1]);
+        end = match[2] ? Math.min(Number(match[2]), fileSize - 1) : end;
+      } else {
+        const suffixLength = Number(match[2]);
+        start = Math.max(fileSize - suffixLength, 0);
+      }
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= fileSize) {
+        return reply.status(416).header('Content-Range', `bytes */${fileSize}`).send();
+      }
+      reply.status(206).header('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+    }
     reply.header('Content-Disposition', `attachment; filename="${macAppName}"`);
     reply.header('Cache-Control', 'public, max-age=3600');
-    reply.header('Content-Length', fs.statSync(macAppPath).size);
+    reply.header('Accept-Ranges', 'bytes');
+    reply.header('Content-Length', end - start + 1);
     reply.type('application/zip');
-    return reply.send(fs.createReadStream(macAppPath));
+    return reply.send(fs.createReadStream(macAppPath, { start, end }));
   });
 
   const packagePath = path.resolve(process.cwd(), '../worker/dist-packages', FILE_NAME);
