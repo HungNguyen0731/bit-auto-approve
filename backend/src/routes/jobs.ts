@@ -64,7 +64,7 @@ export async function registerJobRoutes(
         return reply.status(409).send({ success: false, error: { code: 'WORKER_UPGRADE_REQUIRED', message: 'Update and reconnect this Mac Worker before assigning an account' } });
       }
       if (body.autoMergeOnSuccessfulBuild && worker.supportsAutoMerge !== true) {
-        return reply.status(409).send({ success: false, error: { code: 'WORKER_UPGRADE_REQUIRED', message: 'Update and restart this Mac Worker before enabling auto-merge' } });
+        return reply.status(409).send({ success: false, error: { code: 'WORKER_UPGRADE_REQUIRED', message: `Selected Worker '${worker.name}' has not reported auto-merge support. Update it on that Mac, then retry.` } });
       }
     } else if (body.accountId) {
       return reply.status(400).send({ success: false, error: { code: 'ACCOUNT_REQUIRES_WORKER', message: 'Stored Bitbucket accounts require a Local Worker job' } });
@@ -111,7 +111,7 @@ export async function registerJobRoutes(
         return reply.status(409).send({ success: false, error: { code: 'WORKER_UPGRADE_REQUIRED', message: 'Update and reconnect this Mac Worker before assigning an account' } });
       }
       if ((body.autoMergeOnSuccessfulBuild ?? currentJob?.autoMergeOnSuccessfulBuild) && worker.supportsAutoMerge !== true) {
-        return reply.status(409).send({ success: false, error: { code: 'WORKER_UPGRADE_REQUIRED', message: 'Update and restart this Mac Worker before enabling auto-merge' } });
+        return reply.status(409).send({ success: false, error: { code: 'WORKER_UPGRADE_REQUIRED', message: `Selected Worker '${worker.name}' has not reported auto-merge support. Update it on that Mac, then retry.` } });
       }
       if (currentJob?.workerId && currentJob.workerId !== workerId &&
           workerStore?.getLeases().some((lease) => lease.jobId === id && ['LEASED', 'RUNNING'].includes(lease.status))) {

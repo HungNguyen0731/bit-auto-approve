@@ -182,6 +182,9 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
 
   if (!isOpen) return null;
 
+  const selectedWorker = workers.find((worker) => worker.id === workerId);
+  const autoMergeWorkerReady = !autoMergeOnSuccessfulBuild || selectedWorker?.supportsAutoMerge === true;
+
   const currentRules: JobFilterRules = {
     repositories,
     authorWhitelist,
@@ -286,10 +289,15 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
                 <option value="">Select a paired Worker</option>
                 {workers.map((worker) => (
                   <option key={worker.id} value={worker.id} disabled={worker.state !== 'ONLINE'}>
-                    {worker.name} — {worker.state}
+                    {worker.name} — {worker.state}{worker.supportsAutoMerge ? ' · auto-merge ready' : ' · needs Worker update for auto-merge'}
                   </option>
                 ))}
               </select>
+            )}
+            {!autoMergeWorkerReady && (
+              <p className="mt-2 text-xs text-amber-800">
+                Worker được chọn chưa báo hỗ trợ auto-merge. Mở app Mac trên đúng máy đó, vào Mac Worker → Kiểm tra / cập nhật Worker, rồi làm mới trang này.
+              </p>
             )}
           </div>
 
@@ -670,7 +678,7 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
               </button>
               <button
                 type="submit"
-                disabled={isSaving}
+                disabled={isSaving || !autoMergeWorkerReady}
                 className="px-5 py-2 rounded-xl bg-brand-700 hover:bg-brand-800 text-white text-xs font-semibold shadow-lg shadow-blue-600/20 transition-all disabled:opacity-50"
               >
                 {isSaving ? 'Saving Job...' : editingJob ? 'Update Job' : 'Create Job'}

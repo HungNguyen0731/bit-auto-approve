@@ -281,6 +281,7 @@ export interface WorkerRecord {
   lastHeartbeatAt?: string;
   lastBitbucketProbeAt?: string;
   activeExecutionId?: string;
+  supportsAutoMerge?: boolean;
   queueDepth: number;
   revokedAt?: string;
 }

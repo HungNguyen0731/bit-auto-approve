@@ -10,6 +10,12 @@ private struct Envelope<T: Decodable>: Decodable { let success: Bool; let data: 
 private struct SessionData: Decodable { let csrfToken: String }
 private struct EmptyData: Decodable { let removed: Bool?; let executionId: String? }
 private struct PairingData: Decodable { let pairUrl: String }
+private struct WorkerBundleManifest: Decodable {
+    let protocolVersion: Int
+    let supportsAutoMerge: Bool
+    let sha256: String
+    let sizeBytes: Int
+}
 private struct CancelledExecution: Decodable { let executionId: String; let status: String }
 private struct UpdateManifest: Decodable {
     let version: String
@@ -43,6 +49,7 @@ private struct Worker: Identifiable, Decodable {
     let revokedAt: String?
     let supportsAccountLeases: Bool?
     let supportsAutoMerge: Bool?
+    let activeExecutionId: String?
 }
 
 private struct Rules: Decodable {
@@ -596,23 +603,41 @@ private struct JobDraft {
             let resources = app.appendingPathComponent("Contents/Resources")
             let pinnedOrigin = resources.appendingPathComponent("control-plane-origin")
             let protocolVersion = resources.appendingPathComponent("control-plane-protocol")
+            let bundle = resources.appendingPathComponent("worker-bundle.mjs")
+            let manifest: WorkerBundleManifest = try await call("GET", "/api/worker-installer/bootstrap/bundle-manifest")
+            guard manifest.protocolVersion == 4, manifest.supportsAutoMerge,
+                  manifest.sha256.range(of: #"^[a-fA-F0-9]{64}$"#, options: .regularExpression) != nil,
+                  (100_000...20_000_000).contains(manifest.sizeBytes) else {
+                throw NSError(domain: "Worker", code: 8, userInfo: [NSLocalizedDescriptionKey: "Server chưa phục vụ Worker có auto-merge. Đợi Coolify cập nhật rồi thử lại."])
+            }
+            func installedBundleMatches() -> Bool {
+                guard let data = try? Data(contentsOf: bundle), data.count == manifest.sizeBytes else { return false }
+                let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                return digest == manifest.sha256.lowercased()
+            }
             var setupNeeded = true
             if FileManager.default.fileExists(atPath: pinnedOrigin.path) {
                 let saved = try String(contentsOf: pinnedOrigin, encoding: .utf8)
                 guard URL(string: saved)?.originString == origin.originString else {
                     throw NSError(domain: "Worker", code: 3, userInfo: [NSLocalizedDescriptionKey: "Portable Worker hiện dùng server khác. Không tự ghi đè launcher cũ."])
                 }
-                setupNeeded = (try? String(contentsOf: protocolVersion, encoding: .utf8)) != "4"
+                setupNeeded = (try? String(contentsOf: protocolVersion, encoding: .utf8)) != "4" || !installedBundleMatches()
             }
             if setupNeeded {
+                if let localId = localWorkerId,
+                   workers.first(where: { $0.id == localId })?.activeExecutionId != nil {
+                    throw NSError(domain: "Worker", code: 9, userInfo: [NSLocalizedDescriptionKey: "Worker đang xử lý job. Đợi lượt hiện tại kết thúc trước khi cập nhật bundle."])
+                }
                 guard let setup = Bundle.main.resourceURL?.appendingPathComponent("portable-setup.sh") else { throw NSError(domain: "Worker", code: 4) }
-                try await runProcess(URL(fileURLWithPath: "/bin/zsh"), [setup.path, origin.originString])
+                try await runProcess(URL(fileURLWithPath: "/bin/zsh"), [setup.path, origin.originString, manifest.sha256.lowercased()])
+                guard installedBundleMatches() else {
+                    throw NSError(domain: "Worker", code: 10, userInfo: [NSLocalizedDescriptionKey: "Bundle Worker sau khi cài không khớp bản server. Thử lại khi Coolify ổn định."])
+                }
             }
             let workerConfiguration = localWorkerConfiguration()
             let configURL = workerConfiguration.url
             let support = configURL.deletingLastPathComponent()
             let node = resources.appendingPathComponent("node")
-            let bundle = resources.appendingPathComponent("worker-bundle.mjs")
             let helper = resources.appendingPathComponent("keychain-helper")
             let env = ["BITBUCKET_WORKER_DATA_DIR": support.path, "BITBUCKET_WORKER_KEYCHAIN_HELPER": helper.path,
                        "BITBUCKET_WORKER_KEYCHAIN_ACCOUNT": workerConfiguration.keychainAccount]
@@ -626,6 +651,12 @@ private struct JobDraft {
             } else {
                 let pairing: PairingData = try await call("POST", "/api/workers/pairing-sessions", ["controlPlaneUrl": origin.originString])
                 try await runProcess(node, [bundle.path, "--pair-url", pairing.pairUrl], environment: env)
+            }
+            if !setupNeeded, let localId = localWorkerId,
+               workers.contains(where: { $0.id == localId && $0.state == "ONLINE" && $0.supportsAutoMerge == true }) {
+                message = "Worker đã là bản mới và đang online; không cần khởi động lại."
+                busy = false
+                return
             }
             let label = "com.hungnv.bitbucket-pr-approver.gui-worker"
             let agents = home.appendingPathComponent("Library/LaunchAgents")

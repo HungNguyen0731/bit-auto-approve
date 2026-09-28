@@ -11,8 +11,13 @@ if [[ "$(id -u)" -eq 0 ]]; then
 fi
 
 control_plane="${1:-}"
+expected_bundle_sha="${2:-}"
 if [[ "$control_plane" != https://* || "$control_plane" == https://*/* || "$control_plane" == *'@'* || "$control_plane" == *'?'* || "$control_plane" == *'#'* ]]; then
   echo "Pass the exact HTTPS Control Plane origin, for example https://approver.example.com" >&2
+  exit 1
+fi
+if [[ -n "$expected_bundle_sha" && ! "$expected_bundle_sha" =~ '^[[:xdigit:]]{64}$' ]]; then
+  echo "Expected Worker bundle SHA-256 is invalid." >&2
   exit 1
 fi
 if ! command -v swiftc >/dev/null 2>&1; then
@@ -26,6 +31,10 @@ base="$control_plane/api/worker-installer/bootstrap"
 for resource in launcher terminal applescript bundle keychain-source; do
   /usr/bin/curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 "$base/$resource" -o "$stage/$resource"
 done
+if [[ -n "$expected_bundle_sha" && "$(/usr/bin/shasum -a 256 "$stage/bundle" | /usr/bin/awk '{ print $1 }')" != "$expected_bundle_sha" ]]; then
+  echo "Worker bundle changed during setup. Try again after the server deployment finishes." >&2
+  exit 1
+fi
 /bin/mv "$stage/keychain-source" "$stage/keychain-helper.swift"
 
 node_version=24.14.0

@@ -74,7 +74,7 @@ export async function registerWorkerInstallerRoutes(
   app: FastifyInstance,
   options: { auth: ControlPlaneAuth }
 ): Promise<void> {
-  const macAppVersion = '0.3.6';
+  const macAppVersion = '0.3.7';
   const macAppName = `Bitbucket-PR-Approver-${macAppVersion}-macOS.zip`;
   const macAppPath = path.resolve(process.cwd(), '../macos-app/releases', macAppName);
   app.get('/api/mac-app/latest', async (_request, reply) => {
@@ -135,6 +135,21 @@ export async function registerWorkerInstallerRoutes(
     ['bundle', { path: path.resolve(process.cwd(), '../worker/dist/worker-bundle.mjs'), type: 'application/javascript' }],
     ['keychain-source', { path: path.resolve(process.cwd(), '../worker/native/keychain-helper.swift'), type: 'text/plain' }],
   ]);
+
+  app.get('/api/worker-installer/bootstrap/bundle-manifest', async (_request, reply) => {
+    const bundlePath = path.resolve(process.cwd(), '../worker/dist/worker-bundle.mjs');
+    if (!fs.existsSync(bundlePath)) {
+      return reply.status(404).send({ success: false, error: { code: 'WORKER_BUNDLE_UNAVAILABLE', message: 'Worker bundle is unavailable' } });
+    }
+    const bundle = fs.readFileSync(bundlePath);
+    reply.header('Cache-Control', 'no-store');
+    return reply.send({ success: true, data: {
+      protocolVersion: 4,
+      supportsAutoMerge: bundle.includes('supportsAutoMerge: true'),
+      sha256: crypto.createHash('sha256').update(bundle).digest('hex'),
+      sizeBytes: bundle.length,
+    } });
+  });
 
   app.get<{ Params: { resource: string } }>('/api/worker-installer/bootstrap/:resource', async (request, reply) => {
     const resource = portableResources.get(request.params.resource);
