@@ -393,6 +393,7 @@ export async function registerWorkerRoutes(
   app.get('/api/worker-executions', async (request, reply) => {
     try {
       ownerContext(request, auth, false);
+      executionDispatcher.expireStaleLeases();
       const query = request.query as { limit?: string; workerId?: string };
       const requested = Number(query.limit ?? 100);
       const limit = Number.isFinite(requested) ? Math.min(Math.max(Math.floor(requested), 1), 300) : 100;

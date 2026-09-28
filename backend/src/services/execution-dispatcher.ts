@@ -12,6 +12,7 @@ import type { WorkerStore } from './worker-store.js';
 import type { AccountStore } from './account-store.js';
 
 const LEASE_DURATION_MS = 45 * 1000;
+const EXPIRED_LEASE_GRACE_MS = 2 * 60 * 1000;
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
@@ -50,6 +51,7 @@ export class ExecutionDispatcher {
   ) {}
 
   markOfflineWorkers(now: Date = new Date()): string[] {
+    this.expireStaleLeases(now);
     const cutoff = new Date(now.getTime() - 35_000).toISOString();
     const workerIds = this.workerStore.markOfflineBefore(cutoff);
     for (const workerId of workerIds) {
@@ -63,6 +65,7 @@ export class ExecutionDispatcher {
     | null {
     if ((job.executionMode ?? 'local') !== 'worker' || !job.workerId || !job.enabled) return null;
 
+    this.expireStaleLeases(now);
     const worker = this.workerStore.getWorker(job.workerId);
     const leases = this.workerStore.getLeases();
     const active = leases.find(
@@ -128,6 +131,7 @@ export class ExecutionDispatcher {
     credential?: { username?: string; ciphertext: string },
     now: Date = new Date()
   ): ExecutionLease {
+    this.expireStaleLeases(now);
     const job = this.storage.getJobById(jobId);
     if (!job) {
       throw Object.assign(new Error('Job not found'), { code: 'JOB_NOT_FOUND', statusCode: 404 });
@@ -197,6 +201,7 @@ export class ExecutionDispatcher {
   }
 
   claim(workerId: string, manualOnly = false, now: Date = new Date(), supportsAccountLeases = false): ExecutionLease | null {
+    this.expireStaleLeases(now);
     const leases = this.workerStore.getLeases();
     if (leases.some((lease) => lease.workerId === workerId &&
         ['LEASED', 'RUNNING'].includes(lease.status) && lease.leasedUntil &&
@@ -286,6 +291,54 @@ export class ExecutionDispatcher {
     );
     this.events.broadcast('execution_completed', result);
     return completed;
+  }
+
+  expireStaleLeases(now: Date = new Date()): number {
+    const leases = this.workerStore.getLeases();
+    let expired = 0;
+    const expiredResults: ExecutionResultSummary[] = [];
+    const updated = leases.map((lease) => {
+      const deadline = lease.leasedUntil ? Date.parse(lease.leasedUntil) : NaN;
+      if (!['LEASED', 'RUNNING'].includes(lease.status) ||
+          !Number.isFinite(deadline) ||
+          deadline + EXPIRED_LEASE_GRACE_MS > now.getTime()) return lease;
+
+      expired++;
+      const completedAt = now.toISOString();
+      const startedAt = lease.startedAt || lease.createdAt;
+      const result: ExecutionResultSummary = {
+        executionId: lease.executionId,
+        workerId: lease.workerId,
+        jobId: lease.jobId,
+        status: 'FAILED',
+        startedAt,
+        completedAt,
+        durationMs: Math.max(0, now.getTime() - Date.parse(startedAt)),
+        repositoriesScanned: 0,
+        pullRequestsScanned: 0,
+        matched: 0,
+        approved: 0,
+        skipped: 0,
+        failed: 1,
+        alreadyApproved: 0,
+        failureReason: 'Worker stopped renewing this execution lease; its result is unknown. Check the Mac Worker before retrying.',
+      };
+      expiredResults.push(result);
+      return {
+        ...lease,
+        status: 'FAILED' as const,
+        completedAt,
+        result,
+        leasedUntil: undefined,
+        manualTokenCiphertext: undefined,
+        accountTokenCiphertext: undefined,
+      };
+    });
+    if (expired > 0) {
+      this.workerStore.saveLeases(updated);
+      for (const result of expiredResults) this.events.broadcast('execution_completed', result);
+    }
+    return expired;
   }
 
   private advanceJobSchedule(job: ApprovalJob, now: Date): void {

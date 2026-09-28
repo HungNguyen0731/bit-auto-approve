@@ -442,7 +442,7 @@ private struct JobDraft {
                 guard URL(string: saved)?.originString == origin.originString else {
                     throw NSError(domain: "Worker", code: 3, userInfo: [NSLocalizedDescriptionKey: "Portable Worker hiện dùng server khác. Không tự ghi đè launcher cũ."])
                 }
-                setupNeeded = (try? String(contentsOf: protocolVersion, encoding: .utf8)) != "2"
+                setupNeeded = (try? String(contentsOf: protocolVersion, encoding: .utf8)) != "3"
             }
             if setupNeeded {
                 guard let setup = Bundle.main.resourceURL?.appendingPathComponent("portable-setup.sh") else { throw NSError(domain: "Worker", code: 4) }
