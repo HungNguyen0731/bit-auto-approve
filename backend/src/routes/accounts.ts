@@ -9,6 +9,8 @@ interface AccountBody {
   username?: string;
   authType: BitbucketAuthType;
   token?: string;
+  cookie?: string;
+  csrfToken?: string;
 }
 
 export async function registerAccountRoutes(app: FastifyInstance, options: {

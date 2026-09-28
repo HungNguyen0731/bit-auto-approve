@@ -46,10 +46,22 @@ export class AccountStore {
     return { account, token: this.crypt.decrypt(encryptedToken) };
   }
 
-  save(input: { name: string; username?: string; authType: BitbucketAuthType; token?: string }, id?: string): BitbucketAccount {
+  save(
+    input: {
+      name: string;
+      username?: string;
+      authType: BitbucketAuthType;
+      token?: string;
+      cookie?: string;
+      csrfToken?: string;
+    },
+    id?: string
+  ): BitbucketAccount {
     if (!input || typeof input.name !== 'string' || typeof input.authType !== 'string' ||
         (input.username !== undefined && typeof input.username !== 'string') ||
-        (input.token !== undefined && typeof input.token !== 'string')) {
+        (input.token !== undefined && typeof input.token !== 'string') ||
+        (input.cookie !== undefined && typeof input.cookie !== 'string') ||
+        (input.csrfToken !== undefined && typeof input.csrfToken !== 'string')) {
       throw Object.assign(new Error('Account name, auth type, and token must be valid strings'), { code: 'VALIDATION_ERROR', statusCode: 400 });
     }
     const now = new Date().toISOString();
@@ -61,17 +73,44 @@ export class AccountStore {
       throw Object.assign(new Error('OAuth accounts must be reconnected through Bitbucket'), { code: 'OAUTH_RECONNECT_REQUIRED', statusCode: 409 });
     }
     const username = input.username?.trim() || undefined;
-    if (!name || name.length > 100 || (username && username.length > 320) || !['basic', 'bearer'].includes(input.authType) ||
-        (input.authType === 'basic' && !username) || (!existing && !input.token) ||
-        (input.token !== undefined && (!input.token.trim() || Buffer.byteLength(input.token) > 318))) {
-      throw Object.assign(new Error('Invalid account name, username, or token (maximum 318 UTF-8 bytes)'), { code: 'VALIDATION_ERROR', statusCode: 400 });
+    if (!name || name.length > 100 || (username && username.length > 320) || !['basic', 'bearer', 'session'].includes(input.authType) ||
+        (input.authType === 'basic' && !username)) {
+      throw Object.assign(new Error('Invalid account name, username, or auth type'), { code: 'VALIDATION_ERROR', statusCode: 400 });
     }
-    const token = input.token?.trim();
+
+    // Determine the raw token string
+    let token = input.token?.trim();
+    if (input.authType === 'session') {
+      if (input.cookie !== undefined || input.csrfToken !== undefined) {
+        const cookie = input.cookie?.trim() || '';
+        const csrfToken = input.csrfToken?.trim() || '';
+        if (cookie || csrfToken) {
+          token = JSON.stringify({ cookie, csrfToken });
+        }
+      }
+    }
+
+    const maxBytes = input.authType === 'session' ? 4096 : 318;
+    if (!existing && !token) {
+      throw Object.assign(new Error(input.authType === 'session' ? 'Session cookie and CSRF token are required' : 'Token is required'), { code: 'VALIDATION_ERROR', statusCode: 400 });
+    }
+    if (token !== undefined && (!token.trim() || Buffer.byteLength(token, 'utf8') > maxBytes)) {
+      throw Object.assign(new Error(`Invalid account token (maximum ${maxBytes} UTF-8 bytes)`), { code: 'VALIDATION_ERROR', statusCode: 400 });
+    }
+
+    const tokenPreview = token
+      ? (input.authType === 'session' ? 'Session auth (cookie + CSRF)' : CryptoService.maskToken(token))
+      : existing!.tokenPreview;
+
     const account: StoredAccount = {
-      id: existing?.id || crypto.randomUUID(), name, username, authType: input.authType,
-      tokenPreview: token ? CryptoService.maskToken(token) : existing!.tokenPreview,
+      id: existing?.id || crypto.randomUUID(),
+      name,
+      username,
+      authType: input.authType,
+      tokenPreview,
       encryptedToken: token ? this.crypt.encrypt(token) : existing!.encryptedToken,
-      createdAt: existing?.createdAt || now, updatedAt: now,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
     };
     this.store.write(existing ? items.map((item) => item.id === id ? account : item) : [...items, account]);
     const { encryptedToken: _encryptedToken, encryptedRefreshToken: _encryptedRefreshToken, ...view } = account;

@@ -132,6 +132,8 @@ private struct AccountDraft {
     var username = ""
     var authType = "bearer"
     var token = ""
+    var cookie = ""
+    var csrfToken = ""
     init() {}
     init(_ account: Account) {
         id = account.id; name = account.name; username = account.username ?? ""; authType = account.authType
@@ -140,7 +142,15 @@ private struct AccountDraft {
         var result: [String: Any] = ["name": name.trimmingCharacters(in: .whitespacesAndNewlines),
                                      "username": username.trimmingCharacters(in: .whitespacesAndNewlines),
                                      "authType": authType]
-        if !token.isEmpty { result["token"] = token }
+        if authType == "session" {
+            let trimmedCookie = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedCsrf = csrfToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedCookie.isEmpty { result["cookie"] = trimmedCookie }
+            if !trimmedCsrf.isEmpty { result["csrfToken"] = trimmedCsrf }
+            if !token.isEmpty { result["token"] = token }
+        } else {
+            if !token.isEmpty { result["token"] = token }
+        }
         return result
     }
 }
@@ -1195,9 +1205,18 @@ private struct AppView: View {
           Form {
             Text(draftAccount.id == nil ? "Tạo Bitbucket account" : "Sửa Bitbucket account").font(.title2.bold())
             TextField("Tên gợi nhớ", text: $draftAccount.name)
-            Picker("Kiểu token", selection: $draftAccount.authType) { Text("Bearer").tag("bearer"); Text("Basic (username + token)").tag("basic") }
+            Picker("Kiểu token", selection: $draftAccount.authType) {
+                Text("Bearer").tag("bearer")
+                Text("Basic (username + token)").tag("basic")
+                Text("Session Auth (Cookie + CSRF)").tag("session")
+            }
             if draftAccount.authType == "basic" { TextField("Username / email", text: $draftAccount.username) }
-            SecureField(draftAccount.id == nil ? "Token" : "Token mới (để trống nếu giữ nguyên)", text: $draftAccount.token)
+            if draftAccount.authType == "session" {
+                SecureField("Session Cookie (header 'cookie')", text: $draftAccount.cookie)
+                TextField("CSRF Token (x-csrftoken)", text: $draftAccount.csrfToken)
+            } else {
+                SecureField(draftAccount.id == nil ? "Token" : "Token mới (để trống nếu giữ nguyên)", text: $draftAccount.token)
+            }
             Text("Token được mã hóa trên server; không lưu trong UserDefaults hoặc file cấu hình Mac.").font(.caption).foregroundStyle(.secondary)
           }
           VStack(alignment: .leading, spacing: 10) {

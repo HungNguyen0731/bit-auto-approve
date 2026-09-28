@@ -118,11 +118,30 @@ export class StorageService {
 
     // If no new token provided, preserve existing token
     let tokenToEncrypt = config.token;
-    let tokenPreview = config.token ? CryptoService.maskToken(config.token) : undefined;
+    if (config.authType === 'session') {
+      if (config.cookie !== undefined || config.csrfToken !== undefined) {
+        const cookie = config.cookie?.trim() || '';
+        const csrfToken = config.csrfToken?.trim() || '';
+        if (cookie || csrfToken) {
+          tokenToEncrypt = JSON.stringify({ cookie, csrfToken });
+        }
+      }
+    }
+
+    let tokenPreview: string | undefined;
+    if (config.authType === 'session') {
+      tokenPreview = 'Session auth (cookie + CSRF)';
+    } else if (tokenToEncrypt) {
+      tokenPreview = CryptoService.maskToken(tokenToEncrypt);
+    }
 
     if (!tokenToEncrypt && existing?.token) {
       tokenToEncrypt = existing.token;
-      tokenPreview = CryptoService.maskToken(existing.token);
+      if (config.authType === 'session' || existing.authType === 'session') {
+        tokenPreview = 'Session auth (cookie + CSRF)';
+      } else {
+        tokenPreview = CryptoService.maskToken(existing.token);
+      }
     }
 
     let encryptedToken: EncryptedData | undefined;

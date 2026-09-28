@@ -51,6 +51,8 @@ export async function registerConfigRoutes(
       baseUrl: body.baseUrl?.trim() || existing?.baseUrl || 'https://api.bitbucket.org/2.0',
       authType: body.authType || existing?.authType || 'basic',
       token: body.token,
+      cookie: body.cookie,
+      csrfToken: body.csrfToken,
       username: body.username !== undefined ? body.username?.trim() : existing?.username,
       workspace: body.workspace !== undefined ? body.workspace?.trim() : existing?.workspace,
       skipSslVerification: body.skipSslVerification !== undefined
@@ -84,11 +86,23 @@ export async function registerConfigRoutes(
     const body = req.body || {};
     const existing = storage.getConfig();
 
+    let testToken = body.token || existing?.token;
+    if (body.authType === 'session' || (!body.authType && existing?.authType === 'session')) {
+      if (body.cookie !== undefined || body.csrfToken !== undefined) {
+        testToken = JSON.stringify({
+          cookie: body.cookie?.trim() || '',
+          csrfToken: body.csrfToken?.trim() || '',
+        });
+      }
+    }
+
     const configToTest: BitbucketConnectionConfig = {
       serverType: 'cloud',
       baseUrl: body.baseUrl?.trim() || existing?.baseUrl || 'https://api.bitbucket.org/2.0',
       authType: body.authType || existing?.authType || 'basic',
-      token: body.token || existing?.token,
+      token: testToken,
+      cookie: body.cookie,
+      csrfToken: body.csrfToken,
       username: body.username !== undefined ? body.username?.trim() : existing?.username,
       workspace: body.workspace !== undefined ? body.workspace?.trim() : existing?.workspace,
       skipSslVerification: body.skipSslVerification !== undefined ? body.skipSslVerification : existing?.skipSslVerification,
@@ -101,7 +115,9 @@ export async function registerConfigRoutes(
         success: false,
         error: {
           code: 'VALIDATION_ERROR',
-          message: 'Bitbucket Cloud App Password / token is required to verify connection',
+          message: configToTest.authType === 'session'
+            ? 'Session cookie and CSRF token are required to verify connection'
+            : 'Bitbucket Cloud App Password / token is required to verify connection',
           httpStatus: 400,
           rateLimitReset: null,
           details: null,

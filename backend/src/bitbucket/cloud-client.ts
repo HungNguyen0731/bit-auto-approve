@@ -21,12 +21,32 @@ export class BitbucketCloudClient implements IBitbucketClient {
   private readonly config: BitbucketConnectionConfig;
   private readonly dispatcher?: Dispatcher;
   private readonly minRequestIntervalMs: number;
+  private readonly sessionCookie?: string;
+  private readonly sessionCsrfToken?: string;
 
   constructor(config: BitbucketConnectionConfig, minRequestIntervalMs = 0) {
     this.config = config;
     this.minRequestIntervalMs = Math.min(Math.max(minRequestIntervalMs, 0), 10_000);
     // Runtime is Cloud-only: legacy persisted Server/Data Center URLs are never contacted.
     this.baseUrl = 'https://api.bitbucket.org/2.0';
+
+    if (config.authType === 'session') {
+      let cookie = config.cookie;
+      let csrfToken = config.csrfToken;
+      if ((!cookie || !csrfToken) && config.token) {
+        try {
+          const parsed = JSON.parse(config.token);
+          if (typeof parsed === 'object' && parsed !== null) {
+            cookie = cookie || parsed.cookie;
+            csrfToken = csrfToken || parsed.csrfToken;
+          }
+        } catch {
+          // token might not be JSON
+        }
+      }
+      this.sessionCookie = cookie;
+      this.sessionCsrfToken = csrfToken;
+    }
 
     if (config.proxyUrl) {
       this.dispatcher = new ProxyAgent(config.proxyUrl);
@@ -39,8 +59,11 @@ export class BitbucketCloudClient implements IBitbucketClient {
     }
   }
 
-  private getAuthHeader(): string {
+  private getAuthHeader(): string | undefined {
     const { authType, token, username } = this.config;
+    if (authType === 'session') {
+      return undefined;
+    }
     if (authType === 'basic' && username && token) {
       const creds = Buffer.from(`${username}:${token}`).toString('base64');
       return `Basic ${creds}`;
@@ -75,9 +98,20 @@ export class BitbucketCloudClient implements IBitbucketClient {
 
     const headers: Record<string, string> = {
       Accept: 'application/json',
-      Authorization: this.getAuthHeader(),
       ...options.headers,
     };
+
+    const authHeader = this.getAuthHeader();
+    if (authHeader) {
+      headers.Authorization = authHeader;
+    } else if (this.config.authType === 'session') {
+      if (this.sessionCookie) {
+        headers.cookie = this.sessionCookie;
+      }
+      if (this.sessionCsrfToken) {
+        headers['x-csrftoken'] = this.sessionCsrfToken;
+      }
+    }
 
     let bodyStr: string | undefined;
     if (options.body) {
@@ -281,6 +315,24 @@ export class BitbucketCloudClient implements IBitbucketClient {
   }
 
   async approvePullRequest(repo: RepositoryRef, prId: number): Promise<{ success: boolean; message: string }> {
+    if (this.config.authType === 'session') {
+      const url = `https://bitbucket.org/!api/2.0/repositories/${encodeURIComponent(repo.projectOrWorkspace)}/${encodeURIComponent(repo.slug)}/pullrequests/${prId}/approve`;
+      const prUrl = `https://bitbucket.org/${encodeURIComponent(repo.projectOrWorkspace)}/${encodeURIComponent(repo.slug)}/pull-requests/${prId}`;
+      const headers: Record<string, string> = {
+        'x-csrftoken': this.sessionCsrfToken || '',
+        'x-requested-with': 'XMLHttpRequest',
+        origin: 'https://bitbucket.org',
+        referer: prUrl,
+        ...(this.sessionCookie ? { cookie: this.sessionCookie } : {}),
+      };
+      const res = await this.request<any>(url, { method: 'POST', body: {}, headers });
+      const status = res?.status || 'APPROVED';
+      return {
+        success: true,
+        message: `Successfully approved PR #${prId} in ${repo.projectOrWorkspace}/${repo.slug} (Status: ${status})`,
+      };
+    }
+
     const path = `/repositories/${encodeURIComponent(repo.projectOrWorkspace)}/${encodeURIComponent(repo.slug)}/pullrequests/${prId}/approve`;
     const res = await this.request<any>(path, { method: 'POST', body: {} });
     const status = res?.status || 'APPROVED';
@@ -310,6 +362,20 @@ export class BitbucketCloudClient implements IBitbucketClient {
   }
 
   async mergePullRequest(repo: RepositoryRef, prId: number): Promise<void> {
+    if (this.config.authType === 'session') {
+      const url = `https://bitbucket.org/!api/2.0/repositories/${encodeURIComponent(repo.projectOrWorkspace)}/${encodeURIComponent(repo.slug)}/pullrequests/${prId}/merge?async=true`;
+      const prUrl = `https://bitbucket.org/${encodeURIComponent(repo.projectOrWorkspace)}/${encodeURIComponent(repo.slug)}/pull-requests/${prId}`;
+      const headers: Record<string, string> = {
+        'x-csrftoken': this.sessionCsrfToken || '',
+        'x-requested-with': 'XMLHttpRequest',
+        origin: 'https://bitbucket.org',
+        referer: prUrl,
+        ...(this.sessionCookie ? { cookie: this.sessionCookie } : {}),
+      };
+      await this.request(url, { method: 'POST', body: { close_source_branch: false }, headers });
+      return;
+    }
+
     const path = `/repositories/${encodeURIComponent(repo.projectOrWorkspace)}/${encodeURIComponent(repo.slug)}/pullrequests/${prId}/merge`;
     await this.request(path, { method: 'POST', body: { close_source_branch: false } });
   }

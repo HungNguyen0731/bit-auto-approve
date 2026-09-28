@@ -25,8 +25,28 @@ const BITBUCKET_REQUEST_INTERVAL_MS = 4_000;
 export class WorkerExecutor {
   constructor(private readonly verificationMode = false) {}
 
+  private buildBitbucketConfig(lease: ExecutionLease, token: string) {
+    if (lease.bitbucketConfig.authType === 'session') {
+      try {
+        const parsed = JSON.parse(token);
+        if (typeof parsed === 'object' && parsed !== null) {
+          return {
+            ...lease.bitbucketConfig,
+            token,
+            cookie: parsed.cookie,
+            csrfToken: parsed.csrfToken,
+          };
+        }
+      } catch {
+        // Not JSON, pass as is
+      }
+    }
+    return { ...lease.bitbucketConfig, token };
+  }
+
   async probe(lease: ExecutionLease, token: string): Promise<void> {
-    const client = new BitbucketCloudClient({ ...lease.bitbucketConfig, token }, BITBUCKET_REQUEST_INTERVAL_MS);
+    const config = this.buildBitbucketConfig(lease, token);
+    const client = new BitbucketCloudClient(config, BITBUCKET_REQUEST_INTERVAL_MS);
     await client.getCurrentUser();
   }
 
@@ -60,7 +80,8 @@ export class WorkerExecutor {
         },
       };
     }
-    const client = new BitbucketCloudClient({ ...lease.bitbucketConfig, token }, BITBUCKET_REQUEST_INTERVAL_MS);
+    const config = this.buildBitbucketConfig(lease, token);
+    const client = new BitbucketCloudClient(config, BITBUCKET_REQUEST_INTERVAL_MS);
     const currentUser = await client.getCurrentUser();
     const repositories = await this.resolveRepositories(client, lease);
     const logs: WorkerLogEntry[] = [];

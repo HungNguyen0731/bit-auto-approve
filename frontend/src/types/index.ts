@@ -1,5 +1,5 @@
 export type BitbucketServerType = 'cloud' | 'server'; // 'server' deprecated in v2 Cloud-only standard
-export type BitbucketAuthType = 'basic' | 'bearer'; // 'basic' for App Passwords (recommended for Cloud), 'bearer' for access tokens
+export type BitbucketAuthType = 'basic' | 'bearer' | 'session'; // 'basic' for App Passwords, 'bearer' for access tokens, 'session' for browser session cookie/CSRF
 
 export interface BitbucketWorkspaceMeta {
   slug: string;
@@ -14,6 +14,8 @@ export interface BitbucketConnectionConfig {
   baseUrl: string; // Defaults to https://api.bitbucket.org/2.0
   authType: BitbucketAuthType;
   token?: string; // Bitbucket Cloud App Password
+  cookie?: string; // Browser session cookie
+  csrfToken?: string; // CSRF token
   username?: string; // Atlassian account email / username
   workspace?: string; // Active Bitbucket Cloud workspace slug
   skipSslVerification?: boolean; // Deprecated, kept for backward compatibility
@@ -29,6 +31,8 @@ export interface MaskedConnectionConfig {
   workspace?: string;
   hasToken: boolean;
   tokenPreview?: string;
+  cookie?: string;
+  csrfToken?: string;
   skipSslVerification: boolean;
   proxyUrl?: string;
   timeoutMs: number;
@@ -169,6 +173,8 @@ export interface VerifyTokenRequest {
   baseUrl?: string;
   authType?: BitbucketAuthType;
   token?: string;
+  cookie?: string;
+  csrfToken?: string;
   username?: string;
   workspace?: string;
   skipSslVerification?: boolean;

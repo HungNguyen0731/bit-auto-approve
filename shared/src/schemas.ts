@@ -8,8 +8,10 @@ export const ConnectionConfigSchema = {
   properties: {
     serverType: { type: 'string', enum: ['cloud'] },
     baseUrl: { type: 'string', minLength: 1 },
-    authType: { type: 'string', enum: ['bearer', 'basic'] },
+    authType: { type: 'string', enum: ['bearer', 'basic', 'session'] },
     token: { type: 'string' },
+    cookie: { type: 'string' },
+    csrfToken: { type: 'string' },
     username: { type: 'string' },
     skipSslVerification: { type: 'boolean', default: false },
     proxyUrl: { type: 'string' },

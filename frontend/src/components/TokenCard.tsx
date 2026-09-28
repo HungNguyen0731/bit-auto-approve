@@ -38,9 +38,11 @@ export const TokenCard: React.FC<TokenCardProps> = ({
 }) => {
   const serverType: BitbucketServerType = 'cloud';
   const baseUrl = 'https://api.bitbucket.org/2.0';
-  const authType: BitbucketAuthType = 'basic';
+  const [authType, setAuthType] = useState<BitbucketAuthType>('basic');
   const [username, setUsername] = useState<string>('');
   const [token, setToken] = useState<string>('');
+  const [cookie, setCookie] = useState<string>('');
+  const [csrfToken, setCsrfToken] = useState<string>('');
   const [showToken, setShowToken] = useState<boolean>(false);
   const [selectedWorkspace, setSelectedWorkspace] = useState<string>('');
   const [skipSsl, setSkipSsl] = useState<boolean>(false);
@@ -53,6 +55,7 @@ export const TokenCard: React.FC<TokenCardProps> = ({
   // Sync with initial config loaded from server
   useEffect(() => {
     if (config) {
+      setAuthType(config.authType || 'basic');
       setUsername(config.username || '');
       setSelectedWorkspace(config.workspace || '');
       setSkipSsl(Boolean(config.skipSslVerification));
@@ -70,6 +73,8 @@ export const TokenCard: React.FC<TokenCardProps> = ({
         baseUrl: baseUrl.trim(),
         authType,
         token: token.trim() || undefined,
+        cookie: cookie.trim() || undefined,
+        csrfToken: csrfToken.trim() || undefined,
         username: username.trim() || undefined,
         workspace: selectedWorkspace || config?.workspace,
         skipSslVerification: skipSsl,
@@ -90,6 +95,8 @@ export const TokenCard: React.FC<TokenCardProps> = ({
       baseUrl: baseUrl.trim(),
       authType,
       token: token.trim() || undefined,
+      cookie: cookie.trim() || undefined,
+      csrfToken: csrfToken.trim() || undefined,
       username: username.trim() || undefined,
       workspace: selectedWorkspace || verifiedUser?.selectedWorkspace || config?.workspace,
       skipSslVerification: skipSsl,
@@ -99,6 +106,12 @@ export const TokenCard: React.FC<TokenCardProps> = ({
     // Clear in-memory raw token input after save for hygiene
     if (token) {
       setToken('');
+    }
+    if (cookie) {
+      setCookie('');
+    }
+    if (csrfToken) {
+      setCsrfToken('');
     }
   };
 
@@ -160,67 +173,108 @@ export const TokenCard: React.FC<TokenCardProps> = ({
             </label>
             <select
               value={authType}
-              disabled
+              onChange={(e) => setAuthType(e.target.value as BitbucketAuthType)}
               className="w-full bg-app-panel-strong border border-app-line focus:border-blue-500 focus:ring-1 focus:ring-blue-500 rounded-xl px-3.5 py-2 text-sm text-slate-900 outline-none transition-all"
             >
-              <option value="bearer">Bearer Token (Personal Access Token)</option>
               <option value="basic">Basic Auth / App Password</option>
+              <option value="bearer">Bearer Token (Personal Access Token)</option>
+              <option value="session">Session Auth (Cookie + CSRF)</option>
             </select>
             <span className="text-[11px] text-slate-600 mt-1 block">
-              Requires username + App Password
+              {authType === 'basic' && 'Requires username + App Password'}
+              {authType === 'bearer' && 'Requires Bearer / Access token'}
+              {authType === 'session' && 'Uses browser session cookies + CSRF token to bypass REST rate limits'}
             </span>
           </div>
         </div>
 
-        {/* Username & Token Row */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {authType === 'basic' && (
+        {/* Auth Credentials Row */}
+        {authType === 'session' ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-medium text-slate-700 mb-1.5">
-                Username / Email <span className="text-rose-700">*</span>
-              </label>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-xs font-medium text-slate-700">
+                  Session Cookie (header 'cookie') <span className="text-rose-700">*</span>
+                </label>
+                {config?.hasToken && config.authType === 'session' && (
+                  <span className="text-[11px] text-emerald-700 flex items-center gap-1 font-mono">
+                    <Lock className="w-3 h-3" /> Saved session
+                  </span>
+                )}
+              </div>
               <input
-                type="text"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="developer.username"
-                className="w-full bg-app-panel-strong border border-app-line focus:border-blue-500 focus:ring-1 focus:ring-blue-500 rounded-xl px-3.5 py-2 text-sm text-slate-900 placeholder-slate-600 outline-none transition-all"
-              />
-            </div>
-          )}
-
-          <div>
-            <div className="flex items-center justify-between mb-1.5">
-              <label className="text-xs font-medium text-slate-700">
-                App Password / Secret
-                {!config?.hasToken && <span className="text-rose-700 ml-1">*</span>}
-              </label>
-              {config?.hasToken && (
-                <span className="text-[11px] text-emerald-700 flex items-center gap-1 font-mono">
-                  <Lock className="w-3 h-3" /> Saved: {config.tokenPreview}
-                </span>
-              )}
-            </div>
-
-            <div className="relative">
-              <input
-                type={showToken ? 'text' : 'password'}
-                value={token}
-                onChange={(e) => setToken(e.target.value)}
-                placeholder={config?.hasToken ? 'Enter new token to update (or leave blank to keep saved)' : 'Paste Personal Access Token here'}
+                type="password"
+                value={cookie}
+                onChange={(e) => setCookie(e.target.value)}
+                placeholder={config?.hasToken && config.authType === 'session' ? 'Leave blank to keep saved cookie' : 'cloud.session.token=...; bb_session=...'}
                 className="w-full bg-app-panel-strong border border-app-line focus:border-blue-500 focus:ring-1 focus:ring-blue-500 rounded-xl px-3.5 py-2 text-sm text-slate-900 placeholder-slate-600 outline-none transition-all font-mono"
               />
-              <button
-                type="button"
-                onClick={() => setShowToken(!showToken)}
-                className="absolute right-3 top-2.5 text-slate-500 hover:text-slate-700 p-0.5 rounded transition-colors"
-                title={showToken ? 'Hide token' : 'Show token'}
-              >
-                {showToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-              </button>
+            </div>
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-xs font-medium text-slate-700">
+                  CSRF Token (x-csrftoken) <span className="text-rose-700">*</span>
+                </label>
+              </div>
+              <input
+                type="text"
+                value={csrfToken}
+                onChange={(e) => setCsrfToken(e.target.value)}
+                placeholder={config?.hasToken && config.authType === 'session' ? 'Leave blank to keep saved CSRF token' : 'CSRF token value'}
+                className="w-full bg-app-panel-strong border border-app-line focus:border-blue-500 focus:ring-1 focus:ring-blue-500 rounded-xl px-3.5 py-2 text-sm text-slate-900 placeholder-slate-600 outline-none transition-all font-mono"
+              />
             </div>
           </div>
-        </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {authType === 'basic' && (
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1.5">
+                  Username / Email <span className="text-rose-700">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="developer.username"
+                  className="w-full bg-app-panel-strong border border-app-line focus:border-blue-500 focus:ring-1 focus:ring-blue-500 rounded-xl px-3.5 py-2 text-sm text-slate-900 placeholder-slate-600 outline-none transition-all"
+                />
+              </div>
+            )}
+
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-xs font-medium text-slate-700">
+                  {authType === 'basic' ? 'App Password / Secret' : 'Bearer Token'}
+                  {!config?.hasToken && <span className="text-rose-700 ml-1">*</span>}
+                </label>
+                {config?.hasToken && config.authType !== 'session' && (
+                  <span className="text-[11px] text-emerald-700 flex items-center gap-1 font-mono">
+                    <Lock className="w-3 h-3" /> Saved: {config.tokenPreview}
+                  </span>
+                )}
+              </div>
+
+              <div className="relative">
+                <input
+                  type={showToken ? 'text' : 'password'}
+                  value={token}
+                  onChange={(e) => setToken(e.target.value)}
+                  placeholder={config?.hasToken ? 'Enter new token to update (or leave blank to keep saved)' : 'Paste Personal Access Token here'}
+                  className="w-full bg-app-panel-strong border border-app-line focus:border-blue-500 focus:ring-1 focus:ring-blue-500 rounded-xl px-3.5 py-2 text-sm text-slate-900 placeholder-slate-600 outline-none transition-all font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowToken(!showToken)}
+                  className="absolute right-3 top-2.5 text-slate-500 hover:text-slate-700 p-0.5 rounded transition-colors"
+                  title={showToken ? 'Hide token' : 'Show token'}
+                >
+                  {showToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Advanced Corporate Network Options Accordion */}
         <div className="pt-1">
