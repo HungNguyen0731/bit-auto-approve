@@ -128,6 +128,7 @@ export interface WorkerRunRecord {
   jobName: string;
   workerId: string;
   trigger: ExecutionTrigger;
+  dryRun?: boolean;
   status: ExecutionStatus;
   createdAt: string;
   startedAt?: string;
@@ -183,6 +184,7 @@ export interface ExecutionResultSummary {
   pullRequestsScanned: number;
   matched: number;
   approved: number;
+  wouldApprove?: number;
   skipped: number;
   failed: number;
   alreadyApproved: number;

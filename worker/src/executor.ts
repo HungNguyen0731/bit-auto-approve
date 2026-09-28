@@ -63,6 +63,7 @@ export class WorkerExecutor {
     let pullRequestsScanned = 0;
     let matched = 0;
     let approved = 0;
+    let wouldApprove = 0;
     let skipped = 0;
     let failed = 0;
     let alreadyApproved = 0;
@@ -85,7 +86,7 @@ export class WorkerExecutor {
           skipped++;
         } else if (lease.job.dryRun) {
           status = 'DRY_RUN';
-          approved++;
+          wouldApprove++;
         } else {
           try {
             await client.approvePullRequest(repository, pullRequest.id);
@@ -128,6 +129,7 @@ export class WorkerExecutor {
         pullRequestsScanned,
         matched,
         approved,
+        wouldApprove,
         skipped,
         failed,
         alreadyApproved,

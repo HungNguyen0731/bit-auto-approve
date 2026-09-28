@@ -1,5 +1,5 @@
 export const MAC_APP_DOWNLOAD_URL =
-  'https://raw.githubusercontent.com/HungNguyen0731/bit-auto-approve/4238a38/macos-app/releases/Bitbucket-PR-Approver-0.3.4-macOS.zip';
+  'https://raw.githubusercontent.com/HungNguyen0731/bit-auto-approve/main/macos-app/releases/Bitbucket-PR-Approver-0.3.5-macOS.zip';
 
 export const MAC_APP_FALLBACK_URL =
-  '/downloads/Bitbucket-PR-Approver-0.3.4-macOS.zip';
+  '/downloads/Bitbucket-PR-Approver-0.3.5-macOS.zip';

@@ -2,12 +2,19 @@ import AppKit
 import Foundation
 import SwiftUI
 import Darwin
+import CryptoKit
 
 private struct APIError: Decodable { let code: String?; let message: String? }
 private struct Envelope<T: Decodable>: Decodable { let success: Bool; let data: T?; let error: APIError? }
 private struct SessionData: Decodable { let csrfToken: String }
 private struct EmptyData: Decodable { let removed: Bool?; let executionId: String? }
 private struct PairingData: Decodable { let pairUrl: String }
+private struct UpdateManifest: Decodable {
+    let version: String
+    let downloadUrl: String
+    let sha256: String
+    let sizeBytes: Int
+}
 
 private final class SameOriginRedirects: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
@@ -82,6 +89,7 @@ private struct WorkerRun: Identifiable, Decodable {
     let jobName: String
     let workerId: String
     let trigger: String
+    let dryRun: Bool?
     let status: String
     let createdAt: String
     let startedAt: String?
@@ -94,6 +102,7 @@ private struct RunSummary: Decodable {
     let pullRequestsScanned: Int
     let matched: Int
     let approved: Int
+    let wouldApprove: Int?
     let skipped: Int
     let failed: Int
     let alreadyApproved: Int
@@ -189,6 +198,9 @@ private struct JobDraft {
     @Published var selectedWorkerId = ""
     @Published var historyError = ""
     @Published var historyLoading = false
+    @Published var availableUpdate: UpdateManifest?
+    @Published var updateBusy = false
+    @Published var updateMessage = ""
     private var historyGeneration = 0
     private var csrf = ""
     private let session: URLSession = {
@@ -203,6 +215,84 @@ private struct JobDraft {
               (url.path.isEmpty || url.path == "/"), url.query == nil, url.fragment == nil else { return nil }
         guard scheme == "https" || (scheme == "http" && ["localhost", "127.0.0.1", "::1"].contains(host)) else { return nil }
         return url
+    }
+
+    func checkForUpdate() async {
+        guard !updateBusy, let base = origin,
+              let url = URL(string: "/api/mac-app/latest", relativeTo: base)?.absoluteURL else { return }
+        do {
+            let (data, response) = try await session.data(from: url)
+            guard (response as? HTTPURLResponse)?.statusCode == 200, data.count < 4096,
+                  let envelope = try? JSONDecoder().decode(Envelope<UpdateManifest>.self, from: data),
+                  envelope.success, let manifest = envelope.data,
+                  manifest.version.range(of: #"^\d+\.\d+\.\d+$"#, options: .regularExpression) != nil,
+                  manifest.version.compare(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0", options: .numeric) == .orderedDescending,
+                  manifest.downloadUrl == "/downloads/Bitbucket-PR-Approver-\(manifest.version)-macOS.zip",
+                  manifest.sha256.range(of: #"^[a-fA-F0-9]{64}$"#, options: .regularExpression) != nil,
+                  (100_000...100_000_000).contains(manifest.sizeBytes) else { return }
+            availableUpdate = manifest
+        } catch { /* Update checks must not interrupt job management. */ }
+    }
+
+    func installUpdate() async {
+        guard !updateBusy, let manifest = availableUpdate, let base = origin,
+              let url = URL(string: manifest.downloadUrl, relativeTo: base)?.absoluteURL,
+              url.originString == base.originString else { return }
+        updateBusy = true
+        updateMessage = "Đang tải bản \(manifest.version)…"
+        do {
+            let (downloaded, response) = try await session.download(from: url)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw updateError("Tải bản cập nhật thất bại.") }
+            let stage = FileManager.default.temporaryDirectory.appendingPathComponent("bitbucket-pr-update-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: stage, withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+            let archive = stage.appendingPathComponent("update.zip")
+            try FileManager.default.copyItem(at: downloaded, to: archive)
+            let bytes = try Data(contentsOf: archive)
+            guard bytes.count == manifest.sizeBytes,
+                  SHA256.hash(data: bytes).map({ String(format: "%02x", $0) }).joined() == manifest.sha256.lowercased() else {
+                throw updateError("File tải về không khớp SHA-256. Không cài đặt.")
+            }
+            updateMessage = "Đang xác minh ứng dụng…"
+            let unpacked = stage.appendingPathComponent("unpacked", isDirectory: true)
+            try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: false)
+            try runTool("/usr/bin/ditto", ["-xk", archive.path, unpacked.path])
+            let candidate = unpacked.appendingPathComponent("Bitbucket PR Approver.app", isDirectory: true)
+            guard let bundle = Bundle(url: candidate),
+                  bundle.bundleIdentifier == "com.hungnv.bitbucket-pr-approver.mac",
+                  bundle.infoDictionary?["CFBundleShortVersionString"] as? String == manifest.version else {
+                throw updateError("Ứng dụng trong bản tải về không hợp lệ.")
+            }
+            try runTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", candidate.path])
+            guard let bundledHelper = Bundle.main.url(forResource: "update-app", withExtension: "sh") else {
+                throw updateError("Bản app hiện tại thiếu trình cập nhật. Hãy tải bản mới từ website.")
+            }
+            let helper = stage.appendingPathComponent("update-app.sh")
+            try FileManager.default.copyItem(at: bundledHelper, to: helper)
+            let target = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Applications/Bitbucket PR Approver.app", isDirectory: true)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.arguments = [helper.path, candidate.path, target.path, String(ProcessInfo.processInfo.processIdentifier), manifest.version]
+            try process.run()
+            NSApplication.shared.terminate(nil)
+        } catch {
+            updateMessage = error.localizedDescription
+            updateBusy = false
+        }
+    }
+
+    private func updateError(_ message: String) -> NSError {
+        NSError(domain: "App Update", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    private func runTool(_ path: String, _ arguments: [String]) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { throw updateError("Không xác minh được bản cập nhật.") }
     }
 
     private func localWorkerConfiguration() -> (url: URL, keychainAccount: String) {
@@ -386,7 +476,9 @@ private struct JobDraft {
         }
         do {
             let _: EmptyData = try await call("POST", "/api/jobs/\(job.id)/run-now", [:], emptyValue: EmptyData(removed: nil, executionId: nil))
-            message = "Đã đưa lệnh đến Worker trên Mac này. Bitbucket chỉ được gọi từ Mac; xem trạng thái trong Logs."
+            message = job.dryRun
+                ? "Đã chạy mô phỏng trên Mac. Dry Run không gửi lệnh approve lên Bitbucket; xem kết quả trong Logs."
+                : "Đã đưa lệnh approve thật đến Worker trên Mac này; xem trạng thái trong Logs."
             await refresh()
         } catch { message = error.localizedDescription }
     }
@@ -570,9 +662,11 @@ private struct AppView: View {
     @State private var selectedTab = 0
     @State private var selectedRunId: String?
     @State private var runFilter = "Tất cả"
+    @State private var confirmUpdate = false
 
     var body: some View {
-        Group {
+        VStack(spacing: 0) {
+            if model.availableUpdate != nil { updateBanner }
             if model.authenticated { content } else { login }
         }
         .frame(minWidth: 1100, minHeight: 700)
@@ -593,9 +687,37 @@ private struct AppView: View {
                 jobToDelete = nil
             }
         } message: { Text("Job sẽ ngừng được xếp lịch. Lượt đã nhận/chờ Worker vẫn có thể hoàn tất; không thể khôi phục job từ GUI.") }
+        .confirmationDialog("Cài bản cập nhật?", isPresented: $confirmUpdate) {
+            Button("Cập nhật & khởi động lại") { Task { await model.installUpdate() } }
+            Button("Để sau", role: .cancel) {}
+        } message: {
+            Text("App sẽ tải và xác minh bản mới, cài vào ~/Applications, giữ bản cũ để khôi phục rồi khởi động lại. Hãy lưu biểu mẫu đang sửa trước khi tiếp tục.")
+        }
+        .task { await model.checkForUpdate() }
         .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { _ in
             if model.authenticated && !model.needsReauth && !model.busy { Task { await model.refresh() } }
         }
+        .onReceive(Timer.publish(every: 600, on: .main, in: .common).autoconnect()) { _ in
+            Task { await model.checkForUpdate() }
+        }
+    }
+
+    private var updateBanner: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.down.app.fill").foregroundStyle(AppPalette.blue)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Có bản mới \(model.availableUpdate?.version ?? "")").font(.subheadline.bold())
+                Text(model.updateMessage.isEmpty ? "Bản cập nhật sẵn sàng để tải và cài đặt." : model.updateMessage)
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if model.updateBusy { ProgressView().controlSize(.small) }
+            Button("Để sau") { model.availableUpdate = nil }.disabled(model.updateBusy)
+            Button("Cập nhật") { confirmUpdate = true }
+                .buttonStyle(.borderedProminent).disabled(model.updateBusy || showingAccount || showingJob)
+        }
+        .padding(.horizontal, 24).padding(.vertical, 10)
+        .background(AppPalette.canvas)
     }
 
     private var login: some View {
@@ -986,7 +1108,7 @@ private struct AppView: View {
                                 model.selectedWorkerId = job.workerId ?? ""
                                 await model.runJob(job)
                                 selectedTab = 4; selectedRunId = nil
-                            } } label: { Label("Run ngay", systemImage: "play.fill") }
+                            } } label: { Label(job.dryRun ? "Chạy mô phỏng" : "Run ngay", systemImage: "play.fill") }
                                 .buttonStyle(.borderedProminent)
                         } else {
                             Button("Thiết lập Mac") {
@@ -1210,7 +1332,7 @@ private struct AppView: View {
                                 Text("\(displayDate(run.createdAt)) · \(run.trigger == "MANUAL" ? "Run thủ công" : "Lịch tự động")")
                                     .font(.caption).foregroundStyle(.secondary)
                                 if let result = run.result {
-                                    Text("PR \(result.pullRequestsScanned) · Approve \(result.approved) · Bỏ qua \(result.skipped) · Lỗi \(result.failed)")
+                                    Text("PR \(result.pullRequestsScanned) · \(approvalSummary(run)) · Bỏ qua \(result.skipped) · Lỗi \(result.failed)")
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
                             }
@@ -1266,6 +1388,10 @@ private struct AppView: View {
                     Text(statusLabel(run.status)).font(.title2.bold())
                 }
                 Text(run.jobName).font(.headline)
+                if run.dryRun == true {
+                    Label("Dry Run — chỉ mô phỏng, chưa gửi approve lên Bitbucket", systemImage: "eye")
+                        .font(.subheadline.bold()).foregroundStyle(.orange)
+                }
                 Text("Bắt đầu: \(displayDate(run.startedAt ?? run.createdAt))")
                 if let completed = run.completedAt { Text("Kết thúc: \(displayDate(completed))") }
                 Text("Lượt chạy: \(run.executionId)").font(.caption.monospaced()).textSelection(.enabled)
@@ -1274,7 +1400,7 @@ private struct AppView: View {
                     Divider()
                     Text("Kết quả").font(.headline)
                     Text("Repo \(result.repositoriesScanned) · PR \(result.pullRequestsScanned) · Khớp \(result.matched)")
-                    Text("Approve \(result.approved) · Đã approve \(result.alreadyApproved) · Bỏ qua \(result.skipped) · Lỗi \(result.failed)")
+                    Text("\(approvalSummary(run)) · Đã approve trước đó \(result.alreadyApproved) · Bỏ qua \(result.skipped) · Lỗi \(result.failed)")
                     if let reason = result.failureReason, !reason.isEmpty {
                         Label(reason, systemImage: "exclamationmark.triangle").foregroundStyle(.red).textSelection(.enabled)
                     }
@@ -1287,7 +1413,7 @@ private struct AppView: View {
                 if details.isEmpty { Text("Không có log PR trong lượt này.").foregroundStyle(.secondary) }
                 ForEach(details) { item in
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("\(item.status) · \(item.repository ?? "Worker")").font(.subheadline.bold())
+                        Text("\(item.status == "DRY_RUN" ? "DRY_RUN (chưa approve)" : item.status) · \(item.repository ?? "Worker")").font(.subheadline.bold())
                         if let title = item.prTitle { Text(title) }
                         if let reason = item.failureReason { Text(reason).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(10)
@@ -1295,6 +1421,14 @@ private struct AppView: View {
                 }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
         }
+    }
+
+    private func approvalSummary(_ run: WorkerRun) -> String {
+        guard let result = run.result else { return "Chưa có kết quả" }
+        if run.dryRun == true {
+            return "Đã approve thật 0 · Dự kiến \(result.wouldApprove ?? result.approved)"
+        }
+        return "Đã approve thật \(result.approved)"
     }
 
     private func statusIcon(_ status: String) -> String {

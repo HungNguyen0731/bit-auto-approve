@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -73,9 +74,26 @@ export async function registerWorkerInstallerRoutes(
   app: FastifyInstance,
   options: { auth: ControlPlaneAuth }
 ): Promise<void> {
-  const macAppName = 'Bitbucket-PR-Approver-0.3.4-macOS.zip';
+  const macAppVersion = '0.3.5';
+  const macAppName = `Bitbucket-PR-Approver-${macAppVersion}-macOS.zip`;
   const macAppPath = path.resolve(process.cwd(), '../macos-app/releases', macAppName);
-  app.get('/downloads/Bitbucket-PR-Approver-0.3.4-macOS.zip', async (request, reply) => {
+  app.get('/api/mac-app/latest', async (_request, reply) => {
+    if (!fs.existsSync(macAppPath)) {
+      return reply.status(404).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app update is unavailable' } });
+    }
+    const archive = fs.readFileSync(macAppPath);
+    reply.header('Cache-Control', 'no-store');
+    return reply.send({
+      success: true,
+      data: {
+        version: macAppVersion,
+        downloadUrl: `/downloads/${macAppName}`,
+        sha256: crypto.createHash('sha256').update(archive).digest('hex'),
+        sizeBytes: archive.length,
+      },
+    });
+  });
+  app.get(`/downloads/${macAppName}`, async (request, reply) => {
     if (!fs.existsSync(macAppPath)) {
       return reply.status(404).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app download is unavailable' } });
     }

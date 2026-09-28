@@ -407,6 +407,7 @@ export async function registerWorkerRoutes(
           jobName: lease.job.name,
           workerId: lease.workerId,
           trigger: lease.trigger,
+          dryRun: lease.job.dryRun,
           status: lease.status,
           createdAt: lease.createdAt,
           startedAt: lease.startedAt,
