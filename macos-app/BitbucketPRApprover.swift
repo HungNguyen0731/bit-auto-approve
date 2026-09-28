@@ -3,12 +3,14 @@ import Foundation
 import SwiftUI
 import Darwin
 import CryptoKit
+import Security
 
 private struct APIError: Decodable { let code: String?; let message: String? }
 private struct Envelope<T: Decodable>: Decodable { let success: Bool; let data: T?; let error: APIError? }
 private struct SessionData: Decodable { let csrfToken: String }
 private struct EmptyData: Decodable { let removed: Bool?; let executionId: String? }
 private struct PairingData: Decodable { let pairUrl: String }
+private struct CancelledExecution: Decodable { let executionId: String; let status: String }
 private struct UpdateManifest: Decodable {
     let version: String
     let downloadUrl: String
@@ -40,6 +42,7 @@ private struct Worker: Identifiable, Decodable {
     let lastHeartbeatAt: String?
     let revokedAt: String?
     let supportsAccountLeases: Bool?
+    let supportsAutoMerge: Bool?
 }
 
 private struct Rules: Decodable {
@@ -63,6 +66,7 @@ private struct Job: Identifiable, Decodable {
     let description: String?
     let enabled: Bool
     let dryRun: Bool
+    let autoMergeOnSuccessfulBuild: Bool?
     let intervalSeconds: Int
     let executionMode: String?
     let workerId: String?
@@ -102,6 +106,7 @@ private struct RunSummary: Decodable {
     let pullRequestsScanned: Int
     let matched: Int
     let approved: Int
+    let merged: Int?
     let wouldApprove: Int?
     let skipped: Int
     let failed: Int
@@ -137,6 +142,7 @@ private struct JobDraft {
     var intervalSeconds = 60
     var enabled = true
     var dryRun = true
+    var autoMergeOnSuccessfulBuild = false
     var repositories = ""
     var authors = ""
     var blockedAuthors = ""
@@ -153,6 +159,7 @@ private struct JobDraft {
     init(_ job: Job) {
         id = job.id; name = job.name; description = job.description ?? ""; workerId = job.workerId ?? ""; accountId = job.accountId ?? ""
         intervalSeconds = job.intervalSeconds; enabled = job.enabled; dryRun = job.dryRun
+        autoMergeOnSuccessfulBuild = job.autoMergeOnSuccessfulBuild ?? false
         repositories = job.rules.repositories.joined(separator: ", ")
         authors = job.rules.authorWhitelist.joined(separator: ", ")
         blockedAuthors = (job.rules.authorBlacklist ?? []).joined(separator: ", ")
@@ -172,7 +179,7 @@ private struct JobDraft {
         ["name": name.trimmingCharacters(in: .whitespacesAndNewlines), "description": description,
          "workerId": workerId,
          "accountId": accountId, "executionMode": "worker", "intervalSeconds": intervalSeconds,
-         "enabled": enabled, "dryRun": dryRun,
+         "enabled": enabled, "dryRun": dryRun, "autoMergeOnSuccessfulBuild": autoMergeOnSuccessfulBuild,
          "rules": ["repositories": values(repositories), "authorWhitelist": values(authors),
                    "authorBlacklist": values(blockedAuthors), "excludeSelf": excludeSelf,
                    "targetBranches": values(targetBranches), "sourceBranches": values(sourceBranches),
@@ -185,6 +192,7 @@ private struct JobDraft {
 @MainActor private final class AppModel: ObservableObject {
     @Published var server = UserDefaults.standard.string(forKey: "controlPlaneOrigin") ?? "https://bot.approve.mymind.bond"
     @Published var password = ""
+    @Published var rememberPassword = true
     @Published var authenticated = false
     @Published var busy = false
     @Published var needsReauth = false
@@ -208,6 +216,43 @@ private struct JobDraft {
         configuration.httpCookieAcceptPolicy = .always
         return URLSession(configuration: configuration, delegate: SameOriginRedirects(), delegateQueue: nil)
     }()
+
+    private var passwordKeychainQuery: [String: Any]? {
+        guard let origin else { return nil }
+        return [kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "com.hungnv.bitbucket-pr-approver.owner",
+                kSecAttrAccount as String: origin.originString]
+    }
+
+    var hasSavedPassword: Bool { savedPassword() != nil }
+
+    private func savedPassword() -> String? {
+        guard var query = passwordKeychainQuery else { return nil }
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func storePassword(_ value: String) throws {
+        guard let query = passwordKeychainQuery else { return }
+        SecItemDelete(query as CFDictionary)
+        var item = query
+        item[kSecValueData as String] = Data(value.utf8)
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let status = SecItemAdd(item as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw NSError(domain: "Keychain", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Không lưu được Owner password vào Keychain (mã \(status))."])
+        }
+    }
+
+    func restoreLogin() async {
+        guard !authenticated, !busy, let saved = savedPassword() else { return }
+        password = saved
+        await login()
+    }
 
     private var origin: URL? {
         guard let url = URL(string: server), let scheme = url.scheme?.lowercased(),
@@ -337,6 +382,10 @@ private struct JobDraft {
             let detail: String
             if status == 404 && path.hasPrefix("/api/accounts") {
                 detail = "Server chưa có API account (HTTP 404). Cần deploy backend mới lên Coolify rồi thử lại."
+            } else if envelope?.error?.code == "WORKER_MAY_STILL_BE_RUNNING" {
+                detail = "Worker có thể vẫn đang xử lý lượt này. Restart Worker trên Mac, đợi heartbeat mới rồi thử hủy lại."
+            } else if envelope?.error?.code == "JOB_EXECUTION_ACTIVE" {
+                detail = "Job còn lượt chạy đang hoạt động. Vào Lịch sử chạy để hủy lượt treo an toàn trước khi xóa job."
             } else if status == 401 || status == 403 {
                 detail = "Phiên đăng nhập hoặc quyền truy cập không còn hợp lệ (HTTP \(status)). Hãy đăng nhập lại."
             } else if let error = envelope?.error?.message {
@@ -351,11 +400,18 @@ private struct JobDraft {
 
     func login() async {
         busy = true; message = ""
+        let enteredPassword = password
         do {
             let session: SessionData = try await (password.isEmpty
                 ? call("GET", "/api/session")
                 : call("POST", "/api/session/login", ["password": password]))
             csrf = session.csrfToken; password = ""; authenticated = true; needsReauth = false
+            if rememberPassword && !enteredPassword.isEmpty {
+                do { try storePassword(enteredPassword) }
+                catch { message = error.localizedDescription }
+            } else if !rememberPassword, let query = passwordKeychainQuery {
+                SecItemDelete(query as CFDictionary)
+            }
             UserDefaults.standard.set(server, forKey: "controlPlaneOrigin")
             await refresh()
         } catch { message = error.localizedDescription }
@@ -415,7 +471,8 @@ private struct JobDraft {
     func reauthenticate(_ ownerPassword: String) async -> Bool {
         busy = true; defer { busy = false }
         do {
-            let session: SessionData = try await call("POST", "/api/session/login", ["password": ownerPassword])
+            let credential = ownerPassword.isEmpty ? savedPassword() ?? "" : ownerPassword
+            let session: SessionData = try await call("POST", "/api/session/login", ["password": credential])
             csrf = session.csrfToken
             needsReauth = false
             message = "Đã đăng nhập lại."
@@ -428,6 +485,7 @@ private struct JobDraft {
 
     func logout() async {
         let _: EmptyData? = try? await call("POST", "/api/session/logout", [:])
+        if let query = passwordKeychainQuery { SecItemDelete(query as CFDictionary) }
         historyGeneration += 1
         csrf = ""; authenticated = false; needsReauth = false; accounts = []; workers = []; jobs = []; logs = []; runs = []; runHistoryAvailable = true; historyError = ""; selectedWorkerId = ""
         message = ""
@@ -497,6 +555,16 @@ private struct JobDraft {
         } catch { message = error.localizedDescription }
     }
 
+    func cancelStuckRun(_ run: WorkerRun) async {
+        busy = true
+        defer { busy = false }
+        do {
+            let _: CancelledExecution = try await call("POST", "/api/worker-executions/\(run.executionId)/cancel-stuck", [:])
+            message = "Đã đánh dấu lượt chạy bị treo là thất bại. Hãy kiểm tra PR trên Bitbucket trước khi chạy lại hoặc xóa job."
+            await refreshHistory()
+        } catch { message = error.localizedDescription }
+    }
+
     private func runProcess(_ executable: URL, _ arguments: [String], environment: [String: String]? = nil) async throws {
         let process = Process()
         process.executableURL = executable
@@ -534,7 +602,7 @@ private struct JobDraft {
                 guard URL(string: saved)?.originString == origin.originString else {
                     throw NSError(domain: "Worker", code: 3, userInfo: [NSLocalizedDescriptionKey: "Portable Worker hiện dùng server khác. Không tự ghi đè launcher cũ."])
                 }
-                setupNeeded = (try? String(contentsOf: protocolVersion, encoding: .utf8)) != "3"
+                setupNeeded = (try? String(contentsOf: protocolVersion, encoding: .utf8)) != "4"
             }
             if setupNeeded {
                 guard let setup = Bundle.main.resourceURL?.appendingPathComponent("portable-setup.sh") else { throw NSError(domain: "Worker", code: 4) }
@@ -586,6 +654,26 @@ private struct JobDraft {
             message = ready
                 ? "Worker đã ghép đôi và chạy nền, tự khởi động sau khi đăng nhập Mac."
                 : "Worker đã được bật nền, đang chờ heartbeat. Bấm Làm mới sau vài giây để kiểm tra."
+        } catch { message = error.localizedDescription }
+        busy = false
+    }
+
+    func restartWorker() async {
+        guard localWorkerId != nil else { message = "Mac này chưa ghép Worker."; return }
+        let label = "com.hungnv.bitbucket-pr-approver.gui-worker"
+        let plist = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+        guard FileManager.default.fileExists(atPath: plist.path) else {
+            message = "Không tìm thấy LaunchAgent của Worker. Bấm Kiểm tra / cập nhật Worker để cài lại."
+            return
+        }
+        busy = true; message = "Đang khởi động lại Worker…"
+        do {
+            try await runProcess(URL(fileURLWithPath: "/bin/launchctl"),
+                                 ["kickstart", "-k", "gui/\(getuid())/\(label)"])
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+            await refresh()
+            message = "Đã yêu cầu khởi động lại Worker. Lượt đang chạy có thể có kết quả chưa xác định; xem Lịch sử chạy trước khi chạy lại."
         } catch { message = error.localizedDescription }
         busy = false
     }
@@ -659,6 +747,7 @@ private struct AppView: View {
     @State private var ownerPassword = ""
     @State private var accountToDelete: Account?
     @State private var jobToDelete: Job?
+    @State private var runToCancel: WorkerRun?
     @State private var selectedTab = 0
     @State private var selectedRunId: String?
     @State private var runFilter = "Tất cả"
@@ -686,14 +775,24 @@ private struct AppView: View {
                 if let jobToDelete { Task { await model.deleteJob(jobToDelete) } }
                 jobToDelete = nil
             }
-        } message: { Text("Job sẽ ngừng được xếp lịch. Lượt đã nhận/chờ Worker vẫn có thể hoàn tất; không thể khôi phục job từ GUI.") }
+        } message: { Text("Nếu job còn lượt đang chạy, hãy Restart Worker rồi hủy lượt treo trong Lịch sử chạy trước. Xóa job không thể hoàn tác.") }
+        .confirmationDialog("Hủy lượt chạy bị treo?", isPresented: Binding(
+            get: { runToCancel != nil }, set: { if !$0 { runToCancel = nil } })) {
+            Button("Hủy lượt chạy", role: .destructive) {
+                if let runToCancel { Task { await model.cancelStuckRun(runToCancel) } }
+                runToCancel = nil
+            }
+        } message: { Text("Chỉ hủy được khi Worker đã báo heartbeat mới và không còn chạy lượt này. Kết quả trên Bitbucket trước khi hủy có thể chưa xác định; kiểm tra PR trước khi chạy lại.") }
         .confirmationDialog("Cài bản cập nhật?", isPresented: $confirmUpdate) {
             Button("Cập nhật & khởi động lại") { Task { await model.installUpdate() } }
             Button("Để sau", role: .cancel) {}
         } message: {
             Text("App sẽ tải và xác minh bản mới, cài vào ~/Applications, giữ bản cũ để khôi phục rồi khởi động lại. Hãy lưu biểu mẫu đang sửa trước khi tiếp tục.")
         }
-        .task { await model.checkForUpdate() }
+        .task {
+            await model.checkForUpdate()
+            await model.restoreLogin()
+        }
         .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { _ in
             if model.authenticated && !model.needsReauth && !model.busy { Task { await model.refresh() } }
         }
@@ -758,6 +857,7 @@ private struct AppView: View {
                     SecureField("Nhập mật khẩu", text: $model.password).textFieldStyle(.roundedBorder)
                         .onSubmit { Task { await model.login() } }
                 }
+                Toggle("Nhớ đăng nhập trên Mac này (Keychain)", isOn: $model.rememberPassword)
                 if !model.message.isEmpty {
                     Label(model.message, systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.red).textSelection(.enabled)
@@ -775,7 +875,7 @@ private struct AppView: View {
                 Button("Khôi phục URL mặc định") { model.resetServer() }
                     .buttonStyle(.plain).foregroundStyle(AppPalette.blue).disabled(model.busy)
                 Spacer()
-                Text("Owner password không lưu trên Mac. Token account được mã hóa trên server.")
+                Text("Nếu bật ghi nhớ, Owner password chỉ lưu trong macOS Keychain. Đăng xuất sẽ xóa mật khẩu đã lưu.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .frame(maxWidth: 430).padding(44)
@@ -1049,7 +1149,7 @@ private struct AppView: View {
                         else { accountError = model.message }
                     }
                 }.buttonStyle(.borderedProminent)
-                    .disabled(accountSubmitting || model.busy || (model.needsReauth && ownerPassword.isEmpty) || draftAccount.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (draftAccount.id == nil && draftAccount.token.isEmpty))
+                    .disabled(accountSubmitting || model.busy || (model.needsReauth && ownerPassword.isEmpty && !model.hasSavedPassword) || draftAccount.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (draftAccount.id == nil && draftAccount.token.isEmpty))
             }
           }.padding()
         }.frame(width: 520, height: model.needsReauth ? 440 : 380)
@@ -1099,6 +1199,9 @@ private struct AppView: View {
                         Label("\(job.rules.repositories.count) repo", systemImage: "folder")
                         Label(model.workers.first(where: { $0.id == job.workerId })?.name ?? "Worker chưa gán",
                               systemImage: "desktopcomputer")
+                        if job.autoMergeOnSuccessfulBuild == true {
+                            Label("Auto-merge khi build xanh", systemImage: "arrow.triangle.merge")
+                        }
                     }.font(.caption).foregroundStyle(.secondary)
                     Divider()
                     HStack(spacing: 10) {
@@ -1168,6 +1271,15 @@ private struct AppView: View {
             Toggle("Bỏ qua Draft", isOn: $draftJob.ignoreDrafts)
             Toggle("Bỏ qua PR conflict", isOn: $draftJob.ignoreConflicts)
             Toggle("Yêu cầu build thành công", isOn: $draftJob.requireBuild)
+            Toggle("Tự merge sau approve khi build xanh", isOn: $draftJob.autoMergeOnSuccessfulBuild)
+            if draftJob.autoMergeOnSuccessfulBuild {
+                Text("Chỉ merge PR khớp rule, được account này approve và build của đúng commit nguồn thành công. Dry Run không merge.")
+                    .font(.caption).foregroundStyle(.orange)
+                if model.workers.first(where: { $0.id == draftJob.workerId })?.supportsAutoMerge != true {
+                    Text("Worker cần được cập nhật. Vào Mac Worker → Kiểm tra / cập nhật Worker trước khi lưu.")
+                        .font(.caption).foregroundStyle(.red)
+                }
+            }
           }
           VStack(alignment: .leading, spacing: 10) {
             if !jobError.isEmpty {
@@ -1197,7 +1309,7 @@ private struct AppView: View {
                         else { jobError = model.message }
                     }
                 }.buttonStyle(.borderedProminent)
-                    .disabled(jobSubmitting || model.busy || (model.needsReauth && ownerPassword.isEmpty) || draftJob.name.isEmpty || draftJob.repositories.split(separator: ",").allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } || draftJob.accountId.isEmpty || draftJob.workerId.isEmpty)
+                    .disabled(jobSubmitting || model.busy || (model.needsReauth && ownerPassword.isEmpty && !model.hasSavedPassword) || draftJob.name.isEmpty || draftJob.repositories.split(separator: ",").allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } || draftJob.accountId.isEmpty || draftJob.workerId.isEmpty || (draftJob.autoMergeOnSuccessfulBuild && model.workers.first(where: { $0.id == draftJob.workerId })?.supportsAutoMerge != true))
             }
           }.padding()
         }.frame(width: 680, height: 640)
@@ -1243,6 +1355,11 @@ private struct AppView: View {
                             Label(model.localWorkerId == nil ? "Ghép đôi & chạy nền" : "Kiểm tra / cập nhật Worker",
                                   systemImage: "arrow.triangle.2.circlepath")
                         }.buttonStyle(.borderedProminent).disabled(model.busy)
+                        if model.localWorkerId != nil {
+                            Button { Task { await model.restartWorker() } } label: {
+                                Label("Restart Worker", systemImage: "arrow.clockwise.circle")
+                            }.buttonStyle(.bordered).disabled(model.busy)
+                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading).padding(24)
                     .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 18))
@@ -1388,6 +1505,10 @@ private struct AppView: View {
                     Text(statusLabel(run.status)).font(.title2.bold())
                 }
                 Text(run.jobName).font(.headline)
+                if !["COMPLETED", "FAILED"].contains(run.status) {
+                    Button("Hủy lượt treo") { runToCancel = run }
+                        .buttonStyle(.bordered).disabled(model.busy)
+                }
                 if run.dryRun == true {
                     Label("Dry Run — chỉ mô phỏng, chưa gửi approve lên Bitbucket", systemImage: "eye")
                         .font(.subheadline.bold()).foregroundStyle(.orange)
@@ -1428,7 +1549,7 @@ private struct AppView: View {
         if run.dryRun == true {
             return "Đã approve thật 0 · Dự kiến \(result.wouldApprove ?? result.approved)"
         }
-        return "Đã approve thật \(result.approved)"
+        return "Đã approve thật \(result.approved) · Đã merge \(result.merged ?? 0)"
     }
 
     private func statusIcon(_ status: String) -> String {

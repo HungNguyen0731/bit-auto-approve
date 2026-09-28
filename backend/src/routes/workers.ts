@@ -423,6 +423,17 @@ export async function registerWorkerRoutes(
     }
   });
 
+  app.post<{ Params: { executionId: string } }>('/api/worker-executions/:executionId/cancel-stuck', async (request, reply) => {
+    try {
+      ownerContext(request, auth, true);
+      const lease = executionDispatcher.cancelStuckExecution(request.params.executionId);
+      return reply.send({ success: true, data: { executionId: lease.executionId, status: lease.status } });
+    } catch (error: any) {
+      return reply.status(error.statusCode || 409).send({ success: false,
+        error: { code: error.code || 'CANCEL_STUCK_FAILED', message: error.message } });
+    }
+  });
+
   app.get<{ Params: { workerId: string } }>(
     '/api/workers/:workerId/update-manifest',
     async (request, reply) => {

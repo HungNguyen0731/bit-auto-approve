@@ -22,6 +22,7 @@ export type ExecutionStatus =
 
 export type WorkerLogStatus =
   | 'APPROVED'
+  | 'MERGED'
   | 'SKIPPED'
   | 'DRY_RUN'
   | 'ALREADY_APPROVED'
@@ -49,6 +50,7 @@ export interface WorkerRecord extends WorkerMetadata {
   queueDepth: number;
   hasLegacyToken?: boolean;
   supportsAccountLeases?: boolean;
+  supportsAutoMerge?: boolean;
   revokedAt?: string;
 }
 
@@ -88,6 +90,7 @@ export interface HeartbeatRequest {
   queueDepth: number;
   hasLegacyToken?: boolean;
   supportsAccountLeases?: boolean;
+  supportsAutoMerge?: boolean;
   lastBitbucketProbeAt?: string;
 }
 
@@ -184,6 +187,7 @@ export interface ExecutionResultSummary {
   pullRequestsScanned: number;
   matched: number;
   approved: number;
+  merged?: number;
   wouldApprove?: number;
   skipped: number;
   failed: number;

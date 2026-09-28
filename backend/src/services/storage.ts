@@ -196,6 +196,7 @@ export class StorageService {
         dto.intervalSeconds || APP_CONSTANTS.SCHEDULER.DEFAULT_INTERVAL_SECONDS
       ),
       dryRun: Boolean(dto.dryRun),
+      autoMergeOnSuccessfulBuild: Boolean(dto.autoMergeOnSuccessfulBuild),
       executionMode: dto.executionMode ?? 'local',
       workerId: dto.executionMode === 'worker' ? dto.workerId : undefined,
       accountId: dto.executionMode === 'worker' ? dto.accountId : undefined,
@@ -240,6 +241,8 @@ export class StorageService {
           ? Math.max(APP_CONSTANTS.SCHEDULER.MIN_INTERVAL_SECONDS, dto.intervalSeconds)
           : current.intervalSeconds,
       dryRun: dto.dryRun !== undefined ? dto.dryRun : current.dryRun,
+      autoMergeOnSuccessfulBuild: dto.autoMergeOnSuccessfulBuild !== undefined
+        ? dto.autoMergeOnSuccessfulBuild : Boolean(current.autoMergeOnSuccessfulBuild),
       executionMode:
         dto.executionMode !== undefined ? dto.executionMode : current.executionMode ?? 'local',
       workerId:

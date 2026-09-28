@@ -118,6 +118,7 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
   const [description, setDescription] = useState('');
   const [intervalSeconds, setIntervalSeconds] = useState(60);
   const [dryRun, setDryRun] = useState(false);
+  const [autoMergeOnSuccessfulBuild, setAutoMergeOnSuccessfulBuild] = useState(false);
   const [enabled, setEnabled] = useState(true);
   const [executionMode, setExecutionMode] = useState<'local' | 'worker'>('worker');
   const [workerId, setWorkerId] = useState('');
@@ -143,6 +144,7 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
       setDescription(editingJob.description || '');
       setIntervalSeconds(editingJob.intervalSeconds || 60);
       setDryRun(editingJob.dryRun);
+      setAutoMergeOnSuccessfulBuild(editingJob.autoMergeOnSuccessfulBuild ?? false);
       setEnabled(editingJob.enabled);
       setExecutionMode('worker');
       setWorkerId(editingJob.workerId || '');
@@ -161,6 +163,7 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
       setDescription('');
       setIntervalSeconds(60);
       setDryRun(false);
+      setAutoMergeOnSuccessfulBuild(false);
       setEnabled(true);
       setExecutionMode('worker');
       setWorkerId(workers.find((worker) => worker.state === 'ONLINE')?.id || '');
@@ -203,6 +206,7 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
         enabled,
         intervalSeconds,
         dryRun,
+        autoMergeOnSuccessfulBuild,
         executionMode,
         workerId: executionMode === 'worker' ? workerId : undefined,
         rules: currentRules,
@@ -633,6 +637,14 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
                 <span className="text-slate-900 text-xs">
                   Require CI Build Success (Only approve if commit status is green)
                 </span>
+              </label>
+            </div>
+            <div className="pt-1">
+              <label className="flex items-center gap-2 cursor-pointer p-2 rounded-lg bg-amber-50 border border-amber-200">
+                <input type="checkbox" checked={autoMergeOnSuccessfulBuild}
+                  onChange={(e) => setAutoMergeOnSuccessfulBuild(e.target.checked)}
+                  className="rounded border-amber-300 text-amber-700 focus:ring-amber-500" />
+                <span className="text-slate-900 text-xs">Auto-merge after this account approves and the source commit build succeeds (Live only)</span>
               </label>
             </div>
           </div>

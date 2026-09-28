@@ -289,6 +289,9 @@ export const JobList: React.FC<JobListProps> = ({
                     {job.rules.requireSuccessfulBuild && (
                       <span className="text-emerald-700">✓ Require CI Green</span>
                     )}
+                    {job.autoMergeOnSuccessfulBuild && (
+                      <span className="text-amber-700">✓ Auto-merge after green build</span>
+                    )}
                     {job.rules.titleKeywordsExclude && job.rules.titleKeywordsExclude.length > 0 && (
                       <span className="text-rose-700">
                         Excludes: {job.rules.titleKeywordsExclude.join(', ')}

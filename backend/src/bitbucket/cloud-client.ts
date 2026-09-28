@@ -268,6 +268,30 @@ export class BitbucketCloudClient implements IBitbucketClient {
     };
   }
 
+  async getCommitBuildStatus(repo: RepositoryRef, commitHash: string): Promise<'SUCCESSFUL' | 'PENDING' | 'FAILED'> {
+    if (!/^[a-f0-9]{7,64}$/i.test(commitHash)) return 'PENDING';
+    const prefix = `/repositories/${encodeURIComponent(repo.projectOrWorkspace)}/${encodeURIComponent(repo.slug)}`;
+    const statuses = await this.paginatedValues<any>(
+      `${prefix}/commit/${encodeURIComponent(commitHash)}/statuses/build?pagelen=100`, 1000
+    );
+    if (statuses.length === 0) return 'PENDING';
+    const latestByKey = new Map<string, any>();
+    for (const status of statuses) {
+      const key = String(status.key || status.uuid || status.name || 'default');
+      const previous = latestByKey.get(key);
+      if (!previous || Date.parse(status.updated_on || status.created_on || '') >
+          Date.parse(previous.updated_on || previous.created_on || '')) latestByKey.set(key, status);
+    }
+    const states = [...latestByKey.values()].map((status) => String(status.state || '').toUpperCase());
+    if (states.some((state) => ['FAILED', 'STOPPED'].includes(state))) return 'FAILED';
+    return states.every((state) => state === 'SUCCESSFUL') ? 'SUCCESSFUL' : 'PENDING';
+  }
+
+  async mergePullRequest(repo: RepositoryRef, prId: number): Promise<void> {
+    const path = `/repositories/${encodeURIComponent(repo.projectOrWorkspace)}/${encodeURIComponent(repo.slug)}/pullrequests/${prId}/merge`;
+    await this.request(path, { method: 'POST', body: { close_source_branch: false } });
+  }
+
   async searchRepositories(options?: { query?: string; project?: string; limit?: number }): Promise<BitbucketRepositoryMeta[]> {
     const workspace = await this.resolveWorkspace(options?.project);
 

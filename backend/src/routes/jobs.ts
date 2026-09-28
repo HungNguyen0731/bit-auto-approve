@@ -43,6 +43,11 @@ export async function registerJobRoutes(
         code: 'LOCAL_WORKER_REQUIRED', message: 'Assign a paired Mac Worker; jobs cannot run on the cloud server',
       } });
     }
+    if (body.autoMergeOnSuccessfulBuild && body.executionMode !== 'worker') {
+      return reply.status(400).send({ success: false, error: {
+        code: 'AUTO_MERGE_REQUIRES_WORKER', message: 'Auto-merge requires a paired Mac Worker job',
+      } });
+    }
 
     if (body.executionMode === 'worker') {
       const worker = body.workerId ? workerStore?.getWorker(body.workerId) : null;
@@ -57,6 +62,9 @@ export async function registerJobRoutes(
       }
       if (body.accountId && worker.supportsAccountLeases !== true) {
         return reply.status(409).send({ success: false, error: { code: 'WORKER_UPGRADE_REQUIRED', message: 'Update and reconnect this Mac Worker before assigning an account' } });
+      }
+      if (body.autoMergeOnSuccessfulBuild && worker.supportsAutoMerge !== true) {
+        return reply.status(409).send({ success: false, error: { code: 'WORKER_UPGRADE_REQUIRED', message: 'Update and restart this Mac Worker before enabling auto-merge' } });
       }
     } else if (body.accountId) {
       return reply.status(400).send({ success: false, error: { code: 'ACCOUNT_REQUIRES_WORKER', message: 'Stored Bitbucket accounts require a Local Worker job' } });
@@ -77,6 +85,11 @@ export async function registerJobRoutes(
     const currentJob = storage.getJobById(id);
     const nextMode = body.executionMode ?? currentJob?.executionMode ?? 'local';
     const nextAccountId = body.accountId ?? currentJob?.accountId;
+    if ((body.autoMergeOnSuccessfulBuild ?? currentJob?.autoMergeOnSuccessfulBuild) && nextMode !== 'worker') {
+      return reply.status(400).send({ success: false, error: {
+        code: 'AUTO_MERGE_REQUIRES_WORKER', message: 'Auto-merge requires a paired Mac Worker job',
+      } });
+    }
     if (process.env.NODE_ENV === 'production' && nextMode !== 'worker') {
       return reply.status(409).send({ success: false, error: {
         code: 'LOCAL_WORKER_REQUIRED', message: 'Assign a paired Mac Worker; legacy Server jobs cannot run on the cloud server',
@@ -96,6 +109,9 @@ export async function registerJobRoutes(
       }
       if (nextAccountId && worker.supportsAccountLeases !== true) {
         return reply.status(409).send({ success: false, error: { code: 'WORKER_UPGRADE_REQUIRED', message: 'Update and reconnect this Mac Worker before assigning an account' } });
+      }
+      if ((body.autoMergeOnSuccessfulBuild ?? currentJob?.autoMergeOnSuccessfulBuild) && worker.supportsAutoMerge !== true) {
+        return reply.status(409).send({ success: false, error: { code: 'WORKER_UPGRADE_REQUIRED', message: 'Update and restart this Mac Worker before enabling auto-merge' } });
       }
       if (currentJob?.workerId && currentJob.workerId !== workerId &&
           workerStore?.getLeases().some((lease) => lease.jobId === id && ['LEASED', 'RUNNING'].includes(lease.status))) {
@@ -148,6 +164,12 @@ export async function registerJobRoutes(
 
   app.delete<{ Params: { id: string } }>('/api/jobs/:id', async (req, reply) => {
     const { id } = req.params;
+    const active = workerStore?.getLeases().find((lease) => lease.jobId === id &&
+      ['QUEUED', 'LEASED', 'RUNNING', 'RETRYABLE'].includes(lease.status));
+    if (active) return reply.status(409).send({ success: false, error: {
+      code: 'JOB_EXECUTION_ACTIVE',
+      message: 'Cancel the active execution from Mac run history before deleting this job. Restart the Worker first if it may still be running.',
+    } });
     const deleted = storage.deleteJob(id);
     if (!deleted) {
       return reply.status(404).send({

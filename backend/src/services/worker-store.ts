@@ -174,6 +174,7 @@ export class WorkerStore {
           queueDepth: heartbeat.queueDepth,
           hasLegacyToken: heartbeat.hasLegacyToken,
           supportsAccountLeases: heartbeat.supportsAccountLeases === true,
+          supportsAutoMerge: heartbeat.supportsAutoMerge === true,
           lastBitbucketProbeAt: heartbeat.lastBitbucketProbeAt,
           lastHeartbeatAt: now.toISOString(),
         };

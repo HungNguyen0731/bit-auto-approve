@@ -157,6 +157,7 @@ export interface ApprovalJob {
   enabled: boolean; // Whether the background runner will execute this job
   intervalSeconds: number; // Polling interval in seconds (default: 60s, min: 10s)
   dryRun: boolean; // When true, checks and logs matching PRs without actually sending approve API call
+  autoMergeOnSuccessfulBuild?: boolean; // Opt-in: merge only after this account approved and source commit CI is green
   executionMode?: 'local' | 'worker'; // Missing values remain local for backward compatibility
   workerId?: string; // Required when executionMode is worker
   accountId?: string; // Server-stored Bitbucket credential for this Worker job
@@ -174,6 +175,7 @@ export interface ApprovalJob {
 
 export type ApprovalActionStatus = 
   | 'APPROVED'      // Successfully sent approval API call
+  | 'MERGED'        // Approved PR was merged after successful build
   | 'DRY_RUN'       // Matched rules, simulated approval
   | 'ALREADY_APPROVED' // Current user already approved this PR
   | 'SKIPPED'       // Did not match one or more filter rules
@@ -267,6 +269,7 @@ export interface CreateJobDto {
   enabled?: boolean;
   intervalSeconds?: number;
   dryRun?: boolean;
+  autoMergeOnSuccessfulBuild?: boolean;
   executionMode?: 'local' | 'worker';
   workerId?: string;
   accountId?: string;

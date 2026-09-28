@@ -32,6 +32,7 @@ function jobRevision(job: ApprovalJob): string {
       stableJson({
         name: job.name,
         dryRun: job.dryRun,
+        autoMergeOnSuccessfulBuild: job.autoMergeOnSuccessfulBuild,
         intervalSeconds: job.intervalSeconds,
         executionMode: job.executionMode ?? 'local',
         workerId: job.workerId,
@@ -67,6 +68,10 @@ export class ExecutionDispatcher {
 
     this.expireStaleLeases(now);
     const worker = this.workerStore.getWorker(job.workerId);
+    if (job.autoMergeOnSuccessfulBuild && worker?.supportsAutoMerge !== true) {
+      this.advanceJobSchedule(job, now);
+      return null;
+    }
     const leases = this.workerStore.getLeases();
     const active = leases.find(
       (lease) =>
@@ -143,6 +148,11 @@ export class ExecutionDispatcher {
       });
     }
     const worker = this.workerStore.getWorker(job.workerId);
+    if (job.autoMergeOnSuccessfulBuild && worker?.supportsAutoMerge !== true) {
+      throw Object.assign(new Error('Update and restart this Mac Worker before running auto-merge'), {
+        code: 'WORKER_UPGRADE_REQUIRED', statusCode: 409,
+      });
+    }
     if (!worker || worker.revokedAt ||
         !worker.lastHeartbeatAt ||
         now.getTime() - new Date(worker.lastHeartbeatAt).getTime() > 35_000 ||
@@ -291,6 +301,40 @@ export class ExecutionDispatcher {
     );
     this.events.broadcast('execution_completed', result);
     return completed;
+  }
+
+  cancelStuckExecution(executionId: string, now: Date = new Date()): ExecutionLease {
+    const leases = this.workerStore.getLeases();
+    const current = leases.find((lease) => lease.executionId === executionId);
+    if (!current) throw Object.assign(new Error('Execution not found'), { code: 'EXECUTION_NOT_FOUND', statusCode: 404 });
+    if (['COMPLETED', 'FAILED'].includes(current.status)) return current;
+    if (['LEASED', 'RUNNING'].includes(current.status)) {
+      const worker = this.workerStore.getWorker(current.workerId);
+      const heartbeatAt = worker?.lastHeartbeatAt ? Date.parse(worker.lastHeartbeatAt) : 0;
+      const startedAt = Date.parse(current.startedAt || current.createdAt);
+      if (!worker || worker.activeExecutionId === executionId ||
+          heartbeatAt <= startedAt + 10_000 || now.getTime() - heartbeatAt > 35_000) {
+        throw Object.assign(new Error('Worker may still be running this execution. Restart the local Worker and wait for a fresh idle heartbeat before cancelling.'), {
+          code: 'WORKER_MAY_STILL_BE_RUNNING', statusCode: 409,
+        });
+      }
+    }
+    const completedAt = now.toISOString();
+    const startedAt = current.startedAt || current.createdAt;
+    const result: ExecutionResultSummary = {
+      executionId, workerId: current.workerId, jobId: current.jobId, status: 'FAILED',
+      startedAt, completedAt, durationMs: Math.max(0, now.getTime() - Date.parse(startedAt)),
+      repositoriesScanned: 0, pullRequestsScanned: 0, matched: 0, approved: 0,
+      skipped: 0, failed: 1, alreadyApproved: 0,
+      failureReason: 'Execution was cancelled after the Worker reported idle. Earlier Bitbucket side effects may have occurred; check the PR before retrying.',
+    };
+    const cancelled: ExecutionLease = {
+      ...current, status: 'FAILED', completedAt, result, leasedUntil: undefined,
+      manualTokenCiphertext: undefined, accountTokenCiphertext: undefined,
+    };
+    this.workerStore.saveLeases(leases.map((lease) => lease.executionId === executionId ? cancelled : lease));
+    this.events.broadcast('execution_completed', result);
+    return cancelled;
   }
 
   expireStaleLeases(now: Date = new Date()): number {

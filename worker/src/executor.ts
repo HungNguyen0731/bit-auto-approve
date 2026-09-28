@@ -63,6 +63,7 @@ export class WorkerExecutor {
     let pullRequestsScanned = 0;
     let matched = 0;
     let approved = 0;
+    let merged = 0;
     let wouldApprove = 0;
     let skipped = 0;
     let failed = 0;
@@ -79,23 +80,54 @@ export class WorkerExecutor {
         let providerErrorCode: string | undefined;
         let failureReason = evaluation.failureReason;
 
-        if (evaluation.isAlreadyApproved) {
-          status = 'ALREADY_APPROVED';
-          alreadyApproved++;
-        } else if (!evaluation.wouldApprove) {
+        if (!evaluation.matched) {
           skipped++;
         } else if (lease.job.dryRun) {
-          status = 'DRY_RUN';
-          wouldApprove++;
+          status = evaluation.isAlreadyApproved ? 'ALREADY_APPROVED' : 'DRY_RUN';
+          if (evaluation.isAlreadyApproved) alreadyApproved++;
+          else wouldApprove++;
         } else {
           try {
-            await client.approvePullRequest(repository, pullRequest.id);
-            status = 'APPROVED';
-            approved++;
+            const commitHash = pullRequest.sourceBranch.commitHash;
+            const needsBuild = lease.job.rules.requireSuccessfulBuild || lease.job.autoMergeOnSuccessfulBuild;
+            const build = needsBuild && commitHash
+              ? await client.getCommitBuildStatus(repository, commitHash) : 'PENDING';
+            if (!evaluation.isAlreadyApproved && lease.job.rules.requireSuccessfulBuild && build !== 'SUCCESSFUL') {
+              status = 'SKIPPED';
+              skipped++;
+              failureReason = `Source commit build is ${build.toLowerCase()}; waiting for success before approval`;
+            } else if (evaluation.isAlreadyApproved) {
+              status = 'ALREADY_APPROVED';
+              alreadyApproved++;
+            } else {
+              await client.approvePullRequest(repository, pullRequest.id);
+              status = 'APPROVED';
+              approved++;
+            }
+
+            if (lease.job.autoMergeOnSuccessfulBuild && status !== 'SKIPPED') {
+              if (build !== 'SUCCESSFUL' || !commitHash) {
+                failureReason = `Merge is waiting for a successful source-commit build (currently ${build.toLowerCase()})`;
+              } else {
+                const fresh = await client.getPullRequest(repository, pullRequest.id);
+                const freshEvaluation = RuleFilteringEngine.evaluate(fresh, lease.job.rules, currentUser);
+                if (fresh.state !== 'OPEN' || fresh.sourceBranch.commitHash !== commitHash ||
+                    !freshEvaluation.matched || !freshEvaluation.isAlreadyApproved) {
+                  failureReason = 'Merge deferred: PR, source commit, rules, or Bitbucket approval changed after the scan';
+                } else if (await client.getCommitBuildStatus(repository, commitHash) !== 'SUCCESSFUL') {
+                  failureReason = 'Merge deferred: source-commit build is no longer successful';
+                } else {
+                  await client.mergePullRequest(repository, pullRequest.id);
+                  status = 'MERGED';
+                  merged++;
+                  failureReason = undefined;
+                }
+              }
+            }
           } catch (error: any) {
             status = 'FAILED';
             failed++;
-            providerErrorCode = error.code || 'APPROVAL_FAILED';
+            providerErrorCode = error.code || 'APPROVAL_OR_MERGE_FAILED';
             failureReason = error.message;
           }
         }
@@ -129,6 +161,7 @@ export class WorkerExecutor {
         pullRequestsScanned,
         matched,
         approved,
+        merged,
         wouldApprove,
         skipped,
         failed,

@@ -115,6 +115,7 @@ export interface ApprovalJob {
   enabled: boolean;
   intervalSeconds: number;
   dryRun: boolean;
+  autoMergeOnSuccessfulBuild?: boolean;
   executionMode?: 'local' | 'worker';
   workerId?: string;
   revision?: string;
@@ -127,6 +128,7 @@ export interface ApprovalJob {
 
 export type ApprovalActionStatus = 
   | 'APPROVED'
+  | 'MERGED'
   | 'DRY_RUN'
   | 'ALREADY_APPROVED'
   | 'SKIPPED'
@@ -185,6 +187,7 @@ export interface CreateJobDto {
   enabled?: boolean;
   intervalSeconds?: number;
   dryRun?: boolean;
+  autoMergeOnSuccessfulBuild?: boolean;
   executionMode?: 'local' | 'worker';
   workerId?: string;
   rules: JobFilterRules;

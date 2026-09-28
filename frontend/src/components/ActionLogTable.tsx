@@ -33,6 +33,10 @@ const STATUS_CONFIG: Record<
     border: 'border-emerald-500/20',
     icon: CheckCircle2,
   },
+  MERGED: {
+    label: 'MERGED', bg: 'bg-emerald-500/10', text: 'text-emerald-700',
+    border: 'border-emerald-500/20', icon: CheckCircle2,
+  },
   DRY_RUN: {
     label: 'DRY RUN',
     bg: 'bg-blue-500/10',
