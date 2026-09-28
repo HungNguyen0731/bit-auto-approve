@@ -417,7 +417,12 @@ export const TokenCard: React.FC<TokenCardProps> = ({
           <button
             type="button"
             onClick={handleTest}
-            disabled={isTesting || (!token && !config?.hasToken)}
+            disabled={
+              isTesting ||
+              (authType === 'session'
+                ? !config?.hasToken && (!cookie.trim() || !csrfToken.trim())
+                : !token.trim() && !config?.hasToken)
+            }
             className="flex items-center gap-2 px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-700 text-slate-900 text-xs font-semibold border border-slate-300 transition-colors disabled:opacity-50"
           >
             {isTesting ? (

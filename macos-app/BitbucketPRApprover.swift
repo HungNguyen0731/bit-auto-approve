@@ -1243,11 +1243,21 @@ private struct AppView: View {
                         }
                         let saved = await model.saveAccount(draftAccount)
                         accountSubmitting = false
-                        if saved { draftAccount.token = ""; showingAccount = false }
+                        if saved { draftAccount.token = ""; draftAccount.cookie = ""; draftAccount.csrfToken = ""; showingAccount = false }
                         else { accountError = model.message }
                     }
                 }.buttonStyle(.borderedProminent)
-                    .disabled(accountSubmitting || model.busy || (model.needsReauth && ownerPassword.isEmpty && !model.hasSavedPassword) || draftAccount.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (draftAccount.id == nil && draftAccount.token.isEmpty))
+                    .disabled(
+                        accountSubmitting || model.busy ||
+                        (model.needsReauth && ownerPassword.isEmpty && !model.hasSavedPassword) ||
+                        draftAccount.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                        (draftAccount.authType == "basic" && draftAccount.username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) ||
+                        (draftAccount.id == nil && (
+                            draftAccount.authType == "session"
+                                ? (draftAccount.cookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draftAccount.csrfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                : draftAccount.token.isEmpty
+                        ))
+                    )
             }
           }.padding()
         }.frame(width: 520, height: model.needsReauth ? 440 : 380)

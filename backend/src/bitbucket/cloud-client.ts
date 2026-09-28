@@ -28,7 +28,9 @@ export class BitbucketCloudClient implements IBitbucketClient {
     this.config = config;
     this.minRequestIntervalMs = Math.min(Math.max(minRequestIntervalMs, 0), 10_000);
     // Runtime is Cloud-only: legacy persisted Server/Data Center URLs are never contacted.
-    this.baseUrl = 'https://api.bitbucket.org/2.0';
+    this.baseUrl = config.authType === 'session'
+      ? 'https://bitbucket.org/!api/2.0'
+      : 'https://api.bitbucket.org/2.0';
 
     if (config.authType === 'session') {
       let cookie = config.cookie;
@@ -111,6 +113,13 @@ export class BitbucketCloudClient implements IBitbucketClient {
       if (this.sessionCsrfToken) {
         headers['x-csrftoken'] = this.sessionCsrfToken;
       }
+      headers['x-requested-with'] = 'XMLHttpRequest';
+      headers['origin'] = 'https://bitbucket.org';
+      if (!headers['referer']) {
+        headers['referer'] = 'https://bitbucket.org/';
+      }
+      headers['user-agent'] =
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
     }
 
     let bodyStr: string | undefined;
@@ -131,7 +140,9 @@ export class BitbucketCloudClient implements IBitbucketClient {
 
       if (response.status === 401) {
         throw new BitbucketError(
-          'Authentication failed on Bitbucket Cloud (HTTP 401). Invalid username or App Password.',
+          this.config.authType === 'session'
+            ? 'Bitbucket Cloud session authentication failed (HTTP 401). Your cookie or CSRF token may be expired, invalid, or incomplete. Make sure to copy the full cookie string from the browser.'
+            : 'Authentication failed on Bitbucket Cloud (HTTP 401). Invalid username or App Password.',
           'AUTH_INVALID_TOKEN',
           401
         );
