@@ -243,6 +243,8 @@ async function run(): Promise<void> {
               failed: 1,
               alreadyApproved: 0,
               failureReason: error.message,
+              failureCode: classification,
+              rateLimitRetryAfterSeconds: classification === 'RATE_LIMITED' ? error.details?.rateLimitReset : undefined,
             });
             if (!networkFailure) lastLease = null;
             delay = transition.nextProbeDelayMs;

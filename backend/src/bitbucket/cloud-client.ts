@@ -15,12 +15,16 @@ import type { IBitbucketClient } from './client.interface.js';
 import { BitbucketError, classifyNetworkError } from './errors.js';
 
 export class BitbucketCloudClient implements IBitbucketClient {
+  private static pacedRequestQueue: Promise<void> = Promise.resolve();
+  private static nextPacedRequestAt = 0;
   private readonly baseUrl: string;
   private readonly config: BitbucketConnectionConfig;
   private readonly dispatcher?: Dispatcher;
+  private readonly minRequestIntervalMs: number;
 
-  constructor(config: BitbucketConnectionConfig) {
+  constructor(config: BitbucketConnectionConfig, minRequestIntervalMs = 0) {
     this.config = config;
+    this.minRequestIntervalMs = Math.min(Math.max(minRequestIntervalMs, 0), 10_000);
     // Runtime is Cloud-only: legacy persisted Server/Data Center URLs are never contacted.
     this.baseUrl = 'https://api.bitbucket.org/2.0';
 
@@ -47,6 +51,17 @@ export class BitbucketCloudClient implements IBitbucketClient {
     throw new BitbucketError('No token or credentials configured for Bitbucket Cloud', 'AUTH_INVALID_CREDENTIALS', 401);
   }
 
+  private async paceRequest(): Promise<void> {
+    if (this.minRequestIntervalMs === 0) return;
+    const turn = BitbucketCloudClient.pacedRequestQueue.then(async () => {
+      const waitMs = Math.max(0, BitbucketCloudClient.nextPacedRequestAt - Date.now());
+      if (waitMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+      BitbucketCloudClient.nextPacedRequestAt = Date.now() + this.minRequestIntervalMs;
+    });
+    BitbucketCloudClient.pacedRequestQueue = turn.catch(() => {});
+    await turn;
+  }
+
   private async request<T = unknown>(
     path: string,
     options: {
@@ -71,6 +86,7 @@ export class BitbucketCloudClient implements IBitbucketClient {
     }
 
     try {
+      await this.paceRequest();
       const response = await fetch(url, {
         method: options.method || 'GET',
         headers,
@@ -115,7 +131,13 @@ export class BitbucketCloudClient implements IBitbucketClient {
 
       if (response.status === 429) {
         const retryAfterHeader = response.headers.get('retry-after');
-        const retryAfter = retryAfterHeader ? parseInt(retryAfterHeader, 10) : 30;
+        const seconds = retryAfterHeader && /^\d+$/.test(retryAfterHeader.trim())
+          ? Number(retryAfterHeader.trim()) : NaN;
+        const resetAt = retryAfterHeader && !Number.isFinite(seconds)
+          ? Date.parse(retryAfterHeader) : NaN;
+        const retryAfter = Math.min(3600, Math.max(1, Number.isFinite(seconds) ? seconds
+          : Number.isFinite(resetAt) ? Math.ceil((resetAt - Date.now()) / 1000) : 30));
+        await response.body?.cancel();
         throw new BitbucketError(
           `Bitbucket Cloud rate limit exceeded. Retry after ${retryAfter}s.`,
           'RATE_LIMITED',

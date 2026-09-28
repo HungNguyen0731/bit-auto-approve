@@ -287,6 +287,32 @@ export class ExecutionDispatcher {
     }
     if (['COMPLETED', 'FAILED'].includes(current.status)) return current;
 
+    // A 60-second job scanning many repositories can exhaust the hourly
+    // Bitbucket quota. Keep the run terminal (earlier PR side effects may have
+    // happened), but push out the next scheduled scan instead of hammering 429.
+    if (result.failureCode === 'RATE_LIMITED') {
+      const previous = leases
+        .filter((lease) => lease.jobId === current.jobId && lease.executionId !== current.executionId &&
+          lease.result && ['COMPLETED', 'FAILED'].includes(lease.status))
+        .sort((left, right) => Date.parse(right.completedAt || right.createdAt) - Date.parse(left.completedAt || left.createdAt));
+      let consecutive = 1;
+      for (const lease of previous) {
+        if (lease.result?.failureCode !== 'RATE_LIMITED') break;
+        consecutive++;
+        if (consecutive >= 5) break;
+      }
+      const retryAfter = Number.isFinite(result.rateLimitRetryAfterSeconds)
+        ? Math.min(Math.max(Math.ceil(result.rateLimitRetryAfterSeconds!), 0), 3600) : 0;
+      const delaySeconds = Math.min(3600, Math.max(retryAfter + 5, 300 * 2 ** (consecutive - 1)));
+      const job = this.storage.getJobById(current.jobId);
+      if (job && jobRevision(job) === current.jobRevision) {
+        const nextRunAt = new Date(Date.now() + delaySeconds * 1000).toISOString();
+        const jobs = this.storage.getJobs();
+        this.storage.saveJobs(jobs.map((item) => item.id === job.id
+          ? { ...item, nextRunAt, updatedAt: new Date().toISOString() } : item));
+      }
+    }
+
     const completed: ExecutionLease = {
       ...current,
       status: result.status,

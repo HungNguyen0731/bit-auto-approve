@@ -193,6 +193,8 @@ export interface ExecutionResultSummary {
   failed: number;
   alreadyApproved: number;
   failureReason?: string;
+  failureCode?: string;
+  rateLimitRetryAfterSeconds?: number;
 }
 
 export interface WorkerLogQuery {

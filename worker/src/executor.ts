@@ -17,11 +17,16 @@ export interface WorkerExecutionResult {
   logs: WorkerLogEntry[];
 }
 
+// Space Bitbucket calls across scans, approval checks, and merge revalidation.
+// The queue is process-wide in BitbucketCloudClient, so consecutive jobs on
+// this Worker do not start a fresh burst.
+const BITBUCKET_REQUEST_INTERVAL_MS = 4_000;
+
 export class WorkerExecutor {
   constructor(private readonly verificationMode = false) {}
 
   async probe(lease: ExecutionLease, token: string): Promise<void> {
-    const client = new BitbucketCloudClient({ ...lease.bitbucketConfig, token });
+    const client = new BitbucketCloudClient({ ...lease.bitbucketConfig, token }, BITBUCKET_REQUEST_INTERVAL_MS);
     await client.getCurrentUser();
   }
 
@@ -55,7 +60,7 @@ export class WorkerExecutor {
         },
       };
     }
-    const client = new BitbucketCloudClient({ ...lease.bitbucketConfig, token });
+    const client = new BitbucketCloudClient({ ...lease.bitbucketConfig, token }, BITBUCKET_REQUEST_INTERVAL_MS);
     const currentUser = await client.getCurrentUser();
     const repositories = await this.resolveRepositories(client, lease);
     const logs: WorkerLogEntry[] = [];
@@ -68,9 +73,22 @@ export class WorkerExecutor {
     let skipped = 0;
     let failed = 0;
     let alreadyApproved = 0;
+    let repositoriesScanned = 0;
+    let rateLimitReason: string | undefined;
+    let rateLimitRetryAfterSeconds: number | undefined;
 
     for (const repository of repositories) {
-      const pullRequests = await client.listOpenPullRequests(repository);
+      let pullRequests: PullRequest[];
+      try {
+        pullRequests = await client.listOpenPullRequests(repository);
+        repositoriesScanned++;
+      } catch (error: any) {
+        if (error.code !== 'RATE_LIMITED') throw error;
+        rateLimitReason = error.message;
+        rateLimitRetryAfterSeconds = error.details?.rateLimitReset;
+        failed++;
+        break;
+      }
       for (const pullRequest of pullRequests) {
         pullRequestsScanned++;
         const evaluation = RuleFilteringEngine.evaluate(pullRequest, lease.job.rules, currentUser);
@@ -129,6 +147,10 @@ export class WorkerExecutor {
             failed++;
             providerErrorCode = error.code || 'APPROVAL_OR_MERGE_FAILED';
             failureReason = error.message;
+            if (providerErrorCode === 'RATE_LIMITED') {
+              rateLimitReason = error.message;
+              rateLimitRetryAfterSeconds = error.details?.rateLimitReset;
+            }
           }
         }
 
@@ -143,7 +165,9 @@ export class WorkerExecutor {
             providerErrorCode
           )
         );
+        if (rateLimitReason) break;
       }
+      if (rateLimitReason) break;
     }
 
     const completedAt = new Date();
@@ -157,7 +181,7 @@ export class WorkerExecutor {
         startedAt: startedAt.toISOString(),
         completedAt: completedAt.toISOString(),
         durationMs: completedAt.getTime() - startedAt.getTime(),
-        repositoriesScanned: repositories.length,
+        repositoriesScanned,
         pullRequestsScanned,
         matched,
         approved,
@@ -166,6 +190,9 @@ export class WorkerExecutor {
         skipped,
         failed,
         alreadyApproved,
+        failureReason: rateLimitReason,
+        failureCode: rateLimitReason ? 'RATE_LIMITED' : undefined,
+        rateLimitRetryAfterSeconds,
       },
     };
   }
