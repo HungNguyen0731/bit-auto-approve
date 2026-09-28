@@ -117,6 +117,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
     if (request.method === 'GET' && request.url.startsWith('/api/worker-installer/bootstrap/')) return;
     if (
       request.url === '/api/health' ||
+      request.url === '/api/mac-app/latest' ||
       request.url.startsWith('/api/session') ||
       request.url.startsWith('/api/workers/') ||
       request.url === '/api/workers'
