@@ -138,6 +138,7 @@ async function run(): Promise<void> {
         queueDepth: outbox.size(),
         hasLegacyToken: Boolean(bitbucketToken),
         supportsAccountLeases: true,
+        supportsHybridTokenEnvelope: true,
         supportsAutoMerge: true,
       } as const;
       await client.heartbeat(request);

@@ -22,6 +22,8 @@ import { WorkerAuth } from './services/worker-auth.js';
 import { WorkerLogStore } from './services/worker-log-store.js';
 import { WorkerStore } from './services/worker-store.js';
 import { AccountStore } from './services/account-store.js';
+import { BitbucketOAuth } from './services/bitbucket-oauth.js';
+import { registerAccountOAuthRoutes } from './routes/account-oauth.js';
 import { ExecutionDispatcher } from './services/execution-dispatcher.js';
 import { registerWorkerInstallerRoutes } from './routes/worker-installer.js';
 import { ownerSessionId } from './routes/session.js';
@@ -106,8 +108,9 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
   const events = new EventHub();
   const workerStore = new WorkerStore(storage.getDataDir());
   const accounts = new AccountStore(storage.getDataDir());
+  const oauth = new BitbucketOAuth(accounts);
   const workerLogs = new WorkerLogStore(storage.getDataDir());
-  const executionDispatcher = new ExecutionDispatcher(storage, workerStore, events, accounts);
+  const executionDispatcher = new ExecutionDispatcher(storage, workerStore, events, accounts, oauth);
   const scheduler = new SchedulerService(storage, events, executionDispatcher);
   const controlPlaneAuth = new ControlPlaneAuth(storage.getDataDir());
   const workerAuth = new WorkerAuth(workerStore);
@@ -115,6 +118,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
   app.addHook('preHandler', async (request) => {
     if (!controlPlaneAuth.enabled || !request.url.startsWith('/api/')) return;
     if (request.method === 'GET' && request.url.startsWith('/api/worker-installer/bootstrap/')) return;
+    if (request.method === 'GET' && request.url.startsWith('/api/accounts/oauth/callback?')) return;
     if (
       request.url === '/api/health' ||
       request.url === '/api/mac-app/latest' ||
@@ -141,6 +145,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
   await registerHealthRoutes(app, { scheduler });
   await registerConfigRoutes(app, { storage });
   await registerAccountRoutes(app, { accounts, storage, workers: workerStore });
+  await registerAccountOAuthRoutes(app, { oauth, auth: controlPlaneAuth });
   await registerJobRoutes(app, {
     storage,
     scheduler,

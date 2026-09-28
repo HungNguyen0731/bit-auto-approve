@@ -10,6 +10,7 @@ import type { EventHub } from './events.js';
 import type { StorageService } from './storage.js';
 import type { WorkerStore } from './worker-store.js';
 import type { AccountStore } from './account-store.js';
+import type { BitbucketOAuth } from './bitbucket-oauth.js';
 
 const LEASE_DURATION_MS = 45 * 1000;
 const EXPIRED_LEASE_GRACE_MS = 2 * 60 * 1000;
@@ -48,7 +49,8 @@ export class ExecutionDispatcher {
     private readonly storage: StorageService,
     private readonly workerStore: WorkerStore,
     private readonly events: EventHub,
-    private readonly accounts?: AccountStore
+    private readonly accounts?: AccountStore,
+    private readonly oauth?: BitbucketOAuth
   ) {}
 
   markOfflineWorkers(now: Date = new Date()): string[] {
@@ -210,7 +212,7 @@ export class ExecutionDispatcher {
     return lease;
   }
 
-  claim(workerId: string, manualOnly = false, now: Date = new Date(), supportsAccountLeases = false): ExecutionLease | null {
+  async claim(workerId: string, manualOnly = false, now: Date = new Date(), supportsAccountLeases = false): Promise<ExecutionLease | null> {
     this.expireStaleLeases(now);
     const leases = this.workerStore.getLeases();
     if (leases.some((lease) => lease.workerId === workerId &&
@@ -236,9 +238,26 @@ export class ExecutionDispatcher {
       if (!this.accounts) throw Object.assign(new Error('Account store is unavailable'), { code: 'ACCOUNT_STORE_UNAVAILABLE', statusCode: 503 });
       const worker = this.workerStore.getWorker(workerId);
       if (!worker || worker.revokedAt) throw Object.assign(new Error('Worker is unavailable'), { code: 'WORKER_NOT_FOUND', statusCode: 404 });
-      const { account, token } = this.accounts.getCredential(available.job.accountId);
+      const { account, token } = this.oauth
+        ? await this.oauth.getWorkerCredential(available.job.accountId)
+        : this.accounts.getCredential(available.job.accountId);
       const publicKey = crypto.createPublicKey({ key: worker.publicKey, format: 'jwk' });
-      accountTokenCiphertext = crypto.publicEncrypt({ key: publicKey, oaepHash: 'sha256' }, Buffer.from(token, 'utf8')).toString('base64url');
+      const maxBytes = (publicKey.asymmetricKeyDetails?.modulusLength || 3072) / 8 - 66;
+      if (Buffer.byteLength(token, 'utf8') > maxBytes) {
+        if (worker.supportsHybridTokenEnvelope !== true) {
+          throw Object.assign(new Error('Update and restart this Mac Worker to use this Bitbucket OAuth account'), { code: 'WORKER_ENCRYPTION_UPGRADE_REQUIRED', statusCode: 409 });
+        }
+        const secret = crypto.randomBytes(32);
+        const iv = crypto.randomBytes(12);
+        const cipher = crypto.createCipheriv('aes-256-gcm', secret, iv);
+        const data = Buffer.concat([cipher.update(token, 'utf8'), cipher.final()]);
+        accountTokenCiphertext = 'v2:' + Buffer.from(JSON.stringify({
+          key: crypto.publicEncrypt({ key: publicKey, oaepHash: 'sha256' }, secret).toString('base64url'),
+          iv: iv.toString('base64url'), tag: cipher.getAuthTag().toString('base64url'), data: data.toString('base64url'),
+        })).toString('base64url');
+      } else {
+        accountTokenCiphertext = crypto.publicEncrypt({ key: publicKey, oaepHash: 'sha256' }, Buffer.from(token, 'utf8')).toString('base64url');
+      }
       bitbucketConfig = { ...bitbucketConfig, authType: account.authType, username: account.username };
     }
 
@@ -250,8 +269,16 @@ export class ExecutionDispatcher {
       leasedUntil: new Date(now.getTime() + LEASE_DURATION_MS).toISOString(),
       startedAt: available.startedAt || now.toISOString(),
     };
+    // OAuth refresh introduces an await. Re-read leases so concurrent claims
+    // cannot both issue the same execution or overwrite a completed/cancelled run.
+    const latestLeases = this.workerStore.getLeases();
+    const latest = latestLeases.find((lease) => lease.executionId === claimed.executionId);
+    if (!latest || !['QUEUED', 'RETRYABLE', 'LEASED'].includes(latest.status) ||
+        (latest.status === 'LEASED' && latest.leasedUntil && Date.parse(latest.leasedUntil) > Date.now()) ||
+        latestLeases.some((lease) => lease.workerId === workerId && lease.executionId !== claimed.executionId &&
+          ['LEASED', 'RUNNING'].includes(lease.status) && lease.leasedUntil && Date.parse(lease.leasedUntil) > Date.now())) return null;
     this.workerStore.saveLeases(
-      leases.map((lease) => (lease.executionId === claimed.executionId ? claimed : lease))
+      latestLeases.map((lease) => (lease.executionId === claimed.executionId ? claimed : lease))
     );
     return claimed;
   }

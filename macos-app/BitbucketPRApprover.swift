@@ -39,7 +39,12 @@ private struct Account: Identifiable, Decodable {
     let username: String?
     let authType: String
     let tokenPreview: String
+    let credentialSource: String?
+    let expiresAt: String?
 }
+
+private struct OAuthStart: Decodable { let flowId: String; let authorizeUrl: String }
+private struct OAuthStatus: Decodable { let status: String; let error: String?; let account: Account? }
 
 private struct Worker: Identifiable, Decodable {
     let id: String
@@ -205,6 +210,8 @@ private struct JobDraft {
     @Published var needsReauth = false
     @Published var message = ""
     @Published var accounts: [Account] = []
+    @Published var oauthMessage = ""
+    @Published var oauthConnecting = false
     @Published var workers: [Worker] = []
     @Published var jobs: [Job] = []
     @Published var logs: [ExecutionLog] = []
@@ -512,6 +519,36 @@ private struct JobDraft {
             message = "Đã lưu account. Token chỉ được lưu mã hóa trên server."
             await refresh(); return true
         } catch { message = error.localizedDescription; return false }
+    }
+
+    func connectBitbucket(accountId: String? = nil) async {
+        guard !oauthConnecting else { return }
+        oauthConnecting = true
+        oauthMessage = "Đang mở Bitbucket để cấp quyền…"
+        defer { oauthConnecting = false }
+        do {
+            let input: [String: Any] = accountId.map { ["accountId": $0] } ?? [:]
+            let flow: OAuthStart = try await call("POST", "/api/accounts/oauth/start", input)
+            guard let url = URL(string: flow.authorizeUrl), url.scheme == "https", url.host == "bitbucket.org",
+                  NSWorkspace.shared.open(url) else {
+                oauthMessage = "Không mở được trang Bitbucket. Kiểm tra trình duyệt mặc định."
+                return
+            }
+            for _ in 0..<150 {
+                try await Task.sleep(for: .seconds(2))
+                let state: OAuthStatus = try await call("GET", "/api/accounts/oauth/status/\(flow.flowId)")
+                if state.status == "complete" {
+                    await refresh()
+                    oauthMessage = "Đã kết nối \(state.account?.name ?? "Bitbucket"). Chọn account này khi tạo job."
+                    return
+                }
+                if state.status == "failed" {
+                    oauthMessage = state.error ?? "Kết nối Bitbucket thất bại. Thử lại."
+                    return
+                }
+            }
+            oauthMessage = "Hết thời gian chờ. Bấm Kết nối Bitbucket để thử lại."
+        } catch { oauthMessage = error.localizedDescription }
     }
 
     func deleteAccount(_ id: String) async {
@@ -1091,16 +1128,22 @@ private struct AppView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("ACCOUNTS").font(.caption.bold()).tracking(1.5).foregroundStyle(AppPalette.blue)
                         Text("Bitbucket accounts").font(.largeTitle.bold())
-                        Text("Token được lưu mã hóa trên server và không tải ngược về Mac.")
+                        Text("Kết nối Bitbucket bằng Allow hoặc thêm token thủ công; credential được mã hóa trên server.")
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
+                    Button("Kết nối Bitbucket") { Task { await model.connectBitbucket() } }
+                        .buttonStyle(.borderedProminent).disabled(model.oauthConnecting || model.needsReauth)
                     Button {
                         draftAccount = AccountDraft(); accountError = ""; ownerPassword = ""; showingAccount = true
-                    } label: { Label("Thêm account", systemImage: "plus") }.buttonStyle(.borderedProminent)
+                    } label: { Label("Thêm token thủ công", systemImage: "plus") }.buttonStyle(.bordered)
+                }
+                if !model.oauthMessage.isEmpty {
+                    Label(model.oauthMessage, systemImage: model.oauthConnecting ? "hourglass" : "info.circle")
+                        .font(.callout).foregroundStyle(.secondary)
                 }
                 if model.accounts.isEmpty {
-                    emptyPanel("Chưa có account", "Tạo account để dùng token Bitbucket cho các job.", "key.horizontal")
+                    emptyPanel("Chưa có account", "Kết nối Bitbucket hoặc thêm token để dùng cho job.", "key.horizontal")
                 }
                 ForEach(model.accounts) { account in
                     HStack(spacing: 16) {
@@ -1111,21 +1154,26 @@ private struct AppView: View {
                             .accessibilityHidden(true)
                         VStack(alignment: .leading, spacing: 5) {
                             Text(account.name).font(.headline)
-                            Text("\(account.username ?? "Bearer") · \(account.tokenPreview)")
+                            Text("\(account.credentialSource == "oauth" ? "Bitbucket OAuth" : (account.username ?? "Bearer")) · \(account.tokenPreview)")
                                 .font(.callout).foregroundStyle(.secondary)
                             Text("\(model.jobs.filter { $0.accountId == account.id }.count) job sử dụng")
                                 .font(.caption).foregroundStyle(AppPalette.blue)
                         }
                         Spacer()
-                        Button("Sửa / đổi token") {
-                            draftAccount = AccountDraft(account); accountError = ""; ownerPassword = ""; showingAccount = true
+                        if account.credentialSource == "oauth" {
+                            Button("Kết nối lại") { Task { await model.connectBitbucket(accountId: account.id) } }
+                                .disabled(model.oauthConnecting || model.needsReauth)
+                        } else {
+                            Button("Sửa / đổi token") {
+                                draftAccount = AccountDraft(account); accountError = ""; ownerPassword = ""; showingAccount = true
+                            }
                         }
                         Button(role: .destructive) { accountToDelete = account } label: { Image(systemName: "trash") }
                             .accessibilityLabel("Xóa account \(account.name)")
                     }
                     .padding(18).background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 14))
                 }
-                Label("Để đổi token, mở account và nhập token mới. Để trống sẽ giữ token hiện tại.",
+                Label("OAuth tự làm mới token khi Worker nhận job. Nếu quyền bị thu hồi, bấm Kết nối lại. Token thủ công vẫn hoạt động như cũ.",
                       systemImage: "lock.shield")
                     .font(.callout).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading).padding(28)

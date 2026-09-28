@@ -41,6 +41,20 @@ export class WorkerIdentityStore {
   async decryptEnvelope(ciphertext: string): Promise<string> {
     const identity = await this.getOrCreateIdentity();
     const privateKey = crypto.createPrivateKey({ key: identity.privateKey, format: 'jwk' });
+    if (ciphertext.startsWith('v2:')) {
+      const envelope = JSON.parse(Buffer.from(ciphertext.slice(3), 'base64url').toString('utf8')) as {
+        key: string; iv: string; tag: string; data: string;
+      };
+      const secret = crypto.privateDecrypt(
+        { key: privateKey, oaepHash: 'sha256', padding: crypto.constants.RSA_PKCS1_OAEP_PADDING },
+        Buffer.from(envelope.key, 'base64url')
+      );
+      const decipher = crypto.createDecipheriv('aes-256-gcm', secret, Buffer.from(envelope.iv, 'base64url'));
+      decipher.setAuthTag(Buffer.from(envelope.tag, 'base64url'));
+      return Buffer.concat([
+        decipher.update(Buffer.from(envelope.data, 'base64url')), decipher.final(),
+      ]).toString('utf8');
+    }
     return crypto
       .privateDecrypt(
         { key: privateKey, oaepHash: 'sha256', padding: crypto.constants.RSA_PKCS1_OAEP_PADDING },

@@ -10,12 +10,16 @@ export interface BitbucketAccount {
   username?: string;
   authType: BitbucketAuthType;
   tokenPreview: string;
+  credentialSource?: 'oauth';
+  bitbucketUuid?: string;
+  expiresAt?: string;
   createdAt: string;
   updatedAt: string;
 }
 
 interface StoredAccount extends BitbucketAccount {
   encryptedToken: EncryptedData;
+  encryptedRefreshToken?: EncryptedData;
 }
 
 export class AccountStore {
@@ -28,7 +32,7 @@ export class AccountStore {
   }
 
   list(): BitbucketAccount[] {
-    return this.store.read().map(({ encryptedToken: _encryptedToken, ...account }) => account);
+    return this.store.read().map(({ encryptedToken: _encryptedToken, encryptedRefreshToken: _encryptedRefreshToken, ...account }) => account);
   }
 
   get(id: string): BitbucketAccount | null {
@@ -38,7 +42,7 @@ export class AccountStore {
   getCredential(id: string): { account: BitbucketAccount; token: string } {
     const item = this.store.read().find((account) => account.id === id);
     if (!item) throw Object.assign(new Error('Bitbucket account not found'), { code: 'ACCOUNT_NOT_FOUND', statusCode: 404 });
-    const { encryptedToken, ...account } = item;
+    const { encryptedToken, encryptedRefreshToken: _encryptedRefreshToken, ...account } = item;
     return { account, token: this.crypt.decrypt(encryptedToken) };
   }
 
@@ -53,6 +57,9 @@ export class AccountStore {
     const existing = id ? items.find((item) => item.id === id) : undefined;
     if (id && !existing) throw Object.assign(new Error('Bitbucket account not found'), { code: 'ACCOUNT_NOT_FOUND', statusCode: 404 });
     const name = input.name.trim();
+    if (existing?.credentialSource === 'oauth') {
+      throw Object.assign(new Error('OAuth accounts must be reconnected through Bitbucket'), { code: 'OAUTH_RECONNECT_REQUIRED', statusCode: 409 });
+    }
     const username = input.username?.trim() || undefined;
     if (!name || name.length > 100 || (username && username.length > 320) || !['basic', 'bearer'].includes(input.authType) ||
         (input.authType === 'basic' && !username) || (!existing && !input.token) ||
@@ -67,8 +74,48 @@ export class AccountStore {
       createdAt: existing?.createdAt || now, updatedAt: now,
     };
     this.store.write(existing ? items.map((item) => item.id === id ? account : item) : [...items, account]);
-    const { encryptedToken: _encryptedToken, ...view } = account;
+    const { encryptedToken: _encryptedToken, encryptedRefreshToken: _encryptedRefreshToken, ...view } = account;
     return view;
+  }
+
+  saveOAuth(input: { id?: string; name: string; bitbucketUuid: string; accessToken: string; refreshToken: string; expiresAt: string }): BitbucketAccount {
+    const items = this.store.read();
+    const existing = input.id
+      ? items.find((item) => item.id === input.id)
+      : items.find((item) => item.credentialSource === 'oauth' && item.bitbucketUuid === input.bitbucketUuid);
+    if (input.id && (!existing || existing.credentialSource !== 'oauth')) {
+      throw Object.assign(new Error('OAuth account not found'), { code: 'ACCOUNT_NOT_FOUND', statusCode: 404 });
+    }
+    if (existing?.bitbucketUuid && existing.bitbucketUuid !== input.bitbucketUuid) {
+      throw Object.assign(new Error('Bitbucket identity does not match this account'), { code: 'OAUTH_IDENTITY_MISMATCH', statusCode: 409 });
+    }
+    const now = new Date().toISOString();
+    const account: StoredAccount = {
+      id: existing?.id || crypto.randomUUID(), name: input.name.slice(0, 100),
+      authType: 'bearer', credentialSource: 'oauth', bitbucketUuid: input.bitbucketUuid,
+      tokenPreview: 'OAuth connected', encryptedToken: this.crypt.encrypt(input.accessToken),
+      encryptedRefreshToken: this.crypt.encrypt(input.refreshToken), expiresAt: input.expiresAt,
+      createdAt: existing?.createdAt || now, updatedAt: now,
+    };
+    this.store.write(existing ? items.map((item) => item.id === existing.id ? account : item) : [...items, account]);
+    const { encryptedToken: _encryptedToken, encryptedRefreshToken: _encryptedRefreshToken, ...view } = account;
+    return view;
+  }
+
+  getOAuthRefreshToken(id: string): string {
+    const account = this.store.read().find((item) => item.id === id && item.credentialSource === 'oauth');
+    if (!account?.encryptedRefreshToken) throw Object.assign(new Error('Reconnect this Bitbucket account'), { code: 'OAUTH_RECONNECT_REQUIRED', statusCode: 409 });
+    return this.crypt.decrypt(account.encryptedRefreshToken);
+  }
+
+  rotateOAuthTokens(id: string, accessToken: string, refreshToken: string, expiresAt: string): void {
+    const items = this.store.read();
+    const account = items.find((item) => item.id === id && item.credentialSource === 'oauth');
+    if (!account) throw Object.assign(new Error('OAuth account not found'), { code: 'ACCOUNT_NOT_FOUND', statusCode: 404 });
+    this.store.write(items.map((item) => item.id === id ? {
+      ...item, encryptedToken: this.crypt.encrypt(accessToken),
+      encryptedRefreshToken: this.crypt.encrypt(refreshToken), expiresAt, updatedAt: new Date().toISOString(),
+    } : item));
   }
 
   delete(id: string): boolean {

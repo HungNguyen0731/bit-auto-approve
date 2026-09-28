@@ -11,6 +11,8 @@ services:
       BITBUCKET_APPROVER_DATA_DIR: /app/data
       CONTROL_PLANE_ORIGIN: ${CONTROL_PLANE_ORIGIN:?Set the public HTTPS URL in Coolify}
       CONTROL_PLANE_OWNER_PASSWORD: ${CONTROL_PLANE_OWNER_PASSWORD:?Set a strong owner password in Coolify}
+      BITBUCKET_OAUTH_CLIENT_ID: ${BITBUCKET_OAUTH_CLIENT_ID:-}
+      BITBUCKET_OAUTH_CLIENT_SECRET: ${BITBUCKET_OAUTH_CLIENT_SECRET:-}
     volumes:
       - bitbucket-approver-data:/app/data
     ports:

@@ -50,6 +50,7 @@ export interface WorkerRecord extends WorkerMetadata {
   queueDepth: number;
   hasLegacyToken?: boolean;
   supportsAccountLeases?: boolean;
+  supportsHybridTokenEnvelope?: boolean;
   supportsAutoMerge?: boolean;
   revokedAt?: string;
 }
@@ -90,6 +91,7 @@ export interface HeartbeatRequest {
   queueDepth: number;
   hasLegacyToken?: boolean;
   supportsAccountLeases?: boolean;
+  supportsHybridTokenEnvelope?: boolean;
   supportsAutoMerge?: boolean;
   lastBitbucketProbeAt?: string;
 }

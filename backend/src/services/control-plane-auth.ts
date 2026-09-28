@@ -113,6 +113,12 @@ export class ControlPlaneAuth {
     if (sessionId) this.sessions.delete(this.hash(sessionId));
   }
 
+  hasSessionHash(idHash: string): boolean {
+    if (!this.password) return idHash === 'local-mode';
+    const session = this.sessions.get(idHash);
+    return Boolean(session && Date.parse(session.expiresAt) > Date.now());
+  }
+
   private hash(value: string): string {
     return crypto.createHash('sha256').update(value).digest('hex');
   }

@@ -299,7 +299,7 @@ export async function registerWorkerRoutes(
           });
         }
         const manualOnly = worker.state !== 'ONLINE' || worker.hasLegacyToken === false || (request.body as { manualOnly?: boolean } | undefined)?.manualOnly === true;
-        const lease = executionDispatcher.claim(worker.id, manualOnly, new Date(), worker.supportsAccountLeases === true);
+        const lease = await executionDispatcher.claim(worker.id, manualOnly, new Date(), worker.supportsAccountLeases === true);
         return reply.send({ success: true, data: { lease, serverTime: new Date().toISOString() } });
       } catch (error: any) {
         return reply.status(error.statusCode || 400).send({
