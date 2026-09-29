@@ -1645,7 +1645,7 @@ private struct AppView: View {
                 if details.isEmpty { Text("Không có log PR trong lượt này.").foregroundStyle(.secondary) }
                 ForEach(details) { item in
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("\(item.status == "DRY_RUN" ? "DRY_RUN (chưa approve)" : item.status) · \(item.repository ?? "Worker")").font(.subheadline.bold())
+                        Text("\(item.status == "DRY_RUN" ? "DRY_RUN (chưa approve)" : item.status == "SCANNING_REPO" ? ((item.repository ?? "").contains("/") ? "Đang quét repo" : "Đang lấy PR") : item.status) · \(item.repository ?? "Worker")").font(.subheadline.bold())
                         if let title = item.prTitle { Text(title) }
                         if let reason = item.failureReason { Text(reason).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
                     }.frame(maxWidth: .infinity, alignment: .leading).padding(10)

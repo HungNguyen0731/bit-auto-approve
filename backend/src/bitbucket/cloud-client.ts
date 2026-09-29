@@ -344,23 +344,53 @@ export class BitbucketCloudClient implements IBitbucketClient {
     const filter = 'state="OPEN" AND draft=false AND queued=false' +
       (reviewer ? ` AND reviewers.uuid="${reviewer}"` : '');
     const query = encodeURIComponent(filter);
+    // The internal workspace list omits nested repository/commit fields unless
+    // requested explicitly. Those fields identify the repo and exact CI commit.
+    const fields = encodeURIComponent([
+      '+values.destination.repository.full_name',
+      '+values.destination.repository.slug',
+      '+values.destination.branch.name',
+      '+values.source.branch.name',
+      '+values.source.commit.hash',
+      '+values.participants.user.nickname',
+      '+values.participants.user.account_id',
+      '+values.participants.approved',
+      '+values.links.html.href',
+    ].join(','));
     let complete = false;
     for (let page = 1; page <= 1000; page++) {
-      const path = `https://bitbucket.org/!api/internal/workspaces/${encodeURIComponent(workspace)}/pullrequests/?page=${page}&pagelen=${pageSize}&q=${query}`;
-      const response = await this.request<{ values?: any[]; size?: number; next?: string }>(path, {
+      const path = `https://bitbucket.org/!api/internal/workspaces/${encodeURIComponent(workspace)}/pullrequests/?page=${page}&pagelen=${pageSize}&q=${query}&fields=${fields}`;
+      const response = await this.request<{ values?: any[]; page?: number; pagelen?: number; size?: number; next?: string }>(path, {
         headers: { referer: `https://bitbucket.org/${encodeURIComponent(workspace)}/pull-requests/` },
       });
       const values = response.values || [];
+      let missingRepository = 0;
       for (const item of values) {
-        const fullName = item.destination?.repository?.full_name;
+        const repository = item.destination?.repository;
+        let fullName = repository?.full_name;
+        if (!fullName && repository?.slug) fullName = `${workspace}/${repository.slug}`;
+        if (!fullName && typeof item.links?.html?.href === 'string') {
+          try {
+            const url = new URL(item.links.html.href);
+            const parts = url.hostname === 'bitbucket.org' ? url.pathname.split('/').filter(Boolean) : [];
+            if (parts.length >= 4 && parts[2] === 'pull-requests') fullName = `${parts[0]}/${parts[1]}`;
+          } catch { /* Ignore malformed PR link. */ }
+        }
         const parts = typeof fullName === 'string' ? fullName.split('/') : [];
         if (parts.length !== 2 || !parts[0] || !parts[1]) {
-          throw new BitbucketError('Workspace PR response is missing its destination repository.', 'GENERIC_API_ERROR', 502);
+          missingRepository++;
+          continue;
         }
         items.push(this.normalizeCloudPr(item, { projectOrWorkspace: parts[0], slug: parts[1] }));
       }
-      if (values.length === 0 || (response.size !== undefined && page * pageSize >= response.size) ||
-          (response.size === undefined && !response.next && values.length < pageSize)) {
+      if (missingRepository > 0) {
+        console.warn(`Skipped ${missingRepository} workspace PR(s) without an identifiable destination repository`);
+      }
+      const effectivePageSize = response.pagelen || pageSize;
+      const currentPage = response.page || page;
+      if (values.length === 0 ||
+          (response.size !== undefined && currentPage * effectivePageSize >= response.size) ||
+          (response.size === undefined && !response.next && values.length < effectivePageSize)) {
         complete = true;
         break;
       }
