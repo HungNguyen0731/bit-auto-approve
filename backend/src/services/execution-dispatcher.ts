@@ -68,6 +68,7 @@ export class ExecutionDispatcher {
     const allWorkers = this.workerStore.listWorkers();
     return allWorkers
       .filter((worker) => {
+        if (worker.id !== job.workerId) return false;
         if (worker.revokedAt) return false;
         if (!worker.lastHeartbeatAt || now.getTime() - new Date(worker.lastHeartbeatAt).getTime() > 35_000) {
           return false;
@@ -78,11 +79,6 @@ export class ExecutionDispatcher {
         if (!stateAllowed) return false;
         if (job.autoMergeOnSuccessfulBuild && worker.supportsAutoMerge !== true) return false;
         return true;
-      })
-      .sort((a, b) => {
-        if (a.id === job.workerId) return -1;
-        if (b.id === job.workerId) return 1;
-        return a.id.localeCompare(b.id);
       });
   }
 
@@ -90,7 +86,32 @@ export class ExecutionDispatcher {
     if ((job.executionMode ?? 'local') !== 'worker' || !job.workerId || !job.enabled) return [];
 
     this.expireStaleLeases(now);
-    const leases = this.workerStore.getLeases();
+    let leases = this.workerStore.getLeases();
+    const obsolete = leases.filter((lease) =>
+      lease.jobId === job.id && lease.idempotencyKey.includes(':shard:') &&
+      ['QUEUED', 'RETRYABLE'].includes(lease.status)
+    );
+    if (obsolete.length > 0) {
+      const completedAt = now.toISOString();
+      leases = leases.map((lease) => {
+        if (!obsolete.some((item) => item.executionId === lease.executionId)) return lease;
+        const result: ExecutionResultSummary = {
+          executionId: lease.executionId, workerId: lease.workerId, jobId: job.id,
+          status: 'FAILED', startedAt: lease.createdAt, completedAt, durationMs: 0,
+          repositoriesScanned: 0, pullRequestsScanned: 0, matched: 0,
+          approved: 0, skipped: 0, failed: 1, alreadyApproved: 0,
+          failureReason: 'Queued repository shard cancelled after restoring the assigned-Worker rule',
+        };
+        return { ...lease, status: 'FAILED' as const, completedAt, result,
+          leasedUntil: undefined, accountTokenCiphertext: undefined, manualTokenCiphertext: undefined };
+      });
+      this.workerStore.saveLeases(leases);
+      for (const lease of leases) {
+        if (obsolete.some((item) => item.executionId === lease.executionId) && lease.result) {
+          this.events.broadcast('execution_completed', lease.result);
+        }
+      }
+    }
     const active = leases.filter(
       (lease) =>
         lease.jobId === job.id &&
@@ -100,7 +121,6 @@ export class ExecutionDispatcher {
 
     const eligibleWorkers = this.getEligibleWorkers(job, now);
     if (eligibleWorkers.length === 0) {
-      this.advanceJobSchedule(job, now);
       return [];
     }
 
@@ -125,58 +145,23 @@ export class ExecutionDispatcher {
     const scheduledFor = trigger === 'MANUAL' ? now.toISOString() : job.nextRunAt || now.toISOString();
     const baseIdempotencyKey = `${job.id}:${scheduledFor}:${revision}`;
 
-    const existing = leases.filter((lease) => lease.idempotencyKey.startsWith(baseIdempotencyKey));
+    const existing = leases.filter((lease) => lease.idempotencyKey === baseIdempotencyKey);
     if (existing.length > 0) return existing;
 
-    const repositories = (job.rules.repositories || []).map((r) => r.trim()).filter(Boolean);
-    const numShards = Math.min(Math.max(1, repositories.length), eligibleWorkers.length);
-
-    const newLeases: ExecutionLease[] = [];
-    if (numShards > 1 && repositories.length > 1) {
-      for (let s = 0; s < numShards; s++) {
-        const shardRepos = repositories.filter((_, idx) => idx % numShards === s);
-        const assignedWorker = eligibleWorkers[s % eligibleWorkers.length];
-        const shardJob: ApprovalJob = {
-          ...job,
-          rules: {
-            ...job.rules,
-            repositories: shardRepos,
-          },
-        };
-        const shardRevision = jobRevision(shardJob);
-        const shardLease: ExecutionLease = {
-          executionId: crypto.randomUUID(),
-          idempotencyKey: `${baseIdempotencyKey}:shard:${s}`,
-          jobId: job.id,
-          jobRevision: shardRevision,
-          workerId: assignedWorker.id,
-          trigger,
-          status: 'QUEUED',
-          scheduledFor,
-          createdAt: now.toISOString(),
-          lastSequence: 0,
-          job: { ...shardJob, revision: shardRevision },
-          bitbucketConfig,
-        };
-        newLeases.push(shardLease);
-      }
-    } else {
-      const lease: ExecutionLease = {
-        executionId: crypto.randomUUID(),
-        idempotencyKey: baseIdempotencyKey,
-        jobId: job.id,
-        jobRevision: revision,
-        workerId: eligibleWorkers[0].id,
-        trigger,
-        status: 'QUEUED',
-        scheduledFor,
-        createdAt: now.toISOString(),
-        lastSequence: 0,
-        job: { ...job, revision },
-        bitbucketConfig,
-      };
-      newLeases.push(lease);
-    }
+    const newLeases: ExecutionLease[] = [{
+      executionId: crypto.randomUUID(),
+      idempotencyKey: baseIdempotencyKey,
+      jobId: job.id,
+      jobRevision: revision,
+      workerId: eligibleWorkers[0].id,
+      trigger,
+      status: 'QUEUED',
+      scheduledFor,
+      createdAt: now.toISOString(),
+      lastSequence: 0,
+      job: { ...job, revision },
+      bitbucketConfig,
+    }];
 
     this.workerStore.saveLeases([...leases, ...newLeases]);
     this.advanceJobSchedule(job, now);
@@ -271,6 +256,8 @@ export class ExecutionDispatcher {
     let available = leases.find(
       (lease) =>
         lease.workerId === workerId &&
+        lease.job.workerId === workerId &&
+        !lease.idempotencyKey.includes(':shard:') &&
         (!lease.job.accountId || Boolean(lease.manualTokenCiphertext) || supportsAccountLeases) &&
         (!manualOnly || Boolean(lease.manualTokenCiphertext || lease.job.accountId)) &&
         (lease.status === 'QUEUED' ||
@@ -280,32 +267,6 @@ export class ExecutionDispatcher {
             lease.leasedUntil &&
             new Date(lease.leasedUntil).getTime() <= now.getTime()))
     );
-
-    if (!available) {
-      available = leases.find((lease) => {
-        if (lease.status !== 'QUEUED') return false;
-        if (lease.job.accountId && !lease.manualTokenCiphertext && !supportsAccountLeases) return false;
-        if (manualOnly && !lease.manualTokenCiphertext && !lease.job.accountId) return false;
-        if (lease.job.autoMergeOnSuccessfulBuild) {
-          const currentWorker = this.workerStore.getWorker(workerId);
-          if (currentWorker?.supportsAutoMerge !== true) return false;
-        }
-        const assigned = this.workerStore.getWorker(lease.workerId);
-        const assignedOffline = !assigned || assigned.revokedAt || !assigned.lastHeartbeatAt ||
-          now.getTime() - new Date(assigned.lastHeartbeatAt).getTime() > 35_000 || assigned.state !== 'ONLINE';
-        const assignedBusy = leases.some((other) =>
-          other.workerId === lease.workerId &&
-          other.executionId !== lease.executionId &&
-          ['LEASED', 'RUNNING'].includes(other.status) &&
-          other.leasedUntil &&
-          new Date(other.leasedUntil).getTime() > now.getTime()
-        );
-        return assignedOffline || assignedBusy || lease.workerId === 'pool';
-      });
-      if (available) {
-        available = { ...available, workerId };
-      }
-    }
 
     if (!available) return null;
 

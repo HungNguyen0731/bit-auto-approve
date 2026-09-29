@@ -337,6 +337,40 @@ export class BitbucketCloudClient implements IBitbucketClient {
     return items.map((item) => this.normalizeCloudPr(item, repo));
   }
 
+  async listWorkspaceOpenPullRequests(workspace: string, reviewerUuid?: string): Promise<PullRequest[]> {
+    const items: PullRequest[] = [];
+    const pageSize = 100;
+    const reviewer = reviewerUuid?.replace(/^\{|\}$/g, '');
+    const filter = 'state="OPEN" AND draft=false AND queued=false' +
+      (reviewer ? ` AND reviewers.uuid="${reviewer}"` : '');
+    const query = encodeURIComponent(filter);
+    let complete = false;
+    for (let page = 1; page <= 1000; page++) {
+      const path = `https://bitbucket.org/!api/internal/workspaces/${encodeURIComponent(workspace)}/pullrequests/?page=${page}&pagelen=${pageSize}&q=${query}`;
+      const response = await this.request<{ values?: any[]; size?: number; next?: string }>(path, {
+        headers: { referer: `https://bitbucket.org/${encodeURIComponent(workspace)}/pull-requests/` },
+      });
+      const values = response.values || [];
+      for (const item of values) {
+        const fullName = item.destination?.repository?.full_name;
+        const parts = typeof fullName === 'string' ? fullName.split('/') : [];
+        if (parts.length !== 2 || !parts[0] || !parts[1]) {
+          throw new BitbucketError('Workspace PR response is missing its destination repository.', 'GENERIC_API_ERROR', 502);
+        }
+        items.push(this.normalizeCloudPr(item, { projectOrWorkspace: parts[0], slug: parts[1] }));
+      }
+      if (values.length === 0 || (response.size !== undefined && page * pageSize >= response.size) ||
+          (response.size === undefined && !response.next && values.length < pageSize)) {
+        complete = true;
+        break;
+      }
+    }
+    if (!complete) {
+      throw new BitbucketError('Workspace PR list exceeds the supported scan limit.', 'GENERIC_API_ERROR', 502);
+    }
+    return items;
+  }
+
   async getPullRequest(repo: RepositoryRef, prId: number): Promise<PullRequest> {
     const path = `/repositories/${encodeURIComponent(repo.projectOrWorkspace)}/${encodeURIComponent(repo.slug)}/pullrequests/${prId}`;
     const item = await this.request<any>(path);

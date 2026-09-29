@@ -3,13 +3,14 @@ import type {
   ExecutionLease,
   ExecutionResultSummary,
   PullRequest,
-  RepositoryRef,
+  BitbucketUserProfile,
   WorkerLogEntry,
 } from '@bitbucket-pr-approver/shared';
 import {
   BitbucketCloudClient,
   RuleFilteringEngine,
   matchesPattern,
+  matchesRepository,
 } from '@bitbucket-pr-approver/backend/runtime';
 
 export interface WorkerExecutionResult {
@@ -97,7 +98,7 @@ export class WorkerExecutor {
     const config = this.buildBitbucketConfig(lease, token);
     const client = new BitbucketCloudClient(config, BITBUCKET_REQUEST_INTERVAL_MS);
     const currentUser = await client.getCurrentUser();
-    const repositories = await this.resolveRepositories(client, lease);
+    const workspaces = this.resolveWorkspaces(currentUser, lease);
     const logs: WorkerLogEntry[] = [];
     let sequence = lease.lastSequence;
     let pullRequestsScanned = 0;
@@ -108,12 +109,11 @@ export class WorkerExecutor {
     let skipped = 0;
     let failed = 0;
     let alreadyApproved = 0;
-    let repositoriesScanned = 0;
+    const repositoriesSeen = new Set<string>();
     let rateLimitReason: string | undefined;
     let rateLimitRetryAfterSeconds: number | undefined;
 
-    for (const repository of repositories) {
-      const repoFullName = `${repository.projectOrWorkspace}/${repository.slug}`;
+    for (const workspace of workspaces) {
       const scanLog: WorkerLogEntry = {
         id: crypto.randomUUID(),
         workerId: lease.workerId,
@@ -123,16 +123,15 @@ export class WorkerExecutor {
         status: 'SCANNING_REPO',
         flowStep: 'SCAN_REPO',
         timestamp: new Date().toISOString(),
-        repository: repoFullName,
-        matchedConditions: [`Scanning repository ${repoFullName}`],
+        repository: workspace,
+        matchedConditions: [`Loading open pull requests in workspace ${workspace}`],
       };
       logs.push(scanLog);
       if (onProgress) await onProgress(scanLog);
 
       let pullRequests: PullRequest[];
       try {
-        pullRequests = await client.listOpenPullRequests(repository);
-        repositoriesScanned++;
+        pullRequests = await client.listWorkspaceOpenPullRequests(workspace, currentUser.uuid);
       } catch (error: any) {
         if (error.code !== 'RATE_LIMITED') throw error;
         rateLimitReason = error.message;
@@ -141,6 +140,10 @@ export class WorkerExecutor {
         break;
       }
       for (const pullRequest of pullRequests) {
+        const repository = pullRequest.repository;
+        const repoFullName = `${repository.projectOrWorkspace}/${repository.slug}`;
+        if (!matchesRepository(repoFullName, lease.job.rules.repositories || [])) continue;
+        repositoriesSeen.add(repoFullName);
         pullRequestsScanned++;
         const evaluation = RuleFilteringEngine.evaluate(pullRequest, lease.job.rules, currentUser);
         if (evaluation.matched) matched++;
@@ -281,7 +284,7 @@ export class WorkerExecutor {
         startedAt: startedAt.toISOString(),
         completedAt: completedAt.toISOString(),
         durationMs: completedAt.getTime() - startedAt.getTime(),
-        repositoriesScanned,
+        repositoriesScanned: repositoriesSeen.size,
         pullRequestsScanned,
         matched,
         approved,
@@ -297,46 +300,24 @@ export class WorkerExecutor {
     };
   }
 
-  private async resolveRepositories(
-    client: BitbucketCloudClient,
-    lease: ExecutionLease
-  ): Promise<RepositoryRef[]> {
-    const direct: RepositoryRef[] = [];
-    const wildcards: string[] = [];
-    for (const rule of lease.job.rules.repositories || []) {
-      const value = rule.trim();
-      if (!value) continue;
-      if (value.includes('*') || value.includes('?')) {
-        wildcards.push(value);
-        continue;
-      }
-      const separator = value.indexOf('/');
-      if (separator > 0) {
-        direct.push({ projectOrWorkspace: value.slice(0, separator), slug: value.slice(separator + 1) });
-      }
-    }
-
-    if (wildcards.length > 0) {
-      const allRepositories = await client.listRepositories();
-      for (const repository of allRepositories) {
-        const fullName = `${repository.projectOrWorkspace}/${repository.slug}`;
-        if (
-          wildcards.some((pattern) => matchesPattern(fullName, pattern)) &&
-          !direct.some(
-            (item) =>
-              item.projectOrWorkspace === repository.projectOrWorkspace &&
-              item.slug === repository.slug
-          )
-        ) {
-          direct.push({
-            projectOrWorkspace: repository.projectOrWorkspace,
-            slug: repository.slug,
-          });
+  private resolveWorkspaces(currentUser: BitbucketUserProfile, lease: ExecutionLease): string[] {
+    const rules = lease.job.rules.repositories || [];
+    const available = currentUser.workspaces?.map((workspace) => workspace.slug) || [];
+    const workspaces = new Set<string>();
+    for (const rule of rules) {
+      const separator = rule.indexOf('/');
+      if (separator < 1) continue;
+      const pattern = rule.slice(0, separator).trim();
+      if (!pattern) continue;
+      if (!pattern.includes('*') && !pattern.includes('?') && !pattern.startsWith('regex:')) {
+        workspaces.add(pattern);
+      } else {
+        for (const workspace of available) {
+          if (matchesPattern(workspace, pattern)) workspaces.add(workspace);
         }
       }
     }
-
-    return direct;
+    return [...workspaces];
   }
 
   private toLog(

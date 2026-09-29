@@ -35,7 +35,7 @@ function getFlowSteps(entry: WorkerLogEntry): StepState[] {
   let approveStatus: StepState['status'] = 'pending';
   let mergeStatus: StepState['status'] = 'pending';
 
-  let scanDetail: string | undefined = entry.repository ? `Scanned ${entry.repository}` : undefined;
+  let scanDetail: string | undefined = entry.repository ? `PR list from ${entry.repository}` : undefined;
   let matchDetail: string | undefined;
   let ciDetail: string | undefined;
   let approveDetail: string | undefined;
@@ -43,7 +43,7 @@ function getFlowSteps(entry: WorkerLogEntry): StepState[] {
 
   if (entry.status === 'SCANNING_REPO') {
     scanStatus = 'in_progress';
-    scanDetail = 'Scanning open pull requests...';
+    scanDetail = 'Loading open pull requests...';
   } else if (!isPrEntry) {
     // Non-PR transition (e.g. worker state change)
     scanStatus = entry.status === 'FAILED' ? 'failed' : 'completed';
@@ -128,7 +128,7 @@ function getFlowSteps(entry: WorkerLogEntry): StepState[] {
   }
 
   return [
-    { key: 'SCAN_REPO', label: '1. Scan Repo', status: scanStatus, detail: scanDetail },
+    { key: 'SCAN_REPO', label: '1. Get PRs', status: scanStatus, detail: scanDetail },
     { key: 'MATCH_PR', label: '2. Match Rules', status: matchStatus, detail: matchDetail },
     { key: 'CHECK_CI', label: '3. Check CI', status: ciStatus, detail: ciDetail },
     { key: 'APPROVE', label: '4. Approve', status: approveStatus, detail: approveDetail },
@@ -148,7 +148,7 @@ const STATUS_BADGES: Record<
   FAILED: { label: 'FAILED', bg: 'bg-rose-500/10', text: 'text-rose-700', border: 'border-rose-500/20', icon: XCircle },
   PAUSED_VPN: { label: 'PAUSED VPN', bg: 'bg-orange-500/10', text: 'text-orange-700', border: 'border-orange-500/20', icon: AlertCircle },
   RESUMED: { label: 'RESUMED', bg: 'bg-teal-500/10', text: 'text-teal-700', border: 'border-teal-500/20', icon: CheckCircle2 },
-  SCANNING_REPO: { label: 'SCANNING', bg: 'bg-cyan-500/10', text: 'text-cyan-700', border: 'border-cyan-500/20', icon: Loader2 },
+  SCANNING_REPO: { label: 'LOADING PRS', bg: 'bg-cyan-500/10', text: 'text-cyan-700', border: 'border-cyan-500/20', icon: Loader2 },
   MATCHING_PR: { label: 'MATCHING', bg: 'bg-indigo-500/10', text: 'text-indigo-700', border: 'border-indigo-500/20', icon: Activity },
   CHECKING_CI: { label: 'CHECKING CI', bg: 'bg-sky-500/10', text: 'text-sky-700', border: 'border-sky-500/20', icon: ShieldCheck },
 };
