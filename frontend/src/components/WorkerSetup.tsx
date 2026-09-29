@@ -1,7 +1,7 @@
 import { ArrowRight, Download, RefreshCw, ShieldCheck } from 'lucide-react';
 import type { WorkerRecord } from '../types';
 import { WorkerStatus } from './WorkerStatus';
-import { MAC_APP_DOWNLOAD_URL } from '../constants/macAppDownload';
+import { MAC_APP_DOWNLOAD_URL, MAC_APP_FALLBACK_URL } from '../constants/macAppDownload';
 
 export function WorkerSetup({ workers, onRefresh }: {
   workers: WorkerRecord[];
@@ -30,7 +30,7 @@ export function WorkerSetup({ workers, onRefresh }: {
               </a>
               <span className="text-xs leading-5 text-app-muted">macOS 13 trở lên, Apple Silicon</span>
             </div>
-            <p className="mt-3 text-xs leading-5 text-app-muted">Bản mới được tải từ máy chủ ứng dụng.</p>
+            <p className="mt-3 text-xs leading-5 text-app-muted">Tải trực tiếp từ GitHub để tránh nghẽn server. <a href={MAC_APP_FALLBACK_URL} download className="font-semibold text-brand-700 underline underline-offset-2 hover:text-brand-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-700">Dùng máy chủ dự phòng</a> nếu GitHub không truy cập được.</p>
             <p className="mt-4 max-w-lg text-xs leading-5 text-app-muted">
               Bản tải xuống được ký ad-hoc, chưa được Apple notarize. macOS có thể yêu cầu bạn xác nhận mở ứng dụng lần đầu.
             </p>
