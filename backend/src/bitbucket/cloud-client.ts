@@ -174,6 +174,22 @@ export class BitbucketCloudClient implements IBitbucketClient {
         );
       }
 
+      if (response.status === 405) {
+        let errBody: string = '';
+        try {
+          errBody = await response.text();
+        } catch {
+          // ignore
+        }
+        const allow = response.headers.get('allow');
+        throw new BitbucketError(
+          `Method Not Allowed on Bitbucket Cloud (HTTP 405) for ${options.method || 'GET'} ${url}.${allow ? ` Allowed methods: ${allow}.` : ''}${errBody ? ` - ${errBody}` : ''}`,
+          'GENERIC_API_ERROR',
+          405,
+          { responseBody: errBody, method: options.method || 'GET', url, allow }
+        );
+      }
+
       if (response.status === 429) {
         const retryAfterHeader = response.headers.get('retry-after');
         const seconds = retryAfterHeader && /^\d+$/.test(retryAfterHeader.trim())
@@ -357,7 +373,7 @@ export class BitbucketCloudClient implements IBitbucketClient {
     if (!/^[a-f0-9]{7,64}$/i.test(commitHash)) return 'PENDING';
     const prefix = `/repositories/${encodeURIComponent(repo.projectOrWorkspace)}/${encodeURIComponent(repo.slug)}`;
     const statuses = await this.paginatedValues<any>(
-      `${prefix}/commit/${encodeURIComponent(commitHash)}/statuses/build?pagelen=100`, 1000
+      `${prefix}/commit/${encodeURIComponent(commitHash)}/statuses?pagelen=100`, 1000
     );
     if (statuses.length === 0) return 'PENDING';
     const latestByKey = new Map<string, any>();
