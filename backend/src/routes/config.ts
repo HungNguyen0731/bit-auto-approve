@@ -15,8 +15,8 @@ export async function registerConfigRoutes(
       success: true,
       data: config || {
         serverType: 'cloud',
-        baseUrl: 'https://api.bitbucket.org/2.0',
-        authType: 'basic',
+        baseUrl: 'https://bitbucket.org/!api/2.0',
+        authType: 'session',
         username: null,
         workspace: null,
         hasToken: false,
@@ -43,13 +43,14 @@ export async function registerConfigRoutes(
     }
 
     const existing = storage.getConfig();
+    const effectiveAuthType = body.authType || existing?.authType || 'session';
 
-    // Default to Bitbucket Cloud standard while preserving omitted values from
+    // Default to Bitbucket Session Auth while preserving omitted values from
     // partial settings updates. Raw tokens remain preserved by StorageService.
     const configToSave: BitbucketConnectionConfig = {
       serverType: 'cloud',
-      baseUrl: body.baseUrl?.trim() || existing?.baseUrl || 'https://api.bitbucket.org/2.0',
-      authType: body.authType || existing?.authType || 'basic',
+      baseUrl: body.baseUrl?.trim() || existing?.baseUrl || (effectiveAuthType === 'basic' || effectiveAuthType === 'bearer' ? 'https://api.bitbucket.org/2.0' : 'https://bitbucket.org/!api/2.0'),
+      authType: effectiveAuthType,
       token: body.token,
       cookie: body.cookie,
       csrfToken: body.csrfToken,
@@ -86,8 +87,9 @@ export async function registerConfigRoutes(
     const body = req.body || {};
     const existing = storage.getConfig();
 
+    const effectiveAuthType = body.authType || existing?.authType || 'session';
     let testToken = body.token || existing?.token;
-    if (body.authType === 'session' || (!body.authType && existing?.authType === 'session')) {
+    if (effectiveAuthType === 'session') {
       if (body.cookie !== undefined || body.csrfToken !== undefined) {
         testToken = JSON.stringify({
           cookie: body.cookie?.trim() || '',
@@ -98,8 +100,8 @@ export async function registerConfigRoutes(
 
     const configToTest: BitbucketConnectionConfig = {
       serverType: 'cloud',
-      baseUrl: body.baseUrl?.trim() || existing?.baseUrl || 'https://api.bitbucket.org/2.0',
-      authType: body.authType || existing?.authType || 'basic',
+      baseUrl: body.baseUrl?.trim() || existing?.baseUrl || (effectiveAuthType === 'basic' || effectiveAuthType === 'bearer' ? 'https://api.bitbucket.org/2.0' : 'https://bitbucket.org/!api/2.0'),
+      authType: effectiveAuthType,
       token: testToken,
       cookie: body.cookie,
       csrfToken: body.csrfToken,

@@ -20,28 +20,38 @@ export interface WorkerExecutionResult {
 // Space Bitbucket calls across scans, CI checks, approvals, and merge revalidation.
 // The queue is process-wide in BitbucketCloudClient, so consecutive jobs on
 // this Worker do not start a fresh burst.
-const BITBUCKET_REQUEST_INTERVAL_MS = 4_000;
+const BITBUCKET_REQUEST_INTERVAL_MS = 1_000;
 
 export class WorkerExecutor {
   constructor(private readonly verificationMode = false) {}
 
   private buildBitbucketConfig(lease: ExecutionLease, token: string) {
-    if (lease.bitbucketConfig.authType === 'session') {
-      try {
-        const parsed = JSON.parse(token);
-        if (typeof parsed === 'object' && parsed !== null) {
-          return {
-            ...lease.bitbucketConfig,
-            token,
-            cookie: parsed.cookie,
-            csrfToken: parsed.csrfToken,
-          };
-        }
-      } catch {
-        // Not JSON, pass as is
+    let cookie = lease.bitbucketConfig.cookie;
+    let csrfToken = lease.bitbucketConfig.csrfToken;
+    let authType = lease.bitbucketConfig.authType || 'session';
+
+    try {
+      const parsed = JSON.parse(token);
+      if (typeof parsed === 'object' && parsed !== null) {
+        cookie = cookie || parsed.cookie;
+        csrfToken = csrfToken || parsed.csrfToken;
+        authType = 'session';
       }
+    } catch {
+      // Not JSON, pass as is
     }
-    return { ...lease.bitbucketConfig, token };
+
+    if (cookie || csrfToken) {
+      authType = 'session';
+    }
+
+    return {
+      ...lease.bitbucketConfig,
+      authType,
+      token,
+      cookie,
+      csrfToken,
+    };
   }
 
   async probe(lease: ExecutionLease, token: string): Promise<void> {
@@ -50,7 +60,11 @@ export class WorkerExecutor {
     await client.getCurrentUser();
   }
 
-  async execute(lease: ExecutionLease, token: string): Promise<WorkerExecutionResult> {
+  async execute(
+    lease: ExecutionLease,
+    token: string,
+    onProgress?: (entry: WorkerLogEntry) => Promise<void> | void
+  ): Promise<WorkerExecutionResult> {
     if (this.verificationMode && !lease.job.dryRun) {
       throw Object.assign(new Error('Verification mode rejects live approval jobs'), {
         code: 'VERIFICATION_MODE_LIVE_JOB',
@@ -99,6 +113,22 @@ export class WorkerExecutor {
     let rateLimitRetryAfterSeconds: number | undefined;
 
     for (const repository of repositories) {
+      const repoFullName = `${repository.projectOrWorkspace}/${repository.slug}`;
+      const scanLog: WorkerLogEntry = {
+        id: crypto.randomUUID(),
+        workerId: lease.workerId,
+        executionId: lease.executionId,
+        jobId: lease.jobId,
+        sequence: ++sequence,
+        status: 'SCANNING_REPO',
+        flowStep: 'SCAN_REPO',
+        timestamp: new Date().toISOString(),
+        repository: repoFullName,
+        matchedConditions: [`Scanning repository ${repoFullName}`],
+      };
+      logs.push(scanLog);
+      if (onProgress) await onProgress(scanLog);
+
       let pullRequests: PullRequest[];
       try {
         pullRequests = await client.listOpenPullRequests(repository);
@@ -116,31 +146,78 @@ export class WorkerExecutor {
         if (evaluation.matched) matched++;
 
         let status: WorkerLogEntry['status'] = 'SKIPPED';
+        let flowStep: import('@bitbucket-pr-approver/shared').FlowStep = 'MATCH_PR';
         let providerErrorCode: string | undefined;
         let failureReason = evaluation.failureReason;
 
         if (!evaluation.matched) {
           skipped++;
+          flowStep = 'MATCH_PR';
         } else if (lease.job.dryRun) {
           status = evaluation.isAlreadyApproved ? 'ALREADY_APPROVED' : 'DRY_RUN';
+          flowStep = 'APPROVE';
           if (evaluation.isAlreadyApproved) alreadyApproved++;
           else wouldApprove++;
         } else {
+          // Emit MATCH_PR event
+          const matchLog = this.toLog(
+            lease,
+            pullRequest,
+            ++sequence,
+            'MATCHING_PR',
+            evaluation.reasons,
+            undefined,
+            undefined,
+            'MATCH_PR'
+          );
+          logs.push(matchLog);
+          if (onProgress) await onProgress(matchLog);
+
           try {
             const commitHash = pullRequest.sourceBranch.commitHash;
+            // Emit CHECKING_CI event
+            const checkingCiLog = this.toLog(
+              lease,
+              pullRequest,
+              ++sequence,
+              'CHECKING_CI',
+              [`Checking CI build status for commit ${commitHash ? commitHash.slice(0, 10) : 'unknown'}`],
+              undefined,
+              undefined,
+              'CHECK_CI'
+            );
+            logs.push(checkingCiLog);
+            if (onProgress) await onProgress(checkingCiLog);
+
             const build = commitHash
               ? await client.getCommitBuildStatus(repository, commitHash) : 'PENDING';
             if (build !== 'SUCCESSFUL') {
               status = 'SKIPPED';
+              flowStep = 'CHECK_CI';
               skipped++;
               failureReason = `Source commit CI is ${build.toLowerCase()}; approval and merge require success`;
             } else if (evaluation.isAlreadyApproved) {
               status = 'ALREADY_APPROVED';
+              flowStep = 'APPROVE';
               alreadyApproved++;
             } else {
               await client.approvePullRequest(repository, pullRequest.id);
               status = 'APPROVED';
+              flowStep = 'APPROVE';
               approved++;
+
+              const approveLog = this.toLog(
+                lease,
+                pullRequest,
+                ++sequence,
+                'APPROVED',
+                [`Approved pull request #${pullRequest.id}`],
+                undefined,
+                undefined,
+                'APPROVE'
+              );
+              logs.push(approveLog);
+              if (onProgress) await onProgress(approveLog);
             }
 
             if (lease.job.autoMergeOnSuccessfulBuild && build === 'SUCCESSFUL') {
@@ -154,11 +231,11 @@ export class WorkerExecutor {
                     !freshEvaluation.matched || !freshEvaluation.isAlreadyApproved ||
                     !mergeBranches.some((branch) => matchesPattern(fresh.targetBranch.name, branch))) {
                   failureReason = 'Merge deferred: PR, source commit, rules, or Bitbucket approval changed after the scan';
-                } else if (await client.getCommitBuildStatus(repository, commitHash!) !== 'SUCCESSFUL') {
-                  failureReason = 'Merge deferred: source-commit CI is no longer successful';
                 } else {
+                  // Duplicate CI re-check removed: commitHash is validated identical and CI build was already confirmed SUCCESSFUL
                   await client.mergePullRequest(repository, pullRequest.id);
                   status = 'MERGED';
+                  flowStep = 'MERGE';
                   merged++;
                   failureReason = undefined;
                 }
@@ -176,17 +253,18 @@ export class WorkerExecutor {
           }
         }
 
-        logs.push(
-          this.toLog(
-            lease,
-            pullRequest,
-            ++sequence,
-            status,
-            evaluation.reasons,
-            failureReason,
-            providerErrorCode
-          )
+        const terminalLog = this.toLog(
+          lease,
+          pullRequest,
+          ++sequence,
+          status,
+          evaluation.reasons,
+          failureReason,
+          providerErrorCode,
+          flowStep
         );
+        logs.push(terminalLog);
+        if (onProgress) await onProgress(terminalLog);
         if (rateLimitReason) break;
       }
       if (rateLimitReason) break;
@@ -268,7 +346,8 @@ export class WorkerExecutor {
     status: WorkerLogEntry['status'],
     matchedConditions: string[],
     failureReason?: string,
-    providerErrorCode?: string
+    providerErrorCode?: string,
+    flowStep?: import('@bitbucket-pr-approver/shared').FlowStep
   ): WorkerLogEntry {
     return {
       id: crypto.randomUUID(),
@@ -277,6 +356,7 @@ export class WorkerExecutor {
       jobId: lease.jobId,
       sequence,
       status,
+      flowStep,
       timestamp: new Date().toISOString(),
       repository: `${pullRequest.repository.projectOrWorkspace}/${pullRequest.repository.slug}`,
       prId: pullRequest.id,

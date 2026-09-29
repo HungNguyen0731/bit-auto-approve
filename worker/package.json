@@ -8,6 +8,7 @@
     "build:keychain": "swiftc native/keychain-helper.swift -o native/keychain-helper",
     "build:bundle": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node24 --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outfile=dist/worker-bundle.mjs",
     "build": "tsc && npm run build:keychain && npm run build:bundle",
+    "test": "tsx --test src/**/*.test.ts",
     "start": "node dist/index.js"
   },
   "dependencies": {
@@ -18,6 +19,7 @@
   "devDependencies": {
     "@types/node": "^26.6.2",
     "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }
 }

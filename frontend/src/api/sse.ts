@@ -89,11 +89,35 @@ export function useSseEvents(options: SseHookOptions = {}) {
           if (!isMounted) return;
           try {
             const data = JSON.parse(event.data);
-            optionsRef.current.onWorkerLogBatch?.(data.items || []);
+            const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : data ? [data] : [];
+            optionsRef.current.onWorkerLogBatch?.(items);
           } catch (e) {
             console.error('Error parsing worker_log_batch SSE event', e);
           }
         });
+
+        es.onmessage = (event: MessageEvent) => {
+          if (!isMounted) return;
+          try {
+            const parsed = JSON.parse(event.data);
+            if (parsed && typeof parsed === 'object') {
+              if (parsed.type === 'worker_log_batch' && parsed.data) {
+                const items = Array.isArray(parsed.data.items) ? parsed.data.items : Array.isArray(parsed.data) ? parsed.data : [parsed.data];
+                optionsRef.current.onWorkerLogBatch?.(items);
+              } else if (parsed.type === 'status_changed' && parsed.data) {
+                optionsRef.current.onStatusChange?.(parsed.data);
+              } else if (parsed.type === 'worker_status_changed' && parsed.data) {
+                optionsRef.current.onWorkerStatusChange?.(parsed.data);
+              } else if ((parsed.type === 'pr_approved' || parsed.type === 'pr_evaluated') && parsed.data) {
+                optionsRef.current.onLogEntry?.(parsed.data);
+              } else if (parsed.type === 'execution_completed') {
+                optionsRef.current.onExecutionCompleted?.();
+              }
+            }
+          } catch {
+            // ignore
+          }
+        };
 
         es.addEventListener('execution_completed', () => {
           if (!isMounted) return;

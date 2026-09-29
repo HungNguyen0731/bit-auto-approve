@@ -74,7 +74,7 @@ export async function registerWorkerInstallerRoutes(
   app: FastifyInstance,
   options: { auth: ControlPlaneAuth }
 ): Promise<void> {
-  const macAppVersion = '0.3.13';
+  const macAppVersion = '0.3.14';
   const macAppName = `Bitbucket-PR-Approver-${macAppVersion}-macOS.zip`;
   const macAppPath = path.resolve(process.cwd(), '../macos-app/releases', macAppName);
   app.get('/api/mac-app/latest', async (_request, reply) => {

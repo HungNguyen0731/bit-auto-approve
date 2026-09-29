@@ -67,17 +67,32 @@ export class StorageService {
       const stored = JSON.parse(raw) as StoredConfig;
 
       let token: string | undefined;
+      let cookie: string | undefined;
+      let csrfToken: string | undefined;
       if (stored.encryptedToken) {
         token = this.cryptoService.decrypt(stored.encryptedToken);
+        if (stored.authType === 'session' && token) {
+          try {
+            const parsed = JSON.parse(token);
+            if (typeof parsed === 'object' && parsed !== null) {
+              cookie = parsed.cookie;
+              csrfToken = parsed.csrfToken;
+            }
+          } catch {
+            // not JSON
+          }
+        }
       }
 
       return {
         serverType: stored.serverType,
         baseUrl: stored.baseUrl,
-        authType: stored.authType,
+        authType: stored.authType || 'session',
         username: stored.username,
         workspace: stored.workspace,
         token,
+        cookie,
+        csrfToken,
         skipSslVerification: stored.skipSslVerification,
         proxyUrl: stored.proxyUrl,
         timeoutMs: stored.timeoutMs,
@@ -99,7 +114,7 @@ export class StorageService {
       return {
         serverType: stored.serverType,
         baseUrl: stored.baseUrl,
-        authType: stored.authType,
+        authType: stored.authType || 'session',
         username: stored.username,
         workspace: stored.workspace,
         hasToken: stored.hasToken,
@@ -115,10 +130,11 @@ export class StorageService {
 
   saveConfig(config: BitbucketConnectionConfig): MaskedConnectionConfig {
     const existing = this.getConfig();
+    const effectiveAuthType = config.authType || existing?.authType || 'session';
 
     // If no new token provided, preserve existing token
     let tokenToEncrypt = config.token;
-    if (config.authType === 'session') {
+    if (effectiveAuthType === 'session') {
       if (config.cookie !== undefined || config.csrfToken !== undefined) {
         const cookie = config.cookie?.trim() || '';
         const csrfToken = config.csrfToken?.trim() || '';
@@ -129,7 +145,7 @@ export class StorageService {
     }
 
     let tokenPreview: string | undefined;
-    if (config.authType === 'session') {
+    if (effectiveAuthType === 'session') {
       tokenPreview = 'Session auth (cookie + CSRF)';
     } else if (tokenToEncrypt) {
       tokenPreview = CryptoService.maskToken(tokenToEncrypt);
@@ -137,7 +153,7 @@ export class StorageService {
 
     if (!tokenToEncrypt && existing?.token) {
       tokenToEncrypt = existing.token;
-      if (config.authType === 'session' || existing.authType === 'session') {
+      if (effectiveAuthType === 'session' || existing.authType === 'session') {
         tokenPreview = 'Session auth (cookie + CSRF)';
       } else {
         tokenPreview = CryptoService.maskToken(existing.token);
@@ -151,8 +167,8 @@ export class StorageService {
 
     const storedConfig: StoredConfig = {
       serverType: config.serverType,
-      baseUrl: config.baseUrl,
-      authType: config.authType,
+      baseUrl: config.baseUrl || (effectiveAuthType === 'basic' || effectiveAuthType === 'bearer' ? 'https://api.bitbucket.org/2.0' : 'https://bitbucket.org/!api/2.0'),
+      authType: effectiveAuthType,
       username: config.username,
       workspace: config.workspace || existing?.workspace,
       encryptedToken,

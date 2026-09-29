@@ -131,7 +131,7 @@ private struct AccountDraft {
     var id: String?
     var name = ""
     var username = ""
-    var authType = "bearer"
+    var authType = "session"
     var token = ""
     var cookie = ""
     var csrfToken = ""
@@ -1207,9 +1207,9 @@ private struct AppView: View {
             Text(draftAccount.id == nil ? "Tạo Bitbucket account" : "Sửa Bitbucket account").font(.title2.bold())
             TextField("Tên gợi nhớ", text: $draftAccount.name)
             Picker("Kiểu token", selection: $draftAccount.authType) {
+                Text("Session Auth (Cookie + CSRF)").tag("session")
                 Text("Bearer").tag("bearer")
                 Text("Basic (username + token)").tag("basic")
-                Text("Session Auth (Cookie + CSRF)").tag("session")
             }
             if draftAccount.authType == "basic" { TextField("Username / email", text: $draftAccount.username) }
             if draftAccount.authType == "session" {

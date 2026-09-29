@@ -39,7 +39,7 @@ export class EventHub {
     res.write(`data: ${JSON.stringify({ type: 'connected', timestamp: new Date().toISOString() })}\n\n`);
 
     if (initialEvent) {
-      res.write(`event: message\ndata: ${JSON.stringify(initialEvent)}\n\n`);
+      res.write(`event: ${initialEvent.type}\ndata: ${JSON.stringify(initialEvent.data)}\n\n`);
     }
 
     this.clients.add(res);
@@ -50,13 +50,7 @@ export class EventHub {
   }
 
   broadcast<T = unknown>(type: SseEventType, data: T): void {
-    const payload: SseEventPayload<T> = {
-      type,
-      timestamp: new Date().toISOString(),
-      data,
-    };
-
-    const message = `event: message\ndata: ${JSON.stringify(payload)}\n\n`;
+    const message = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 
     for (const client of this.clients) {
       try {

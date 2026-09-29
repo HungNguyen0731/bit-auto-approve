@@ -193,10 +193,10 @@ export class SchedulerService {
     try {
       const savedConfig = this.storage.getConfig();
       const config = manualCredential
-        ? { ...(savedConfig || { serverType: 'cloud' as const, baseUrl: 'https://api.bitbucket.org/2.0', authType: 'basic' as const }),
+        ? { ...(savedConfig || { serverType: 'cloud' as const, baseUrl: 'https://bitbucket.org/!api/2.0', authType: 'session' as const }),
             token: manualCredential.token,
             username: manualCredential.username,
-            authType: manualCredential.username ? 'basic' as const : 'bearer' as const }
+            authType: manualCredential.username ? 'basic' as const : 'session' as const }
         : savedConfig;
       if (!config) {
         this.bitbucketStatus = 'UNCONFIGURED';

@@ -20,6 +20,8 @@ export type ExecutionStatus =
   | 'COMPLETED'
   | 'FAILED';
 
+export type FlowStep = 'SCAN_REPO' | 'MATCH_PR' | 'CHECK_CI' | 'APPROVE' | 'MERGE';
+
 export type WorkerLogStatus =
   | 'APPROVED'
   | 'MERGED'
@@ -28,7 +30,10 @@ export type WorkerLogStatus =
   | 'ALREADY_APPROVED'
   | 'FAILED'
   | 'PAUSED_VPN'
-  | 'RESUMED';
+  | 'RESUMED'
+  | 'SCANNING_REPO'
+  | 'MATCHING_PR'
+  | 'CHECKING_CI';
 
 export interface WorkerMetadata {
   name: string;
@@ -112,6 +117,10 @@ export interface ExecutionLease {
   jobId: string;
   jobRevision: string;
   workerId: string;
+  /** Stable identifier shared by repository shards from one scheduled job run. */
+  executionGroupId?: string;
+  shardIndex?: number;
+  shardCount?: number;
   trigger: ExecutionTrigger;
   status: ExecutionStatus;
   scheduledFor: string;
@@ -153,6 +162,7 @@ export interface WorkerLogEntry {
   jobId: string;
   sequence: number;
   status: WorkerLogStatus;
+  flowStep?: FlowStep;
   timestamp: string;
   repository?: string;
   prId?: number;

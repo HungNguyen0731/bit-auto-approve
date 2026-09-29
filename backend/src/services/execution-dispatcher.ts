@@ -5,6 +5,7 @@ import type {
   ExecutionLease,
   ExecutionResultSummary,
   ExecutionTrigger,
+  WorkerRecord,
 } from '@bitbucket-pr-approver/shared';
 import type { EventHub } from './events.js';
 import type { StorageService } from './storage.js';
@@ -63,32 +64,44 @@ export class ExecutionDispatcher {
     return workerIds;
   }
 
-  schedule(job: ApprovalJob, now: Date = new Date(), trigger: ExecutionTrigger = 'SCHEDULED'):
-    | ExecutionLease
-    | null {
-    if ((job.executionMode ?? 'local') !== 'worker' || !job.workerId || !job.enabled) return null;
+  private getEligibleWorkers(job: ApprovalJob, now: Date): WorkerRecord[] {
+    const allWorkers = this.workerStore.listWorkers();
+    return allWorkers
+      .filter((worker) => {
+        if (worker.revokedAt) return false;
+        if (!worker.lastHeartbeatAt || now.getTime() - new Date(worker.lastHeartbeatAt).getTime() > 35_000) {
+          return false;
+        }
+        const stateAllowed = job.accountId
+          ? worker.supportsAccountLeases === true && ['ONLINE', 'STARTING', 'ERROR_AUTH'].includes(worker.state)
+          : worker.state === 'ONLINE' && worker.hasLegacyToken !== false;
+        if (!stateAllowed) return false;
+        if (job.autoMergeOnSuccessfulBuild && worker.supportsAutoMerge !== true) return false;
+        return true;
+      })
+      .sort((a, b) => {
+        if (a.id === job.workerId) return -1;
+        if (b.id === job.workerId) return 1;
+        return a.id.localeCompare(b.id);
+      });
+  }
+
+  schedule(job: ApprovalJob, now: Date = new Date(), trigger: ExecutionTrigger = 'SCHEDULED'): ExecutionLease[] {
+    if ((job.executionMode ?? 'local') !== 'worker' || !job.workerId || !job.enabled) return [];
 
     this.expireStaleLeases(now);
-    const worker = this.workerStore.getWorker(job.workerId);
-    if (job.autoMergeOnSuccessfulBuild && worker?.supportsAutoMerge !== true) {
-      this.advanceJobSchedule(job, now);
-      return null;
-    }
     const leases = this.workerStore.getLeases();
-    const active = leases.find(
+    const active = leases.filter(
       (lease) =>
         lease.jobId === job.id &&
         ['QUEUED', 'LEASED', 'RUNNING', 'RETRYABLE'].includes(lease.status)
     );
-    if (active) return active;
+    if (active.length > 0) return active;
 
-    const stateAllowed = job.accountId
-      ? worker?.supportsAccountLeases === true && ['ONLINE', 'STARTING', 'ERROR_AUTH'].includes(worker.state)
-      : worker?.state === 'ONLINE' && worker.hasLegacyToken !== false;
-    if (!worker || worker.revokedAt || !stateAllowed || !worker.lastHeartbeatAt ||
-        now.getTime() - new Date(worker.lastHeartbeatAt).getTime() > 35_000) {
+    const eligibleWorkers = this.getEligibleWorkers(job, now);
+    if (eligibleWorkers.length === 0) {
       this.advanceJobSchedule(job, now);
-      return null;
+      return [];
     }
 
     const revision = jobRevision(job);
@@ -100,37 +113,74 @@ export class ExecutionDispatcher {
       });
     }
     const { token: _token, ...legacyConfig } = config || {
-      serverType: 'cloud' as const, baseUrl: 'https://api.bitbucket.org/2.0', authType: 'bearer' as const,
+      serverType: 'cloud' as const, baseUrl: 'https://bitbucket.org/!api/2.0', authType: 'session' as const,
     };
     let bitbucketConfig: Omit<BitbucketConnectionConfig, 'token'> = legacyConfig;
     if (job.accountId) {
       if (!this.accounts) throw Object.assign(new Error('Account store is unavailable'), { code: 'ACCOUNT_STORE_UNAVAILABLE', statusCode: 503 });
       const account = this.accounts.get(job.accountId);
       if (!account) throw Object.assign(new Error('Bitbucket account not found'), { code: 'ACCOUNT_NOT_FOUND', statusCode: 404 });
-      bitbucketConfig = { serverType: 'cloud', baseUrl: 'https://api.bitbucket.org/2.0', authType: account.authType, username: account.username };
+      bitbucketConfig = { serverType: 'cloud', baseUrl: 'https://bitbucket.org/!api/2.0', authType: account.authType, username: account.username };
     }
     const scheduledFor = trigger === 'MANUAL' ? now.toISOString() : job.nextRunAt || now.toISOString();
-    const idempotencyKey = `${job.id}:${scheduledFor}:${revision}`;
-    const existing = leases.find((lease) => lease.idempotencyKey === idempotencyKey);
-    if (existing) return existing;
+    const baseIdempotencyKey = `${job.id}:${scheduledFor}:${revision}`;
 
-    const lease: ExecutionLease = {
-      executionId: crypto.randomUUID(),
-      idempotencyKey,
-      jobId: job.id,
-      jobRevision: revision,
-      workerId: job.workerId,
-      trigger,
-      status: 'QUEUED',
-      scheduledFor,
-      createdAt: now.toISOString(),
-      lastSequence: 0,
-      job: { ...job, revision },
-      bitbucketConfig,
-    };
-    this.workerStore.saveLeases([...leases, lease]);
+    const existing = leases.filter((lease) => lease.idempotencyKey.startsWith(baseIdempotencyKey));
+    if (existing.length > 0) return existing;
+
+    const repositories = (job.rules.repositories || []).map((r) => r.trim()).filter(Boolean);
+    const numShards = Math.min(Math.max(1, repositories.length), eligibleWorkers.length);
+
+    const newLeases: ExecutionLease[] = [];
+    if (numShards > 1 && repositories.length > 1) {
+      for (let s = 0; s < numShards; s++) {
+        const shardRepos = repositories.filter((_, idx) => idx % numShards === s);
+        const assignedWorker = eligibleWorkers[s % eligibleWorkers.length];
+        const shardJob: ApprovalJob = {
+          ...job,
+          rules: {
+            ...job.rules,
+            repositories: shardRepos,
+          },
+        };
+        const shardRevision = jobRevision(shardJob);
+        const shardLease: ExecutionLease = {
+          executionId: crypto.randomUUID(),
+          idempotencyKey: `${baseIdempotencyKey}:shard:${s}`,
+          jobId: job.id,
+          jobRevision: shardRevision,
+          workerId: assignedWorker.id,
+          trigger,
+          status: 'QUEUED',
+          scheduledFor,
+          createdAt: now.toISOString(),
+          lastSequence: 0,
+          job: { ...shardJob, revision: shardRevision },
+          bitbucketConfig,
+        };
+        newLeases.push(shardLease);
+      }
+    } else {
+      const lease: ExecutionLease = {
+        executionId: crypto.randomUUID(),
+        idempotencyKey: baseIdempotencyKey,
+        jobId: job.id,
+        jobRevision: revision,
+        workerId: eligibleWorkers[0].id,
+        trigger,
+        status: 'QUEUED',
+        scheduledFor,
+        createdAt: now.toISOString(),
+        lastSequence: 0,
+        job: { ...job, revision },
+        bitbucketConfig,
+      };
+      newLeases.push(lease);
+    }
+
+    this.workerStore.saveLeases([...leases, ...newLeases]);
     this.advanceJobSchedule(job, now);
-    return lease;
+    return newLeases;
   }
 
   manualRun(
@@ -166,16 +216,16 @@ export class ExecutionDispatcher {
         statusCode: 409,
       });
     }
-    const lease = credential
-      ? this.scheduleManualWithCredential(job, credential, now)
+    const scheduled = credential
+      ? [this.scheduleManualWithCredential(job, credential, now)]
       : this.schedule({ ...job, enabled: true }, now, 'MANUAL');
-    if (!lease) {
+    if (!scheduled || scheduled.length === 0) {
       throw Object.assign(new Error('Unable to create worker execution'), {
         code: 'EXECUTION_NOT_CREATED',
         statusCode: 409,
       });
     }
-    return lease;
+    return scheduled[0];
   }
 
   private scheduleManualWithCredential(
@@ -186,8 +236,8 @@ export class ExecutionDispatcher {
     const config = this.storage.getConfig();
     const { token: _token, ...bitbucketConfig } = config || {
       serverType: 'cloud' as const,
-      baseUrl: 'https://api.bitbucket.org/2.0',
-      authType: 'basic' as const,
+      baseUrl: 'https://bitbucket.org/!api/2.0',
+      authType: 'session' as const,
     };
     const lease: ExecutionLease = {
       executionId: crypto.randomUUID(),
@@ -218,7 +268,7 @@ export class ExecutionDispatcher {
     if (leases.some((lease) => lease.workerId === workerId &&
         ['LEASED', 'RUNNING'].includes(lease.status) && lease.leasedUntil &&
         new Date(lease.leasedUntil).getTime() > now.getTime())) return null;
-    const available = leases.find(
+    let available = leases.find(
       (lease) =>
         lease.workerId === workerId &&
         (!lease.job.accountId || Boolean(lease.manualTokenCiphertext) || supportsAccountLeases) &&
@@ -230,6 +280,33 @@ export class ExecutionDispatcher {
             lease.leasedUntil &&
             new Date(lease.leasedUntil).getTime() <= now.getTime()))
     );
+
+    if (!available) {
+      available = leases.find((lease) => {
+        if (lease.status !== 'QUEUED') return false;
+        if (lease.job.accountId && !lease.manualTokenCiphertext && !supportsAccountLeases) return false;
+        if (manualOnly && !lease.manualTokenCiphertext && !lease.job.accountId) return false;
+        if (lease.job.autoMergeOnSuccessfulBuild) {
+          const currentWorker = this.workerStore.getWorker(workerId);
+          if (currentWorker?.supportsAutoMerge !== true) return false;
+        }
+        const assigned = this.workerStore.getWorker(lease.workerId);
+        const assignedOffline = !assigned || assigned.revokedAt || !assigned.lastHeartbeatAt ||
+          now.getTime() - new Date(assigned.lastHeartbeatAt).getTime() > 35_000 || assigned.state !== 'ONLINE';
+        const assignedBusy = leases.some((other) =>
+          other.workerId === lease.workerId &&
+          other.executionId !== lease.executionId &&
+          ['LEASED', 'RUNNING'].includes(other.status) &&
+          other.leasedUntil &&
+          new Date(other.leasedUntil).getTime() > now.getTime()
+        );
+        return assignedOffline || assignedBusy || lease.workerId === 'pool';
+      });
+      if (available) {
+        available = { ...available, workerId };
+      }
+    }
+
     if (!available) return null;
 
     let accountTokenCiphertext = available.accountTokenCiphertext;

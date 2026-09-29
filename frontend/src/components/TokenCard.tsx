@@ -37,8 +37,8 @@ export const TokenCard: React.FC<TokenCardProps> = ({
   isSaving,
 }) => {
   const serverType: BitbucketServerType = 'cloud';
-  const baseUrl = 'https://api.bitbucket.org/2.0';
-  const [authType, setAuthType] = useState<BitbucketAuthType>('basic');
+  const [authType, setAuthType] = useState<BitbucketAuthType>('session');
+  const baseUrl = authType === 'session' ? 'https://bitbucket.org/!api/2.0' : 'https://api.bitbucket.org/2.0';
   const [username, setUsername] = useState<string>('');
   const [token, setToken] = useState<string>('');
   const [cookie, setCookie] = useState<string>('');
@@ -176,9 +176,9 @@ export const TokenCard: React.FC<TokenCardProps> = ({
               onChange={(e) => setAuthType(e.target.value as BitbucketAuthType)}
               className="w-full bg-app-panel-strong border border-app-line focus:border-blue-500 focus:ring-1 focus:ring-blue-500 rounded-xl px-3.5 py-2 text-sm text-slate-900 outline-none transition-all"
             >
-              <option value="basic">Basic Auth / App Password</option>
+              <option value="session">Session Auth (Cookie + CSRF) - Khuyên dùng (Không giới hạn rate limit)</option>
               <option value="bearer">Bearer Token (Personal Access Token)</option>
-              <option value="session">Session Auth (Cookie + CSRF)</option>
+              <option value="basic">Basic Auth / App Password</option>
             </select>
             <span className="text-[11px] text-slate-600 mt-1 block">
               {authType === 'basic' && 'Requires username + App Password'}

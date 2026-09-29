@@ -118,12 +118,15 @@ async function run(): Promise<void> {
 
   const flushOutbox = async () => {
     while (outbox.size() > 0) {
-      const item = outbox.peek(1)[0];
-      const accepted = await client.sendLogs(item.executionId, {
-        sequence: item.sequence,
-        items: [item],
+      const all = outbox.peek(20);
+      const executionId = all[0].executionId;
+      const items = all.filter((i) => i.executionId === executionId);
+      const lastSeq = items[items.length - 1].sequence;
+      const accepted = await client.sendLogs(executionId, {
+        sequence: lastSeq,
+        items,
       });
-      outbox.acknowledge(item.executionId, accepted.acceptedThrough);
+      outbox.acknowledge(executionId, accepted.acceptedThrough);
     }
   };
 
@@ -216,8 +219,11 @@ async function run(): Promise<void> {
               ? await identityStore.decryptEnvelope(encryptedToken)
               : bitbucketToken;
             if (!executionToken) throw Object.assign(new Error('Missing token'), { code: 'AUTH_INVALID_TOKEN' });
-            const result = await executor.execute(claim.lease, executionToken);
-            outbox.append(result.logs);
+            const onProgress = async (log: WorkerLogEntry) => {
+              outbox.append([log]);
+              await flushOutbox();
+            };
+            const result = await executor.execute(claim.lease, executionToken, onProgress);
             await flushOutbox();
             await client.complete(claim.lease.executionId, result.summary);
             lastLease = null;

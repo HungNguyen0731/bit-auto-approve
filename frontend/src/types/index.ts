@@ -313,14 +313,20 @@ export interface WorkerInstallerManifest {
   portableRunAvailable: boolean;
 }
 
+export type FlowStep = 'SCAN_REPO' | 'MATCH_PR' | 'CHECK_CI' | 'APPROVE' | 'MERGE';
+
 export type WorkerLogStatus =
   | 'APPROVED'
+  | 'MERGED'
   | 'SKIPPED'
   | 'DRY_RUN'
   | 'ALREADY_APPROVED'
   | 'FAILED'
   | 'PAUSED_VPN'
-  | 'RESUMED';
+  | 'RESUMED'
+  | 'SCANNING_REPO'
+  | 'MATCHING_PR'
+  | 'CHECKING_CI';
 
 export interface WorkerLogEntry {
   id: string;
@@ -329,6 +335,7 @@ export interface WorkerLogEntry {
   jobId: string;
   sequence: number;
   status: WorkerLogStatus;
+  flowStep?: FlowStep;
   timestamp: string;
   repository?: string;
   prId?: number;
