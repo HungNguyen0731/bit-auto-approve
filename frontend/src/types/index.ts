@@ -104,6 +104,7 @@ export interface JobFilterRules {
   excludeSelf: boolean;
   targetBranches: string[];
   sourceBranches?: string[];
+  mergeTargetBranches?: string[];
   titleKeywordsInclude?: string[];
   titleKeywordsExclude?: string[];
   ignoreDrafts: boolean;

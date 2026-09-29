@@ -48,6 +48,11 @@ export async function registerJobRoutes(
         code: 'AUTO_MERGE_REQUIRES_WORKER', message: 'Auto-merge requires a paired Mac Worker job',
       } });
     }
+    if (body.autoMergeOnSuccessfulBuild && !body.rules.mergeTargetBranches?.some((branch) => branch.trim())) {
+      return reply.status(400).send({ success: false, error: {
+        code: 'MERGE_BRANCHES_REQUIRED', message: 'Select at least one target branch allowed for auto-merge',
+      } });
+    }
 
     if (body.executionMode === 'worker') {
       const worker = body.workerId ? workerStore?.getWorker(body.workerId) : null;
@@ -83,6 +88,12 @@ export async function registerJobRoutes(
     if (!body) return reply.status(400).send({ success: false, error: { code: 'VALIDATION_ERROR', message: 'Job body is required' } });
 
     const currentJob = storage.getJobById(id);
+    if (body.autoMergeOnSuccessfulBuild &&
+        !(body.rules?.mergeTargetBranches ?? currentJob?.rules.mergeTargetBranches)?.some((branch) => branch.trim())) {
+      return reply.status(400).send({ success: false, error: {
+        code: 'MERGE_BRANCHES_REQUIRED', message: 'Select at least one target branch allowed for auto-merge',
+      } });
+    }
     const nextMode = body.executionMode ?? currentJob?.executionMode ?? 'local';
     const nextAccountId = body.accountId ?? currentJob?.accountId;
     if ((body.autoMergeOnSuccessfulBuild ?? currentJob?.autoMergeOnSuccessfulBuild) && nextMode !== 'worker') {

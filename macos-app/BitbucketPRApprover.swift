@@ -63,6 +63,7 @@ private struct Rules: Decodable {
     let authorBlacklist: [String]?
     let excludeSelf: Bool
     let targetBranches: [String]
+    let mergeTargetBranches: [String]?
     let sourceBranches: [String]?
     let titleKeywordsInclude: [String]?
     let titleKeywordsExclude: [String]?
@@ -169,13 +170,13 @@ private struct JobDraft {
     var authors = ""
     var blockedAuthors = ""
     var targetBranches = "dev"
+    var mergeTargetBranches = ""
     var sourceBranches = ""
     var titleIncludes = ""
     var titleExcludes = ""
     var excludeSelf = true
     var ignoreDrafts = true
     var ignoreConflicts = true
-    var requireBuild = false
     var minApprovals = 0
     init() {}
     init(_ job: Job) {
@@ -186,12 +187,12 @@ private struct JobDraft {
         authors = job.rules.authorWhitelist.joined(separator: ", ")
         blockedAuthors = (job.rules.authorBlacklist ?? []).joined(separator: ", ")
         targetBranches = job.rules.targetBranches.joined(separator: ", ")
+        mergeTargetBranches = (job.rules.mergeTargetBranches ?? []).joined(separator: ", ")
         sourceBranches = (job.rules.sourceBranches ?? []).joined(separator: ", ")
         titleIncludes = (job.rules.titleKeywordsInclude ?? []).joined(separator: ", ")
         titleExcludes = (job.rules.titleKeywordsExclude ?? []).joined(separator: ", ")
         excludeSelf = job.rules.excludeSelf; ignoreDrafts = job.rules.ignoreDrafts
         ignoreConflicts = job.rules.ignoreWithConflicts
-        requireBuild = job.rules.requireSuccessfulBuild ?? false
         minApprovals = job.rules.minApprovalsNeeded ?? 0
     }
     private func values(_ text: String) -> [String] {
@@ -204,10 +205,10 @@ private struct JobDraft {
          "enabled": enabled, "dryRun": dryRun, "autoMergeOnSuccessfulBuild": autoMergeOnSuccessfulBuild,
          "rules": ["repositories": values(repositories), "authorWhitelist": values(authors),
                    "authorBlacklist": values(blockedAuthors), "excludeSelf": excludeSelf,
-                   "targetBranches": values(targetBranches), "sourceBranches": values(sourceBranches),
+                   "targetBranches": values(targetBranches), "mergeTargetBranches": values(mergeTargetBranches), "sourceBranches": values(sourceBranches),
                    "titleKeywordsInclude": values(titleIncludes), "titleKeywordsExclude": values(titleExcludes),
                    "ignoreDrafts": ignoreDrafts, "ignoreWithConflicts": ignoreConflicts,
-                   "requireSuccessfulBuild": requireBuild, "minApprovalsNeeded": minApprovals]]
+                   "requireSuccessfulBuild": true, "minApprovalsNeeded": minApprovals]]
     }
 }
 
@@ -1308,7 +1309,7 @@ private struct AppView: View {
                         Label(model.workers.first(where: { $0.id == job.workerId })?.name ?? "Worker chưa gán",
                               systemImage: "desktopcomputer")
                         if job.autoMergeOnSuccessfulBuild == true {
-                            Label("Auto-merge khi build xanh", systemImage: "arrow.triangle.merge")
+                            Label("Auto-merge sau CI: \((job.rules.mergeTargetBranches ?? []).joined(separator: ", ").isEmpty ? "chưa chọn branch" : (job.rules.mergeTargetBranches ?? []).joined(separator: ", "))", systemImage: "arrow.triangle.merge")
                         }
                     }.font(.caption).foregroundStyle(.secondary)
                     Divider()
@@ -1378,10 +1379,12 @@ private struct AppView: View {
             Toggle("Bỏ qua PR của chính account", isOn: $draftJob.excludeSelf)
             Toggle("Bỏ qua Draft", isOn: $draftJob.ignoreDrafts)
             Toggle("Bỏ qua PR conflict", isOn: $draftJob.ignoreConflicts)
-            Toggle("Yêu cầu build thành công", isOn: $draftJob.requireBuild)
-            Toggle("Tự merge sau approve khi build xanh", isOn: $draftJob.autoMergeOnSuccessfulBuild)
+            Text("Chỉ approve khi CI của commit nguồn thành công.")
+                .font(.caption).foregroundStyle(.secondary)
+            Toggle("Tự merge sau approve và CI thành công", isOn: $draftJob.autoMergeOnSuccessfulBuild)
             if draftJob.autoMergeOnSuccessfulBuild {
-                Text("Chỉ merge PR khớp rule, được account này approve và build của đúng commit nguồn thành công. Dry Run không merge.")
+                TextField("Chỉ merge vào branch: dev, qc (không nhập uat)", text: $draftJob.mergeTargetBranches)
+                Text("Chỉ merge PR khớp rule, có CI xanh, được account này approve và commit nguồn không đổi. Để trống danh sách branch sẽ không merge. Dry Run không merge.")
                     .font(.caption).foregroundStyle(.orange)
                 if model.workers.first(where: { $0.id == draftJob.workerId })?.supportsAutoMerge != true {
                     Text("Worker cần được cập nhật. Vào Mac Worker → Kiểm tra / cập nhật Worker trước khi lưu.")
@@ -1417,7 +1420,7 @@ private struct AppView: View {
                         else { jobError = model.message }
                     }
                 }.buttonStyle(.borderedProminent)
-                    .disabled(jobSubmitting || model.busy || (model.needsReauth && ownerPassword.isEmpty && !model.hasSavedPassword) || draftJob.name.isEmpty || draftJob.repositories.split(separator: ",").allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } || draftJob.accountId.isEmpty || draftJob.workerId.isEmpty || (draftJob.autoMergeOnSuccessfulBuild && model.workers.first(where: { $0.id == draftJob.workerId })?.supportsAutoMerge != true))
+                    .disabled(jobSubmitting || model.busy || (model.needsReauth && ownerPassword.isEmpty && !model.hasSavedPassword) || draftJob.name.isEmpty || draftJob.repositories.split(separator: ",").allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } || draftJob.accountId.isEmpty || draftJob.workerId.isEmpty || (draftJob.autoMergeOnSuccessfulBuild && draftJob.mergeTargetBranches.split(separator: ",").allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) || (draftJob.autoMergeOnSuccessfulBuild && model.workers.first(where: { $0.id == draftJob.workerId })?.supportsAutoMerge != true))
             }
           }.padding()
         }.frame(width: 680, height: 640)

@@ -17,7 +17,7 @@ export interface WorkerExecutionResult {
   logs: WorkerLogEntry[];
 }
 
-// Space Bitbucket calls across scans, approval checks, and merge revalidation.
+// Space Bitbucket calls across scans, CI checks, approvals, and merge revalidation.
 // The queue is process-wide in BitbucketCloudClient, so consecutive jobs on
 // this Worker do not start a fresh burst.
 const BITBUCKET_REQUEST_INTERVAL_MS = 4_000;
@@ -128,13 +128,12 @@ export class WorkerExecutor {
         } else {
           try {
             const commitHash = pullRequest.sourceBranch.commitHash;
-            const needsBuild = lease.job.rules.requireSuccessfulBuild || lease.job.autoMergeOnSuccessfulBuild;
-            const build = needsBuild && commitHash
+            const build = commitHash
               ? await client.getCommitBuildStatus(repository, commitHash) : 'PENDING';
-            if (!evaluation.isAlreadyApproved && lease.job.rules.requireSuccessfulBuild && build !== 'SUCCESSFUL') {
+            if (build !== 'SUCCESSFUL') {
               status = 'SKIPPED';
               skipped++;
-              failureReason = `Source commit build is ${build.toLowerCase()}; waiting for success before approval`;
+              failureReason = `Source commit CI is ${build.toLowerCase()}; approval and merge require success`;
             } else if (evaluation.isAlreadyApproved) {
               status = 'ALREADY_APPROVED';
               alreadyApproved++;
@@ -144,17 +143,19 @@ export class WorkerExecutor {
               approved++;
             }
 
-            if (lease.job.autoMergeOnSuccessfulBuild && status !== 'SKIPPED') {
-              if (build !== 'SUCCESSFUL' || !commitHash) {
-                failureReason = `Merge is waiting for a successful source-commit build (currently ${build.toLowerCase()})`;
+            if (lease.job.autoMergeOnSuccessfulBuild && build === 'SUCCESSFUL') {
+              const mergeBranches = lease.job.rules.mergeTargetBranches || [];
+              if (!mergeBranches.some((branch) => matchesPattern(pullRequest.targetBranch.name, branch))) {
+                failureReason = `Merge not allowed for target branch '${pullRequest.targetBranch.name}'`;
               } else {
                 const fresh = await client.getPullRequest(repository, pullRequest.id);
                 const freshEvaluation = RuleFilteringEngine.evaluate(fresh, lease.job.rules, currentUser);
                 if (fresh.state !== 'OPEN' || fresh.sourceBranch.commitHash !== commitHash ||
-                    !freshEvaluation.matched || !freshEvaluation.isAlreadyApproved) {
+                    !freshEvaluation.matched || !freshEvaluation.isAlreadyApproved ||
+                    !mergeBranches.some((branch) => matchesPattern(fresh.targetBranch.name, branch))) {
                   failureReason = 'Merge deferred: PR, source commit, rules, or Bitbucket approval changed after the scan';
-                } else if (await client.getCommitBuildStatus(repository, commitHash) !== 'SUCCESSFUL') {
-                  failureReason = 'Merge deferred: source-commit build is no longer successful';
+                } else if (await client.getCommitBuildStatus(repository, commitHash!) !== 'SUCCESSFUL') {
+                  failureReason = 'Merge deferred: source-commit CI is no longer successful';
                 } else {
                   await client.mergePullRequest(repository, pullRequest.id);
                   status = 'MERGED';

@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { Download, KeyRound, Loader2 } from 'lucide-react';
 import { api } from '../api/client';
 import { BitbucketMark } from './VisualArtwork';
-import { MAC_APP_DOWNLOAD_URL, MAC_APP_FALLBACK_URL } from '../constants/macAppDownload';
+import { MAC_APP_DOWNLOAD_URL } from '../constants/macAppDownload';
 
 export const OwnerLogin: React.FC<{ onAuthenticated: () => void }> = ({ onAuthenticated }) => {
   const [password, setPassword] = useState('');
@@ -42,7 +42,7 @@ export const OwnerLogin: React.FC<{ onAuthenticated: () => void }> = ({ onAuthen
         <a href={MAC_APP_DOWNLOAD_URL} className="mt-5 flex min-h-11 items-center justify-center gap-2 rounded-xl border border-app-line bg-white text-sm font-semibold text-brand-700 hover:bg-brand-50">
           <Download className="h-4 w-4" aria-hidden="true" /> Tải app cho Mac
         </a>
-        <p className="mt-2 text-center text-xs text-app-muted">Tải từ GitHub. <a href={MAC_APP_FALLBACK_URL} download className="font-semibold text-brand-700 underline underline-offset-2 hover:text-brand-800">Dùng máy chủ dự phòng</a> nếu cần.</p>
+        <p className="mt-2 text-center text-xs text-app-muted">Bản mới được tải từ máy chủ ứng dụng.</p>
       </form>
     </main>
   );

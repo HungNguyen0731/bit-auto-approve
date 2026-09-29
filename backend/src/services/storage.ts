@@ -226,11 +226,12 @@ export class StorageService {
         excludeSelf: dto.rules.excludeSelf !== undefined ? dto.rules.excludeSelf : true,
         targetBranches: dto.rules.targetBranches || ['master', 'main', 'develop'],
         sourceBranches: dto.rules.sourceBranches || [],
+        mergeTargetBranches: dto.rules.mergeTargetBranches || [],
         titleKeywordsInclude: dto.rules.titleKeywordsInclude || [],
         titleKeywordsExclude: dto.rules.titleKeywordsExclude || [],
         ignoreDrafts: dto.rules.ignoreDrafts !== undefined ? dto.rules.ignoreDrafts : true,
         ignoreWithConflicts: dto.rules.ignoreWithConflicts !== undefined ? dto.rules.ignoreWithConflicts : true,
-        requireSuccessfulBuild: Boolean(dto.rules.requireSuccessfulBuild),
+        requireSuccessfulBuild: true,
         minApprovalsNeeded: dto.rules.minApprovalsNeeded || 0,
       },
       createdAt: now,
@@ -276,7 +277,9 @@ export class StorageService {
           : dto.accountId !== undefined
           ? dto.accountId
           : current.accountId,
-      rules: dto.rules ? { ...current.rules, ...dto.rules } : current.rules,
+      rules: dto.rules
+        ? { ...current.rules, ...dto.rules, requireSuccessfulBuild: true }
+        : current.rules,
       updatedAt: new Date().toISOString(),
     };
 

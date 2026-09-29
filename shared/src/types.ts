@@ -142,6 +142,7 @@ export interface JobFilterRules {
   // Branch rules
   targetBranches: string[]; // Target branch patterns e.g. ["main", "master", "develop", "release/*"]
   sourceBranches?: string[]; // Source branch patterns e.g. ["feature/*", "bugfix/*"]
+  mergeTargetBranches?: string[]; // Explicit allowlist for auto-merge; empty or missing means no merge
   
   // Title / content rules
   titleKeywordsInclude?: string[]; // Optional keyword must be present in title
@@ -150,7 +151,7 @@ export interface JobFilterRules {
   // Pre-condition toggles
   ignoreDrafts: boolean; // Skip PRs marked as draft (default: true)
   ignoreWithConflicts: boolean; // Skip PRs that have merge conflicts (default: true)
-  requireSuccessfulBuild?: boolean; // Only approve if CI build status is green (default: false)
+  requireSuccessfulBuild?: boolean; // Compatibility field; Worker always requires successful source-commit CI
   minApprovalsNeeded?: number; // E.g. only approve if it has 0 approvals or already 1 approval
 }
 
@@ -161,7 +162,7 @@ export interface ApprovalJob {
   enabled: boolean; // Whether the background runner will execute this job
   intervalSeconds: number; // Polling interval in seconds (default: 60s, min: 10s)
   dryRun: boolean; // When true, checks and logs matching PRs without actually sending approve API call
-  autoMergeOnSuccessfulBuild?: boolean; // Opt-in: merge only after this account approved and source commit CI is green
+  autoMergeOnSuccessfulBuild?: boolean; // Opt-in merge after successful source-commit CI and PR revalidation
   executionMode?: 'local' | 'worker'; // Missing values remain local for backward compatibility
   workerId?: string; // Required when executionMode is worker
   accountId?: string; // Server-stored Bitbucket credential for this Worker job

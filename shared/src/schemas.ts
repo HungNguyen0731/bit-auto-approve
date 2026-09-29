@@ -50,6 +50,11 @@ export const JobFilterRulesSchema = {
       items: { type: 'string', minLength: 1 },
       default: [],
     },
+    mergeTargetBranches: {
+      type: 'array',
+      items: { type: 'string', minLength: 1 },
+      default: [],
+    },
     titleKeywordsInclude: {
       type: 'array',
       items: { type: 'string' },

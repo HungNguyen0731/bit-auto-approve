@@ -129,6 +129,7 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
   const [authorBlacklist, setAuthorBlacklist] = useState<string[]>([]);
   const [excludeSelf, setExcludeSelf] = useState(true);
   const [targetBranches, setTargetBranches] = useState<string[]>([]);
+  const [mergeTargetBranches, setMergeTargetBranches] = useState<string[]>([]);
   const [sourceBranches, setSourceBranches] = useState<string[]>([]);
   const [titleKeywordsExclude, setTitleKeywordsExclude] = useState<string[]>([
     '[WIP]',
@@ -136,7 +137,6 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
   ]);
   const [ignoreDrafts, setIgnoreDrafts] = useState(true);
   const [ignoreWithConflicts, setIgnoreWithConflicts] = useState(true);
-  const [requireSuccessfulBuild, setRequireSuccessfulBuild] = useState(false);
 
   useEffect(() => {
     if (editingJob) {
@@ -153,11 +153,11 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
       setAuthorBlacklist(editingJob.rules.authorBlacklist || []);
       setExcludeSelf(editingJob.rules.excludeSelf ?? true);
       setTargetBranches(editingJob.rules.targetBranches || []);
+      setMergeTargetBranches(editingJob.rules.mergeTargetBranches || []);
       setSourceBranches(editingJob.rules.sourceBranches || []);
       setTitleKeywordsExclude(editingJob.rules.titleKeywordsExclude || []);
       setIgnoreDrafts(editingJob.rules.ignoreDrafts ?? true);
       setIgnoreWithConflicts(editingJob.rules.ignoreWithConflicts ?? true);
-      setRequireSuccessfulBuild(editingJob.rules.requireSuccessfulBuild ?? false);
     } else {
       setName('');
       setDescription('');
@@ -172,11 +172,11 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
       setAuthorBlacklist([]);
       setExcludeSelf(true);
       setTargetBranches([]);
+      setMergeTargetBranches([]);
       setSourceBranches([]);
       setTitleKeywordsExclude(['[WIP]', 'DO NOT MERGE']);
       setIgnoreDrafts(true);
       setIgnoreWithConflicts(true);
-      setRequireSuccessfulBuild(false);
     }
   }, [editingJob, isOpen, workers]);
 
@@ -191,16 +191,18 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
     authorBlacklist: authorBlacklist.length > 0 ? authorBlacklist : undefined,
     excludeSelf,
     targetBranches,
+    mergeTargetBranches,
     sourceBranches: sourceBranches.length > 0 ? sourceBranches : undefined,
     titleKeywordsExclude: titleKeywordsExclude.length > 0 ? titleKeywordsExclude : undefined,
     ignoreDrafts,
     ignoreWithConflicts,
-    requireSuccessfulBuild,
+    requireSuccessfulBuild: true,
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim() || (executionMode === 'worker' && !workerId)) return;
+    if (!name.trim() || (executionMode === 'worker' && !workerId) ||
+        (autoMergeOnSuccessfulBuild && mergeTargetBranches.length === 0)) return;
 
     await onSave(
       {
@@ -498,6 +500,22 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
               />
             </div>
 
+            {autoMergeOnSuccessfulBuild && (
+              <div className="space-y-2">
+                <TagInput
+                  label="Merge only into these branches"
+                  sublabel="Example: dev, qc — leave uat out"
+                  tags={mergeTargetBranches}
+                  onChange={setMergeTargetBranches}
+                  placeholder="Add an allowed merge branch..."
+                  icon={<GitBranch className="w-3.5 h-3.5" />}
+                />
+                {mergeTargetBranches.length === 0 && (
+                  <p className="text-xs text-amber-700">Choose at least one branch before enabling auto-merge. No branch is merged by default.</p>
+                )}
+              </div>
+            )}
+
             {/* Author Whitelist & Blacklist */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <SearchableCombobox<BitbucketUserMeta>
@@ -635,24 +653,11 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
             </div>
 
             <div className="pt-1">
-              <label className="flex items-center gap-2 cursor-pointer p-2 rounded-lg bg-app-panel-strong border border-app-line">
-                <input
-                  type="checkbox"
-                  checked={requireSuccessfulBuild}
-                  onChange={(e) => setRequireSuccessfulBuild(e.target.checked)}
-                  className="rounded border-slate-300 bg-slate-50 text-blue-600 focus:ring-blue-500"
-                />
-                <span className="text-slate-900 text-xs">
-                  Require CI Build Success (Only approve if commit status is green)
-                </span>
-              </label>
-            </div>
-            <div className="pt-1">
               <label className="flex items-center gap-2 cursor-pointer p-2 rounded-lg bg-amber-50 border border-amber-200">
                 <input type="checkbox" checked={autoMergeOnSuccessfulBuild}
                   onChange={(e) => setAutoMergeOnSuccessfulBuild(e.target.checked)}
                   className="rounded border-amber-300 text-amber-700 focus:ring-amber-500" />
-                <span className="text-slate-900 text-xs">Auto-merge after this account approves and the source commit build succeeds (Live only)</span>
+                <span className="text-slate-900 text-xs">Auto-merge after source-commit CI succeeds and this account approves (Live only)</span>
               </label>
             </div>
           </div>
@@ -678,7 +683,7 @@ export const JobFormModal: React.FC<JobFormModalProps> = ({
               </button>
               <button
                 type="submit"
-                disabled={isSaving || !autoMergeWorkerReady}
+                disabled={isSaving || !autoMergeWorkerReady || (autoMergeOnSuccessfulBuild && mergeTargetBranches.length === 0)}
                 className="px-5 py-2 rounded-xl bg-brand-700 hover:bg-brand-800 text-white text-xs font-semibold shadow-lg shadow-blue-600/20 transition-all disabled:opacity-50"
               >
                 {isSaving ? 'Saving Job...' : editingJob ? 'Update Job' : 'Create Job'}
