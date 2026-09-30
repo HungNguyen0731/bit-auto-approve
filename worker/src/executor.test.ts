@@ -124,9 +124,9 @@ describe('WorkerExecutor Session Auth and CI Optimization Tests', () => {
       values: [{ workspace: { slug: 'my-ws', name: 'My WS', uuid: '{ws-1}' } }],
     }, { headers: { 'content-type': 'application/json' } });
 
-    // 3. listOpenPullRequests
+    // 3. listWorkspaceOpenPullRequests
     pool.intercept({
-      path: '/!api/2.0/repositories/my-ws/my-repo/pullrequests?state=OPEN&pagelen=50',
+      path: /^\/!api\/internal\/workspaces\/my-ws\/pullrequests/,
       method: 'GET',
     }).reply(200, {
       values: [{

@@ -9,7 +9,9 @@ app="$script_dir/dist/Bitbucket PR Approver.app"
 /bin/cp "$script_dir/dist/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 /bin/cp "$script_dir/dist/AppIcon.iconset/icon_256x256.png" "$app/Contents/Resources/app-logo.png"
 /bin/cp "$script_dir/Assets/pr-workflow.png" "$app/Contents/Resources/pr-workflow.png"
-/usr/bin/swiftc -parse-as-library -framework SwiftUI -framework AppKit \
+/bin/cp "$script_dir/Assets/generative_board.html" "$app/Contents/Resources/generative_board.html"
+/bin/cp -r "$script_dir/Assets/generative_agents" "$app/Contents/Resources/generative_agents"
+/usr/bin/swiftc -parse-as-library -framework SwiftUI -framework AppKit -framework WebKit \
   "$script_dir/BitbucketPRApprover.swift" -o "$app/Contents/MacOS/BitbucketPRApprover"
 /bin/cp "$script_dir/../worker/install/macos/portable-setup.sh" "$app/Contents/Resources/portable-setup.sh"
 /bin/cp "$script_dir/update-app.sh" "$app/Contents/Resources/update-app.sh"

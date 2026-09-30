@@ -4,6 +4,7 @@ import SwiftUI
 import Darwin
 import CryptoKit
 import Security
+import WebKit
 
 private struct APIError: Decodable { let code: String?; let message: String? }
 private struct Envelope<T: Decodable>: Decodable { let success: Bool; let data: T?; let error: APIError? }
@@ -813,6 +814,48 @@ private struct WorkflowArtwork: View {
     }
 }
 
+private struct GenerativeAgentsBoardView: NSViewRepresentable {
+    let workersJson: String
+    let runsJson: String
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        var parent: GenerativeAgentsBoardView
+        var isLoaded = false
+        init(_ parent: GenerativeAgentsBoardView) {
+            self.parent = parent
+        }
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            isLoaded = true
+            let script = "if(window.updateWorkers){ window.updateWorkers(\(parent.workersJson), \(parent.runsJson)); }"
+            webView.evaluateJavaScript(script, completionHandler: nil)
+        }
+    }
+
+    func makeNSView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        if let url = Bundle.main.url(forResource: "generative_board", withExtension: "html") {
+            webView.loadFileURL(url, allowingReadAccessTo: Bundle.main.resourceURL ?? url)
+        } else {
+            let fallback = "<html><body style='background:#080e1a;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;font-family:system-ui;'><h3>Generative Agents Town Board</h3></body></html>"
+            webView.loadHTMLString(fallback, baseURL: nil)
+        }
+        return webView
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        if context.coordinator.isLoaded {
+            let script = "if(window.updateWorkers){ window.updateWorkers(\(workersJson), \(runsJson)); }"
+            nsView.evaluateJavaScript(script, completionHandler: nil)
+        }
+    }
+}
+
 private struct AppView: View {
     @StateObject private var model = AppModel()
     @State private var draftAccount = AccountDraft()
@@ -978,6 +1021,7 @@ private struct AppView: View {
                 sidebarButton("Jobs", "list.bullet.rectangle", 2)
                 sidebarButton("Mac Worker", "desktopcomputer", 3)
                 sidebarButton("Lịch sử chạy", "clock.arrow.circlepath", 4)
+                sidebarButton("Town Board 2D", "map.fill", 5)
                 Spacer()
                 if let local = model.workers.first(where: { $0.id == model.localWorkerId }) {
                     Label(local.state == "ONLINE" ? "Worker online" : "Worker: \(local.state)",
@@ -1016,6 +1060,7 @@ private struct AppView: View {
         case 2: jobs
         case 3: worker
         case 4: logs
+        case 5: generativeBoard
         default: overview
         }
     }
@@ -1075,6 +1120,30 @@ private struct AppView: View {
                     stat("Workers", model.workers.filter { $0.revokedAt == nil }.count,
                          "desktopcomputer", "Máy đã ghép")
                 }
+
+                HStack(alignment: .center, spacing: 18) {
+                    Image(systemName: "map.fill")
+                        .font(.system(size: 28))
+                        .foregroundStyle(AppPalette.mint)
+                        .frame(width: 50, height: 50)
+                        .background(AppPalette.mint.opacity(0.15), in: RoundedRectangle(cornerRadius: 14))
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 8) {
+                            Text("Generative Agents Town Board").font(.headline.bold())
+                            Text("Smallville 2D").font(.caption.bold())
+                                .padding(.horizontal, 8).padding(.vertical, 2)
+                                .background(AppPalette.blue.opacity(0.15), in: Capsule())
+                                .foregroundStyle(AppPalette.blue)
+                        }
+                        Text("Mô phỏng bản đồ 2D thị trấn Smallville (joonspk-research/generative_agents). Worker chạy job: Job Fail -> Tắt (OFF), Job Success -> Tiếp tục hoạt động.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Mở Town Board 2D") { selectedTab = 5 }
+                        .buttonStyle(.borderedProminent)
+                }
+                .padding(18)
+                .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 16))
 
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -1652,6 +1721,72 @@ private struct AppView: View {
                         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
                 }
             }.frame(maxWidth: .infinity, alignment: .leading).padding(18)
+        }
+    }
+
+    private var workersJsonString: String {
+        let list: [[String: Any]] = model.workers.map { worker in
+            [
+                "id": worker.id,
+                "name": worker.name,
+                "state": worker.state,
+                "lastHeartbeatAt": worker.lastHeartbeatAt ?? "",
+                "activeExecutionId": worker.activeExecutionId ?? ""
+            ]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: list),
+              let str = String(data: data, encoding: .utf8) else { return "[]" }
+        return str
+    }
+
+    private var runsJsonString: String {
+        let list: [[String: Any]] = model.runs.prefix(30).map { run in
+            var dict: [String: Any] = [
+                "executionId": run.executionId,
+                "jobId": run.jobId,
+                "jobName": run.jobName,
+                "workerId": run.workerId,
+                "status": run.status,
+                "createdAt": run.createdAt,
+                "approved": run.result?.approved ?? 0,
+                "failed": run.result?.failed ?? 0
+            ]
+            if let reason = run.result?.failureReason {
+                dict["failureReason"] = reason
+            }
+            return dict
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: list),
+              let str = String(data: data, encoding: .utf8) else { return "[]" }
+        return str
+    }
+
+    private var generativeBoard: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 8) {
+                        Text("Generative Agents Town Board").font(.headline.bold())
+                        Text("Smallville 2D").font(.caption.bold())
+                            .padding(.horizontal, 8).padding(.vertical, 2)
+                            .background(AppPalette.blue.opacity(0.18), in: Capsule())
+                            .foregroundStyle(AppPalette.blue)
+                    }
+                    Text("Bản đồ thị trấn 2D mô phỏng Stanford Generative Agents (joonspk-research/generative_agents). Phản ứng Worker: Job Fail -> Tắt (OFF), Job Success -> Tiếp tục tuần tra.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    Task { await model.refresh() }
+                } label: {
+                    Label("Làm mới", systemImage: "arrow.clockwise")
+                }
+            }
+            .padding(.horizontal, 20).padding(.vertical, 12)
+            .background(AppPalette.surface)
+            Divider()
+            GenerativeAgentsBoardView(workersJson: workersJsonString, runsJson: runsJsonString)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 

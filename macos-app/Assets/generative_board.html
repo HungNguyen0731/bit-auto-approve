@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no"/>
+<title>Stanford Generative Agents — The Ville 2D Simulation</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+  body, html { width: 100%; height: 100%; overflow: hidden; background: #1a2a1a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #f8fafc; }
+  #canvas-container { position: relative; width: 100%; height: 100%; overflow: hidden; cursor: grab; background: #162a16; }
+  #canvas-container:active { cursor: grabbing; }
+  canvas { display: block; image-rendering: pixelated; }
+  
+  .hud-top {
+    position: absolute; top: 12px; left: 14px; display: flex; flex-wrap: wrap; gap: 8px; z-index: 10; pointer-events: none;
+  }
+  .hud-pill {
+    pointer-events: auto; background: rgba(15, 23, 42, 0.9); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 20px; padding: 5px 12px;
+    font-size: 11px; font-weight: 600; display: flex; align-items: center; gap: 6px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .dot-green { background: #10b981; box-shadow: 0 0 6px #10b981; }
+  .dot-red { background: #ef4444; box-shadow: 0 0 6px #ef4444; }
+  .dot-blue { background: #3b82f6; box-shadow: 0 0 6px #3b82f6; }
+  .dot-yellow { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; }
+
+  .sector-jump {
+    pointer-events: auto; background: rgba(15, 23, 42, 0.9); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 20px; padding: 4px 10px;
+    font-size: 11px; font-weight: 600; color: #cbd5e1; outline: none; cursor: pointer;
+  }
+  .sector-jump option { background: #0f172a; color: #fff; }
+
+  .hud-controls {
+    position: absolute; bottom: 16px; right: 16px; display: flex; flex-direction: column; gap: 6px; z-index: 10;
+  }
+  .hud-btn {
+    background: rgba(15, 23, 42, 0.9); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.15); color: #e2e8f0; border-radius: 8px;
+    width: 36px; height: 36px; display: flex; align-items: center; justify-content: center;
+    font-size: 16px; font-weight: bold; cursor: pointer; transition: all 0.15s ease;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  }
+  .hud-btn:hover { background: #1e293b; color: #fff; border-color: #3b82f6; transform: scale(1.05); }
+
+  #inspector {
+    position: absolute; bottom: 16px; left: 16px; width: 360px; max-width: calc(100% - 32px);
+    background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(14px);
+    border: 1px solid rgba(59, 130, 246, 0.4); border-radius: 14px; padding: 14px 16px;
+    font-size: 12px; z-index: 20; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.65); display: none;
+  }
+  #inspector .header { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
+  #inspector .profile-img { width: 44px; height: 44px; border-radius: 8px; border: 2px solid #3b82f6; object-fit: cover; background: #1e293b; }
+  #inspector .title-wrap { flex: 1; min-width: 0; }
+  #inspector .name { font-weight: 700; font-size: 14px; color: #fff; truncate: ellipsis; }
+  #inspector .state-badge { display: inline-block; margin-top: 2px; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 700; }
+  #inspector .info-row { display: flex; justify-content: space-between; margin: 4px 0; color: #94a3b8; font-size: 11px; }
+  #inspector .info-val { color: #f1f5f9; font-weight: 500; text-align: right; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #inspector .bubble-box { margin-top: 8px; background: rgba(30, 41, 59, 0.7); border-radius: 8px; padding: 8px; color: #cbd5e1; font-style: italic; border-left: 3px solid #3b82f6; line-height: 1.4; }
+  #inspector .focus-btn { margin-top: 10px; width: 100%; background: #2563eb; color: #fff; border: none; border-radius: 8px; padding: 6px; font-size: 11px; font-weight: 600; cursor: pointer; transition: background 0.15s; }
+  #inspector .focus-btn:hover { background: #1d4ed8; }
+</style>
+</head>
+<body>
+<div id="canvas-container">
+  <canvas id="viewport"></canvas>
+
+  <div class="hud-top">
+    <div class="hud-pill"><span class="dot dot-green"></span> Thành công: <span id="count-success">0</span></div>
+    <div class="hud-pill"><span class="dot dot-blue"></span> Đang chạy: <span id="count-active">0</span></div>
+    <div class="hud-pill"><span class="dot dot-red"></span> Thất bại (OFF): <span id="count-failed">0</span></div>
+    <div class="hud-pill"><span class="dot dot-yellow"></span> Chờ việc / VPN: <span id="count-idle">0</span></div>
+    <select class="sector-jump" id="sector-select" onchange="jumpToSector(this.value)">
+      <option value="">🗺️ Đến địa danh thị trấn...</option>
+    </select>
+  </div>
+
+  <div class="hud-controls">
+    <button class="hud-btn" id="btn-zoom-in" title="Phóng to">+</button>
+    <button class="hud-btn" id="btn-zoom-out" title="Thu nhỏ">−</button>
+    <button class="hud-btn" id="btn-reset" title="Toàn cảnh thị trấn">⟲</button>
+  </div>
+
+  <div id="inspector">
+    <div class="header">
+      <img id="insp-avatar" class="profile-img" src="" alt="Avatar"/>
+      <div class="title-wrap">
+        <div class="name" id="insp-name">Worker Name</div>
+        <span class="state-badge" id="insp-state">STATE</span>
+      </div>
+    </div>
+    <div class="info-row"><span>Mã Worker:</span><span class="info-val" id="insp-id">-</span></div>
+    <div class="info-row"><span>PR / Job:</span><span class="info-val" id="insp-job">-</span></div>
+    <div class="info-row"><span>Vị trí hiện tại:</span><span class="info-val" id="insp-loc">-</span></div>
+    <div class="info-row"><span>Heartbeat:</span><span class="info-val" id="insp-hb">-</span></div>
+    <div class="bubble-box" id="insp-bubble">"..."</div>
+    <button class="focus-btn" id="btn-focus">🎯 Tập trung Camera vào Worker này</button>
+  </div>
+</div>
+
+<script>
+// Authentic Generative Agents The Ville Map (140 tiles x 100 tiles, 32px per tile = 4480 x 3200)
+const WORLD_W = 4480;
+const WORLD_H = 3200;
+
+// Authentic sector coordinates derived directly from generative_agents sector_maze.csv
+const SECTORS = [
+  { id: 'hobbs', name: 'Hobbs Cafe', x: 2464, y: 672, color: '#f59e0b', icon: '☕' },
+  { id: 'pub', name: 'The Rose and Crown Pub', x: 1824, y: 704, color: '#ef4444', icon: '🍻' },
+  { id: 'college', name: 'Oak Hill College', x: 3712, y: 832, color: '#8b5cf6', icon: '🏛️' },
+  { id: 'dorm', name: 'Dorm for Oak Hill College', x: 3808, y: 1472, color: '#a855f7', icon: '🛌' },
+  { id: 'park', name: 'Johnson Park', x: 864, y: 1472, color: '#10b981', icon: '⛲' },
+  { id: 'market', name: 'Willows Market & Pharmacy', x: 2688, y: 1504, color: '#06b6d4', icon: '🏪' },
+  { id: 'supply', name: 'Harvey Oak Supply Store', x: 2016, y: 1504, color: '#3b82f6', icon: '📦' },
+  { id: 'lin', name: "Lin Family's House (HQ)", x: 2944, y: 2336, color: '#ec4899', icon: '🏡' },
+  { id: 'moreno', name: "Moreno Family's House", x: 2368, y: 2336, color: '#f97316', icon: '🏠' },
+  { id: 'tamara', name: "Tamara & Carmen's House", x: 1792, y: 2336, color: '#eab308', icon: '🏡' },
+  { id: 'moore', name: "Moore Family's House", x: 1216, y: 2048, color: '#84cc16', icon: '🏠' },
+  { id: 'adam', name: "Adam Smith's House", x: 704, y: 2048, color: '#14b8a6', icon: '🏠' },
+  { id: 'coliving', name: "Artist's Co-Living Space", x: 896, y: 832, color: '#6366f1', icon: '🎨' },
+  { id: 'isabella', name: "Isabella's Apartment", x: 2464, y: 480, color: '#f43f5e', icon: '🏢' },
+  { id: 'arthur', name: "Arthur Burton's Apartment", x: 1824, y: 512, color: '#0284c7', icon: '🏢' },
+  { id: 'carlos', name: "Carlos Gomez's Apartment", x: 3040, y: 576, color: '#d97706', icon: '🏢' },
+  { id: 'giorgio', name: "Giorgio Rossi's Apartment", x: 2816, y: 576, color: '#7c3aed', icon: '🏢' }
+];
+
+// Generative Agents character personas
+const PERSONAS = [
+  'Isabella_Rodriguez',
+  'John_Lin',
+  'Klaus_Mueller',
+  'Mei_Lin',
+  'Arthur_Burton',
+  'Abigail_Chen',
+  'Carlos_Gomez',
+  'Giorgio_Rossi',
+  'Ryan_Park',
+  'Sam_Moore',
+  'Tamara_Taylor',
+  'Carmen_Ortiz',
+  'Yuriko_Yamamoto',
+  'Adam_Smith'
+];
+
+// Asset paths: local bundled relative URLs with GitHub raw fallback
+function getAssetPath(subpath) {
+  return 'generative_agents/' + subpath;
+}
+
+const mapImage = new Image();
+mapImage.src = getAssetPath('the_ville.png');
+mapImage.onerror = () => {
+  mapImage.src = 'https://raw.githubusercontent.com/joonspk-research/generative_agents/main/cover.png';
+};
+
+const characterSprites = {};
+PERSONAS.forEach((name) => {
+  const img = new Image();
+  img.src = getAssetPath(`characters/${name}.png`);
+  img.onerror = () => {
+    img.src = `https://raw.githubusercontent.com/joonspk-research/generative_agents/main/environment/frontend_server/static_dirs/assets/characters/${name}.png`;
+  };
+  characterSprites[name] = img;
+});
+
+const speechBubbleImg = new Image();
+speechBubbleImg.src = getAssetPath('speech_bubble/v3.png');
+speechBubbleImg.onerror = () => {
+  speechBubbleImg.src = 'https://raw.githubusercontent.com/joonspk-research/generative_agents/main/environment/frontend_server/static_dirs/assets/speech_bubble/v3.png';
+};
+
+let canvas, ctx;
+let camera = { x: 0, y: 0, zoom: 0.5 };
+let isDragging = false;
+let startX = 0, startY = 0;
+let agents = [];
+let selectedAgent = null;
+
+function init() {
+  canvas = document.getElementById('viewport');
+  ctx = canvas.getContext('2d');
+  resize();
+  window.addEventListener('resize', resize);
+
+  // Populate sector jump dropdown
+  const select = document.getElementById('sector-select');
+  SECTORS.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s.id;
+    opt.innerText = `${s.icon} ${s.name}`;
+    select.appendChild(opt);
+  });
+
+  const container = document.getElementById('canvas-container');
+  container.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    startX = e.clientX - camera.x;
+    startY = e.clientY - camera.y;
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    camera.x = e.clientX - startX;
+    camera.y = e.clientY - startY;
+  });
+
+  window.addEventListener('mouseup', () => { isDragging = false; });
+
+  container.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const zoomFactor = e.deltaY < 0 ? 1.12 : 0.89;
+    zoomAt(zoomFactor, e.clientX, e.clientY);
+  }, { passive: false });
+
+  container.addEventListener('click', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left - camera.x) / camera.zoom;
+    const my = (e.clientY - rect.top - camera.y) / camera.zoom;
+
+    let clicked = null;
+    for (const a of agents) {
+      const dist = Math.hypot(a.x - mx, a.y - my);
+      if (dist < 40) { clicked = a; break; }
+    }
+    selectAgent(clicked);
+  });
+
+  document.getElementById('btn-zoom-in').onclick = () => zoomAt(1.25, canvas.width / 2, canvas.height / 2);
+  document.getElementById('btn-zoom-out').onclick = () => zoomAt(0.8, canvas.width / 2, canvas.height / 2);
+  document.getElementById('btn-reset').onclick = resetCamera;
+  document.getElementById('btn-focus').onclick = () => {
+    if (selectedAgent) focusOnAgent(selectedAgent);
+  };
+
+  updateWithDemoAgents();
+  resetCamera();
+  requestAnimationFrame(gameLoop);
+}
+
+function resize() {
+  const container = document.getElementById('canvas-container');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = container.clientWidth * dpr;
+  canvas.height = container.clientHeight * dpr;
+  canvas.style.width = container.clientWidth + 'px';
+  canvas.style.height = container.clientHeight + 'px';
+}
+
+function resetCamera() {
+  const container = document.getElementById('canvas-container');
+  const scale = Math.min(container.clientWidth / WORLD_W, container.clientHeight / WORLD_H) * 1.1;
+  camera.zoom = Math.max(0.25, Math.min(scale, 1.2));
+  camera.x = (container.clientWidth - WORLD_W * camera.zoom) / 2;
+  camera.y = (container.clientHeight - WORLD_H * camera.zoom) / 2;
+}
+
+function zoomAt(factor, clientX, clientY) {
+  const newZoom = Math.max(0.2, Math.min(2.0, camera.zoom * factor));
+  camera.x = clientX - (clientX - camera.x) * (newZoom / camera.zoom);
+  camera.y = clientY - (clientY - camera.y) * (newZoom / camera.zoom);
+  camera.zoom = newZoom;
+}
+
+function jumpToSector(secId) {
+  const s = SECTORS.find(item => item.id === secId);
+  if (!s) return;
+  const container = document.getElementById('canvas-container');
+  camera.zoom = 0.85;
+  camera.x = container.clientWidth / 2 - s.x * camera.zoom;
+  camera.y = container.clientHeight / 2 - s.y * camera.zoom;
+}
+
+function focusOnAgent(agent) {
+  const container = document.getElementById('canvas-container');
+  camera.zoom = 1.0;
+  camera.x = container.clientWidth / 2 - agent.x * camera.zoom;
+  camera.y = container.clientHeight / 2 - agent.y * camera.zoom;
+}
+
+function selectAgent(agent) {
+  selectedAgent = agent;
+  const insp = document.getElementById('inspector');
+  if (!agent) { insp.style.display = 'none'; return; }
+
+  insp.style.display = 'block';
+  document.getElementById('insp-name').innerText = `${agent.persona.replace('_', ' ')} (${agent.name})`;
+  const badge = document.getElementById('insp-state');
+  badge.innerText = agent.state;
+  
+  if (agent.state === 'FAILED_OFF') {
+    badge.style.background = '#ef4444'; badge.style.color = '#fff';
+  } else if (agent.state === 'SUCCESS_PATROL') {
+    badge.style.background = '#10b981'; badge.style.color = '#fff';
+  } else if (agent.state === 'ACTIVE_WORKING') {
+    badge.style.background = '#3b82f6'; badge.style.color = '#fff';
+  } else if (agent.state === 'PAUSED_VPN') {
+    badge.style.background = '#f59e0b'; badge.style.color = '#fff';
+  } else {
+    badge.style.background = '#64748b'; badge.style.color = '#fff';
+  }
+
+  // Profile avatar
+  const avatar = document.getElementById('insp-avatar');
+  avatar.src = getAssetPath(`characters/profile/${agent.persona}.png`);
+  avatar.onerror = () => {
+    avatar.src = `https://raw.githubusercontent.com/joonspk-research/generative_agents/main/environment/frontend_server/static_dirs/assets/characters/profile/${agent.persona}.png`;
+  };
+
+  document.getElementById('insp-id').innerText = agent.id;
+  document.getElementById('insp-job').innerText = agent.jobName || 'Không có';
+  document.getElementById('insp-loc').innerText = agent.currentLocationName || 'Đang tuần tra thị trấn';
+  document.getElementById('insp-hb').innerText = agent.lastHeartbeat || 'Vừa xong';
+  document.getElementById('insp-bubble').innerText = `"${agent.bubbleText}"`;
+}
+
+function updateWithDemoAgents() {
+  agents = [
+    {
+      id: 'worker-local-01',
+      name: 'Macbook M1 Worker',
+      persona: 'John_Lin',
+      state: 'ACTIVE_WORKING',
+      x: 2944, y: 2336, targetX: 2464, targetY: 672,
+      speed: 3.2, canMove: true, dir: 0, frame: 0,
+      jobName: 'Auto Approve PR #42 (backend)',
+      currentLocationName: 'Hobbs Cafe Pathway',
+      bubbleText: '⚡ Đang đối chiếu rules & duyệt PR #42...',
+      lastHeartbeat: 'Vừa xong'
+    },
+    {
+      id: 'worker-studio-02',
+      name: 'Mac Studio M2 Worker',
+      persona: 'Isabella_Rodriguez',
+      state: 'SUCCESS_PATROL',
+      x: 2464, y: 672, targetX: 1824, targetY: 704,
+      speed: 2.8, canMove: true, dir: 1, frame: 0,
+      jobName: 'Deploy QC PR #39',
+      currentLocationName: 'The Rose and Crown Pub',
+      bubbleText: '🎉 Duyệt PR #39 thành công! Tiếp tục hoạt động...',
+      lastHeartbeat: '10s trước'
+    },
+    {
+      id: 'worker-intel-03',
+      name: 'Intel CI Runner',
+      persona: 'Klaus_Mueller',
+      state: 'FAILED_OFF',
+      x: 2016, y: 1504, targetX: 2016, targetY: 1504,
+      speed: 0, canMove: false, dir: 0, frame: 0,
+      jobName: 'Release v0.3.16 build',
+      currentLocationName: 'Harvey Oak Supply Store',
+      bubbleText: '❌ Job thất bại: 429 Rate Limit. Worker dừng (OFF)!',
+      lastHeartbeat: '1m trước'
+    },
+    {
+      id: 'worker-air-04',
+      name: 'MacBook Air VPN',
+      persona: 'Arthur_Burton',
+      state: 'PAUSED_VPN',
+      x: 864, y: 1472, targetX: 864, targetY: 1472,
+      speed: 0, canMove: false, dir: 3, frame: 0,
+      jobName: 'Internal PR Approval',
+      currentLocationName: 'Johnson Park',
+      bubbleText: '🛡️ Tạm dừng: Mất kết nối VPN công ty...',
+      lastHeartbeat: '30s trước'
+    },
+    {
+      id: 'worker-mini-05',
+      name: 'Mac Mini Standby',
+      persona: 'Mei_Lin',
+      state: 'IDLE',
+      x: 3712, y: 832, targetX: 3808, targetY: 1472,
+      speed: 1.2, canMove: true, dir: 0, frame: 0,
+      jobName: 'None',
+      currentLocationName: 'Oak Hill College',
+      bubbleText: '💤 Sẵn sàng nhận job PR mới...',
+      lastHeartbeat: '5s trước'
+    }
+  ];
+  updateHud();
+}
+
+function updateHud() {
+  let s = 0, a = 0, f = 0, i = 0;
+  for (const ag of agents) {
+    if (ag.state === 'SUCCESS_PATROL') s++;
+    else if (ag.state === 'ACTIVE_WORKING') a++;
+    else if (ag.state === 'FAILED_OFF') f++;
+    else i++;
+  }
+  document.getElementById('count-success').innerText = s;
+  document.getElementById('count-active').innerText = a;
+  document.getElementById('count-failed').innerText = f;
+  document.getElementById('count-idle').innerText = i;
+}
+
+window.updateWorkers = function(workers, runs) {
+  if (!workers || workers.length === 0) {
+    updateWithDemoAgents();
+    return;
+  }
+
+  const updated = [];
+  workers.forEach((w, idx) => {
+    const existing = agents.find(a => a.id === w.id);
+    const latestRun = (runs || []).find(r => r.workerId === w.id);
+    
+    let state = 'IDLE';
+    let canMove = true;
+    let speed = 1.8;
+    let bubbleText = '💤 Sẵn sàng nhận job...';
+    let jobName = latestRun ? latestRun.jobName : 'None';
+
+    if (w.state === 'PAUSED_VPN') {
+      state = 'PAUSED_VPN';
+      canMove = false;
+      speed = 0;
+      bubbleText = '🛡️ Tạm dừng: Chờ kết nối VPN...';
+    } else if (w.state === 'OFFLINE' || w.state === 'ERROR' || (latestRun && latestRun.status === 'FAILED')) {
+      state = 'FAILED_OFF';
+      canMove = false;
+      speed = 0;
+      const reason = (latestRun && latestRun.failureReason) ? latestRun.failureReason : 'Job gặp lỗi hoặc Worker offline';
+      bubbleText = `❌ Job thất bại: ${reason}`;
+    } else if (latestRun && latestRun.status === 'COMPLETED') {
+      state = 'SUCCESS_PATROL';
+      canMove = true;
+      speed = 2.8;
+      bubbleText = `🎉 Duyệt PR ${latestRun.jobName} thành công! Tiếp tục hoạt động...`;
+    } else if (w.activeExecutionId || (latestRun && latestRun.status === 'RUNNING')) {
+      state = 'ACTIVE_WORKING';
+      canMove = true;
+      speed = 3.2;
+      bubbleText = `⚡ Đang chạy duyệt PR: ${jobName}`;
+    }
+
+    const persona = PERSONAS[idx % PERSONAS.length];
+    const homeSector = SECTORS[idx % SECTORS.length];
+
+    if (existing) {
+      existing.state = state;
+      existing.canMove = canMove;
+      existing.speed = speed;
+      existing.bubbleText = bubbleText;
+      existing.jobName = jobName;
+      existing.lastHeartbeat = w.lastHeartbeatAt ? new Date(w.lastHeartbeatAt).toLocaleTimeString() : 'Vừa xong';
+      updated.push(existing);
+    } else {
+      updated.push({
+        id: w.id,
+        name: w.name,
+        persona: persona,
+        state: state,
+        x: homeSector.x + (Math.random() * 80 - 40),
+        y: homeSector.y + (Math.random() * 80 - 40),
+        targetX: homeSector.x,
+        targetY: homeSector.y,
+        speed: speed,
+        canMove: canMove,
+        dir: 0,
+        frame: 0,
+        jobName: jobName,
+        currentLocationName: homeSector.name,
+        bubbleText: bubbleText,
+        lastHeartbeat: w.lastHeartbeatAt ? new Date(w.lastHeartbeatAt).toLocaleTimeString() : 'Vừa xong'
+      });
+    }
+  });
+
+  agents = updated;
+  updateHud();
+  if (selectedAgent) {
+    const refreshed = agents.find(a => a.id === selectedAgent.id);
+    if (refreshed) selectAgent(refreshed);
+  }
+};
+
+let tick = 0;
+function gameLoop() {
+  tick++;
+  updatePhysics();
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+function updatePhysics() {
+  for (const a of agents) {
+    if (!a.canMove) continue;
+
+    const dx = a.targetX - a.x;
+    const dy = a.targetY - a.y;
+    const dist = Math.hypot(dx, dy);
+
+    if (dist < 16) {
+      // Pick next waypoint from sectors
+      const nextSector = SECTORS[Math.floor(Math.random() * SECTORS.length)];
+      a.targetX = nextSector.x + (Math.random() * 100 - 50);
+      a.targetY = nextSector.y + (Math.random() * 100 - 50);
+      a.currentLocationName = nextSector.name;
+    } else {
+      a.x += (dx / dist) * a.speed;
+      a.y += (dy / dist) * a.speed;
+
+      if (Math.abs(dx) > Math.abs(dy)) {
+        a.dir = dx > 0 ? 2 : 1; // 2: right, 1: left
+      } else {
+        a.dir = dy > 0 ? 0 : 3; // 0: down, 3: up
+      }
+
+      if (tick % 8 === 0) {
+        a.frame = (a.frame + 1) % 3;
+      }
+    }
+  }
+}
+
+function render() {
+  const dpr = window.devicePixelRatio || 1;
+  ctx.save();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.scale(dpr, dpr);
+
+  ctx.translate(camera.x, camera.y);
+  ctx.scale(camera.zoom, camera.zoom);
+
+  // 1. Draw The Ville Town Map
+  drawMap();
+
+  // 2. Draw Sector Landmarks
+  drawSectors();
+
+  // 3. Draw Agents
+  drawAgents();
+
+  ctx.restore();
+}
+
+function drawMap() {
+  if (mapImage.complete && mapImage.naturalWidth > 0) {
+    ctx.drawImage(mapImage, 0, 0, WORLD_W, WORLD_H);
+  } else {
+    // Background placeholder while loading
+    ctx.fillStyle = '#224422';
+    ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+    ctx.fillStyle = '#1e3a8a';
+    ctx.font = 'bold 36px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Đang tải Stanford Smallville Map (4480x3200)...', WORLD_W / 2, WORLD_H / 2);
+  }
+}
+
+function drawSectors() {
+  for (const s of SECTORS) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 3;
+    const w = 220, h = 54;
+    const rx = s.x - w / 2, ry = s.y - 65;
+    
+    ctx.beginPath();
+    ctx.roundRect(rx, ry, w, h, 12);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#f8fafc';
+    ctx.font = 'bold 15px -apple-system, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${s.icon} ${s.name}`, s.x, ry + 32);
+    ctx.restore();
+  }
+}
+
+function drawAgents() {
+  for (const a of agents) {
+    ctx.save();
+    ctx.translate(a.x, a.y);
+
+    // State Aura / Effects
+    if (a.state === 'FAILED_OFF') {
+      // Pulsing red OFF beacon
+      const pulse = 24 + Math.sin(tick * 0.12) * 6;
+      ctx.beginPath();
+      ctx.arc(0, 0, pulse, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(239, 68, 68, 0.4)';
+      ctx.fill();
+      ctx.strokeStyle = '#ef4444';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      // OFF Badge
+      ctx.fillStyle = '#ef4444';
+      ctx.font = 'bold 14px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('⚠️ OFF', 0, -36);
+    } else if (a.state === 'SUCCESS_PATROL') {
+      // Green celebration aura
+      ctx.beginPath();
+      ctx.arc(0, 0, 24, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(16, 185, 129, 0.35)';
+      ctx.fill();
+      ctx.strokeStyle = '#10b981';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      // Confetti / Stars
+      const starY = -34 - (tick % 24);
+      ctx.font = '16px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('✨', 12, starY);
+      ctx.fillText('🎉', -12, starY + 6);
+    } else if (a.state === 'ACTIVE_WORKING') {
+      // Blue active working glow
+      const pulse = 22 + Math.sin(tick * 0.15) * 4;
+      ctx.beginPath();
+      ctx.arc(0, 0, pulse, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(59, 130, 246, 0.35)';
+      ctx.fill();
+      ctx.strokeStyle = '#3b82f6';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    } else if (a.state === 'PAUSED_VPN') {
+      // Yellow shield
+      ctx.beginPath();
+      ctx.arc(0, 0, 24, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(245, 158, 11, 0.3)';
+      ctx.fill();
+      ctx.strokeStyle = '#f59e0b';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.font = '16px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('🛡️', 0, -34);
+    }
+
+    // Draw Authentic Character Sprite from joonspk-research/generative_agents
+    const sprite = characterSprites[a.persona];
+    if (sprite && sprite.complete && sprite.naturalWidth > 0) {
+      if (a.state === 'FAILED_OFF') {
+        ctx.rotate(Math.PI / 2); // Fallen down posture
+        ctx.filter = 'grayscale(100%) brightness(55%)';
+      }
+      // Generative Agents sprite: 96x128 (3 cols of 32, 4 rows of 32)
+      // row 0: down, row 1: left, row 2: right, row 3: up
+      const sx = a.frame * 32;
+      const sy = a.dir * 32;
+      ctx.drawImage(sprite, sx, sy, 32, 32, -24, -24, 48, 48);
+    } else {
+      // Fallback avatar
+      ctx.fillStyle = a.state === 'FAILED_OFF' ? '#64748b' : a.state === 'SUCCESS_PATROL' ? '#10b981' : '#3b82f6';
+      ctx.fillRect(-12, -20, 24, 32);
+    }
+
+    ctx.restore();
+
+    // Name tag & thought bubble
+    ctx.save();
+    ctx.translate(a.x, a.y);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.shadowColor = 'rgba(0,0,0,0.8)';
+    ctx.shadowBlur = 4;
+    ctx.fillText(`${a.persona.replace('_', ' ')} (${a.name})`, 0, 34);
+    ctx.shadowBlur = 0;
+
+    // Thought bubble
+    if (a.bubbleText) {
+      const bText = a.bubbleText.length > 40 ? a.bubbleText.slice(0, 38) + '...' : a.bubbleText;
+      ctx.font = '11px sans-serif';
+      const textWidth = ctx.measureText(bText).width;
+      const bw = textWidth + 18, bh = 24;
+      const bx = -bw / 2, by = -56;
+
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
+      ctx.strokeStyle = a.state === 'FAILED_OFF' ? '#ef4444' : a.state === 'SUCCESS_PATROL' ? '#10b981' : '#3b82f6';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.roundRect(bx, by, bw, bh, 8);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = '#f1f5f9';
+      ctx.fillText(bText, 0, by + 16);
+    }
+    ctx.restore();
+  }
+}
+
+window.onload = init;
+</script>
+</body>
+</html>

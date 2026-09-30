@@ -29,17 +29,22 @@ import { BitbucketMark, VisualArtwork } from './components/VisualArtwork';
 import { WorkerSetup } from './components/WorkerSetup';
 import { WorkerExecutionLog } from './components/WorkerExecutionLog';
 import { OwnerLogin } from './components/OwnerLogin';
+import { SmallvilleBoard } from './components/generative-agents';
 import {
   Activity,
+  Bot,
+  ExternalLink,
   Key,
   Loader2,
   Laptop,
+  RefreshCw,
   Sliders,
   ShieldAlert,
 } from 'lucide-react';
 
 export function App() {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'jobs' | 'workers' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'board' | 'jobs' | 'workers' | 'settings'>('dashboard');
+  const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
 
   // Status & Data
   const [status, setStatus] = useState<SchedulerStatus>({
@@ -163,12 +168,14 @@ export function App() {
       try {
         const restored = await api.restoreSession(storedConfig.workspace);
         if (cancelled) return;
-        setUserProfile(restored.user);
-        setStatus((prev) => ({
-          ...prev,
-          bitbucketStatus: 'CONNECTED',
-          vpnConnected: restored.user.vpnConnected,
-        }));
+        if (restored?.user) {
+          setUserProfile(restored.user);
+          setStatus((prev) => ({
+            ...prev,
+            bitbucketStatus: 'CONNECTED',
+            vpnConnected: Boolean(restored.user?.vpnConnected),
+          }));
+        }
       } catch (err) {
         if (!cancelled) {
           console.warn('Stored Bitbucket session could not be restored:', err);
@@ -204,9 +211,13 @@ export function App() {
     onWorkerStatusChange: (changed) => {
       const workerId = changed.id || changed.workerId;
       if (!workerId) return;
-      setWorkers((current) =>
-        current.map((worker) => (worker.id === workerId ? { ...worker, ...changed } : worker))
-      );
+      setWorkers((current) => {
+        const exists = current.some((worker) => worker.id === workerId);
+        if (exists) {
+          return current.map((worker) => (worker.id === workerId ? { ...worker, ...changed } : worker));
+        }
+        return [...current, changed as WorkerRecord];
+      });
     },
     onWorkerLogBatch: (items) => {
       setWorkerLogs((current) => {
@@ -220,6 +231,15 @@ export function App() {
       loadWorkerData();
     },
   });
+
+  // Polling for worker telemetry when Generative Board or Dashboard tab is active
+  useEffect(() => {
+    if (activeTab !== 'board' && activeTab !== 'dashboard') return;
+    const interval = setInterval(() => {
+      loadWorkerData();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [activeTab, loadWorkerData]);
 
   // Token testing
   const handleTestConnection = async (req: VerifyTokenRequest) => {
@@ -548,6 +568,31 @@ export function App() {
           </button>
 
           <button
+            onClick={() => {
+              setActiveTab('board');
+              loadWorkerData();
+            }}
+            className={`min-h-11 flex shrink-0 items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold transition-all active:scale-[0.98] ${
+              activeTab === 'board'
+                ? 'bg-brand-700 text-white shadow-sm'
+                : 'text-app-muted hover:text-app-ink hover:bg-brand-50'
+            }`}
+            data-testid="tab-generative-board"
+          >
+            <Bot className="w-4 h-4" />
+            <span>Generative Board (2D)</span>
+            {workers.length > 0 && (
+              <span
+                className={`text-[10px] px-1.5 py-0.5 rounded-full font-mono font-bold ${
+                  activeTab === 'board' ? 'bg-white/20 text-white' : 'bg-brand-100 text-brand-700'
+                }`}
+              >
+                {workers.length}
+              </span>
+            )}
+          </button>
+
+          <button
             onClick={() => setActiveTab('jobs')}
             className={`min-h-11 flex shrink-0 items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold transition-all active:scale-[0.98] ${
               activeTab === 'jobs'
@@ -650,6 +695,50 @@ export function App() {
               </div>
             </div>
 
+            {/* Generative Agents Town Quick Board Card */}
+            <div className="rounded-2xl bg-app-panel border border-app-line p-5 shadow-soft">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <span className="p-1.5 rounded-lg bg-brand-50 text-brand-700">
+                    <Bot className="w-4 h-4" />
+                  </span>
+                  <div>
+                    <h3 className="text-sm font-bold text-app-ink flex items-center gap-2">
+                      Generative Agents Town Live Board
+                      <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 font-semibold border border-emerald-200">
+                        2D Realtime
+                      </span>
+                    </h3>
+                    <p className="text-[11px] text-app-muted">
+                      Trực quan hóa trạng thái Worker (Job Active di chuyển, Success tuần tra, Fail/Off dừng hoạt động)
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setActiveTab('board');
+                    loadWorkerData();
+                  }}
+                  className="text-xs text-brand-700 hover:text-brand-800 font-semibold flex items-center gap-1 min-h-9 px-3 rounded-lg hover:bg-brand-50 transition-colors"
+                >
+                  <span>Mở toàn màn hình Town</span>
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              <SmallvilleBoard
+                workers={workers}
+                logs={workerLogs}
+                latestLog={workerLogs.length > 0 ? workerLogs[0] : null}
+                activeExecutionId={workers.find((w) => w.activeExecutionId)?.activeExecutionId || null}
+                onSelectWorker={(workerId) => {
+                  setSelectedWorkerId(workerId);
+                  setActiveTab('board');
+                }}
+                className="w-full"
+              />
+            </div>
+
             {/* Real-time Action Log Table */}
             <ActionLogTable
               logs={logs}
@@ -658,6 +747,123 @@ export function App() {
               isRefreshing={isRefreshing}
               sseConnected={sseConnected}
             />
+          </div>
+        )}
+
+        {activeTab === 'board' && (
+          <div className="space-y-6">
+            <div className="rounded-2xl bg-app-panel border border-app-line p-5 shadow-soft">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
+                <div>
+                  <h3 className="text-base font-bold text-app-ink flex items-center gap-2">
+                    <Bot className="w-5 h-5 text-brand-600" />
+                    Generative Agents Smallville Board (2D Simulation)
+                  </h3>
+                  <p className="text-xs text-app-muted mt-1 leading-relaxed">
+                    Trực quan hóa hoạt động của worker và PR approval jobs theo phong cách Smallville 2D Pixel-Art:
+                    <span className="inline-block mx-1 text-emerald-600 font-semibold">● ACTIVE/SUCCESS</span> di chuyển &amp; tuần tra vui vẻ;
+                    <span className="inline-block mx-1 text-rose-600 font-semibold">● FAILED</span> dừng ngay lập tức kèm cảnh báo lỗi;
+                    <span className="inline-block mx-1 text-amber-600 font-semibold">● PAUSED VPN</span> dừng chờ kết nối mạng.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={() => loadWorkerData()}
+                    disabled={isRefreshing}
+                    className="min-h-10 px-3.5 py-1.5 rounded-xl border border-app-line bg-app-panel-muted text-xs font-semibold text-app-ink hover:bg-brand-50 hover:text-brand-700 transition-colors flex items-center gap-2 active:scale-95"
+                    title="Cập nhật trạng thái worker và logs mới nhất"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
+                    <span>Làm mới dữ liệu</span>
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('workers')}
+                    className="min-h-10 px-3.5 py-1.5 rounded-xl bg-brand-700 text-xs font-semibold text-white hover:bg-brand-800 transition-colors flex items-center gap-2 active:scale-95 shadow-sm"
+                  >
+                    <Laptop className="w-3.5 h-3.5" />
+                    <span>Cấu hình Mac Worker</span>
+                  </button>
+                </div>
+              </div>
+
+              <SmallvilleBoard
+                workers={workers}
+                logs={workerLogs}
+                latestLog={workerLogs.length > 0 ? workerLogs[0] : null}
+                activeExecutionId={workers.find((w) => w.activeExecutionId)?.activeExecutionId || null}
+                onSelectWorker={(workerId) => {
+                  setSelectedWorkerId(workerId);
+                }}
+                className="w-full"
+              />
+            </div>
+
+            {/* Selected Worker Details Card */}
+            {selectedWorkerId && (
+              <div className="rounded-2xl bg-app-panel border border-brand-300 p-5 shadow-soft transition-all">
+                <div className="flex items-center justify-between mb-3 border-b border-app-line pb-3">
+                  <div className="flex items-center gap-2">
+                    <span className="p-1.5 rounded-lg bg-brand-50 text-brand-700">
+                      <Bot className="w-4 h-4" />
+                    </span>
+                    <div>
+                      <h4 className="text-sm font-bold text-app-ink">
+                        Chi tiết Worker đã chọn: {workers.find((w) => w.id === selectedWorkerId)?.name || selectedWorkerId}
+                      </h4>
+                      <p className="text-[11px] text-app-muted font-mono">ID: {selectedWorkerId}</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setSelectedWorkerId(null)}
+                    className="text-xs text-app-muted hover:text-app-ink px-2.5 py-1 rounded-lg hover:bg-app-panel-muted"
+                  >
+                    Đóng
+                  </button>
+                </div>
+                {(() => {
+                  const worker = workers.find((w) => w.id === selectedWorkerId);
+                  if (!worker) {
+                    return (
+                      <p className="text-xs text-app-muted">
+                        Worker demo hoặc đã ngắt kết nối. Chọn worker khác trên bản đồ để xem trạng thái.
+                      </p>
+                    );
+                  }
+                  return (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+                      <div className="p-3 rounded-xl bg-app-panel-muted border border-app-line">
+                        <span className="text-[10px] text-app-muted font-medium uppercase">Trạng thái</span>
+                        <div className="mt-1 font-bold text-app-ink flex items-center gap-1.5">
+                          <span className={`w-2 h-2 rounded-full ${
+                            worker.state === 'ONLINE' ? 'bg-emerald-500' :
+                            worker.state === 'PAUSED_VPN' ? 'bg-amber-500' : 'bg-rose-500'
+                          }`} />
+                          {worker.state}
+                        </div>
+                      </div>
+                      <div className="p-3 rounded-xl bg-app-panel-muted border border-app-line">
+                        <span className="text-[10px] text-app-muted font-medium uppercase">Platform / Version</span>
+                        <div className="mt-1 font-mono font-semibold text-app-ink">
+                          {worker.platform} ({worker.architecture}) - v{worker.version}
+                        </div>
+                      </div>
+                      <div className="p-3 rounded-xl bg-app-panel-muted border border-app-line">
+                        <span className="text-[10px] text-app-muted font-medium uppercase">Queue Depth</span>
+                        <div className="mt-1 font-mono font-semibold text-app-ink">
+                          {worker.queueDepth} job pending
+                        </div>
+                      </div>
+                      <div className="p-3 rounded-xl bg-app-panel-muted border border-app-line">
+                        <span className="text-[10px] text-app-muted font-medium uppercase">Heartbeat gần nhất</span>
+                        <div className="mt-1 font-mono text-app-muted">
+                          {worker.lastHeartbeatAt ? new Date(worker.lastHeartbeatAt).toLocaleTimeString() : 'N/A'}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
           </div>
         )}
 
