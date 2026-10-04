@@ -32,3 +32,19 @@ localhost phải dùng HTTPS.
 Sau khi cập nhật server, bấm "Ghép đôi & chạy nền" một lần để GUI nâng cấp
 portable Worker lên phiên bản hỗ trợ account theo job. Khi triển khai lên
 Coolify, cần deploy bản server mới trước bước này.
+
+Tab "Bật/Tắt Server":
+Cho phép điều khiển trực tiếp các môi trường AWS ECS (dev, qc, uat, demo) qua
+Bitbucket Pipelines (custom pipeline `start-stop-environment`, `restart-all-services`,
+`restart-one-service`). Hỗ trợ chọn phạm vi (All services hoặc Database), xác thực
+bằng Bitbucket App Password / Token hoặc Session Cookie & CSRF từ trình duyệt,
+có dialog xác nhận an toàn trước khi tắt server và lưu lịch sử kích hoạt kèm link mở
+trực tiếp pipeline kết quả trên Bitbucket.
+
+Tab "Tổng quan" - FortiClient VPN Shield & Auto Reconnect:
+Tích hợp widget giám sát kết nối FortiClient SSL-VPN với hiệu ứng sóng radar 
+phát ra xung quanh (ExpressVPN style) và vòng tròn báo trạng thái trực quan.
+Đo độ trễ gateway realtime tới 115.78.233.162:443 (TLS 1.3 ~10ms).
+Hỗ trợ tùy chọn bật/tắt "Tự động kết nối lại khi mất VPN", kết nối chạy ẩn
+dưới nền không làm phiền người dùng và cơ chế tự động dọn dẹp chống treo
+khi gặp lỗi "Connection was terminated unexpectedly".

@@ -213,6 +213,64 @@ private struct JobDraft {
     }
 }
 
+private struct PipelineConfig: Codable {
+    var repository: String = "msm-software/digifact-utilities"
+    var branch: String = "devops"
+    var authType: String = "account" // "account" | "session" | "token"
+    var selectedAccountId: String = ""
+    var username: String = ""
+    var token: String = ""
+    var cookie: String = ""
+    var csrfToken: String = "1rfIZh8UmWS7a162UeggG2niaPCrYM7z"
+}
+
+private struct PipelineTriggerLog: Identifiable, Codable {
+    var id: String = UUID().uuidString
+    var timestamp: String
+    var env: String // dev, qc, uat, demo
+    var action: String // start, stop, restart-all, restart-service
+    var services: String // All, Database, or service name
+    var status: String // SUCCESS, FAILED, PENDING
+    var buildNumber: Int?
+    var pipelineUuid: String?
+    var pipelineUrl: String?
+    var message: String
+}
+
+private struct ServerActionConfirmation: Identifiable {
+    var id: String { "\(env)-\(action)-\(services)" }
+    let env: String
+    let action: String
+    let services: String
+    let serviceName: String?
+    let title: String
+    let message: String
+}
+
+private struct AlertInfo: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+    let isSuccess: Bool
+    let url: String?
+}
+
+private let kAvailableServices: [String] = [
+    "core-fe",
+    "core-identity",
+    "core-laboratory",
+    "core-manufacturing",
+    "core-masterdata",
+    "core-notification",
+    "core-quality",
+    "core-report",
+    "core-superset",
+    "core-usermanagement",
+    "core-warehouse",
+    "kong-gateway",
+    "kong-gateway-int"
+]
+
 @MainActor private final class AppModel: ObservableObject {
     @Published var server = UserDefaults.standard.string(forKey: "controlPlaneOrigin") ?? "https://bot.approve.mymind.bond"
     @Published var password = ""
@@ -235,6 +293,26 @@ private struct JobDraft {
     @Published var availableUpdate: UpdateManifest?
     @Published var updateBusy = false
     @Published var updateMessage = ""
+    @Published var pipelineConfig = PipelineConfig()
+    @Published var pipelineLogs: [PipelineTriggerLog] = []
+    @Published var pipelineBusy = false
+    @Published var pipelineStatusMessage = ""
+    @Published var lastTriggeredLog: PipelineTriggerLog?
+    @Published var pipelineTestMessage = ""
+    @Published var pipelineTesting = false
+    @Published var pipelineConsoleLogs: [String] = []
+    @Published var executionAlertResult: AlertInfo? = nil
+    // MARK: - FortiClient VPN & Reconnect State
+    @Published var vpnGatewayIp: String = UserDefaults.standard.string(forKey: "vpnGatewayIp") ?? "115.78.233.162"
+    @Published var vpnAutoReconnect: Bool = UserDefaults.standard.object(forKey: "vpnAutoReconnect") as? Bool ?? true
+    @Published var vpnStatus: VpnConnectionStatus = .checking
+    @Published var vpnLatencyMs: Double? = nil
+    @Published var vpnTunnelIp: String? = nil
+    @Published var vpnTunnelInterface: String? = nil
+    @Published var vpnLastChecked: Date? = nil
+    @Published var vpnReconnectAttempts: Int = 0
+    @Published var vpnStatusMessage: String = "Đang kiểm tra kết nối VPN..."
+    @Published var vpnProbing: Bool = false
     private var historyGeneration = 0
     private var csrf = ""
     private let session: URLSession = {
@@ -242,12 +320,24 @@ private struct JobDraft {
         configuration.httpCookieAcceptPolicy = .always
         return URLSession(configuration: configuration, delegate: SameOriginRedirects(), delegateQueue: nil)
     }()
+    private let pipelineSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 45
+        return URLSession(configuration: configuration)
+    }()
 
     private var passwordKeychainQuery: [String: Any]? {
         guard let origin else { return nil }
         return [kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: "com.hungnv.bitbucket-pr-approver.owner",
                 kSecAttrAccount as String: origin.originString]
+    }
+
+    init() {
+        loadPipelineConfig()
+        Task { [weak self] in
+            await self?.checkVpnHealth()
+        }
     }
 
     var hasSavedPassword: Bool { savedPassword() != nil }
@@ -450,6 +540,9 @@ private struct JobDraft {
             accounts = try await call("GET", "/api/accounts")
             workers = try await call("GET", "/api/workers")
             jobs = try await call("GET", "/api/jobs")
+            if pipelineConfig.selectedAccountId.isEmpty, let first = accounts.first {
+                selectAccountAndAutofill(first.id)
+            }
         } catch { message = error.localizedDescription }
         await refreshHistory()
     }
@@ -527,7 +620,12 @@ private struct JobDraft {
         busy = true; defer { busy = false }
         do {
             let path = draft.id.map { "/api/accounts/\($0)" } ?? "/api/accounts"
-            let _: Account = try await call(draft.id == nil ? "POST" : "PUT", path, draft.body)
+            let savedAcc: Account = try await call(draft.id == nil ? "POST" : "PUT", path, draft.body)
+            if draft.authType == "session" && (!draft.cookie.isEmpty || !draft.csrfToken.isEmpty) {
+                saveCredentialsForAccount(savedAcc.id, cookie: draft.cookie, csrf: draft.csrfToken)
+            } else if !draft.token.isEmpty {
+                saveCredentialsForAccount(savedAcc.id, cookie: "", csrf: "", token: draft.token)
+            }
             message = "Đã lưu account. Token chỉ được lưu mã hóa trên server."
             await refresh(); return true
         } catch { message = error.localizedDescription; return false }
@@ -761,6 +859,825 @@ private struct JobDraft {
     private func modelWorkerReady(_ id: String?) -> Bool {
         workers.contains { $0.id == id && $0.supportsAccountLeases == true }
     }
+
+    // MARK: - Bitbucket Pipelines for ECS Environment Control
+
+    private var pipelineKeychainQuery: [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: "com.hungnv.bitbucket-pr-approver.pipelines",
+         kSecAttrAccount as String: "pipeline-secrets"]
+    }
+
+    private func accountCredentialsQuery(for accountId: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: "com.hungnv.bitbucket-pr-approver.account-creds",
+         kSecAttrAccount as String: accountId]
+    }
+
+    func loadCredentialsForAccount(_ accountId: String) -> [String: String]? {
+        guard !accountId.isEmpty else { return nil }
+        var query = accountCredentialsQuery(for: accountId)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+           let data = result as? Data,
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            return dict
+        }
+        return nil
+    }
+
+    func saveCredentialsForAccount(_ accountId: String, cookie: String, csrf: String, token: String = "") {
+        guard !accountId.isEmpty else { return }
+        let dict: [String: String] = [
+            "cookie": sanitizeCookie(cookie),
+            "csrfToken": sanitizeCsrf(csrf),
+            "token": token
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: dict) {
+            let query = accountCredentialsQuery(for: accountId)
+            SecItemDelete(query as CFDictionary)
+            var item = query
+            item[kSecValueData as String] = data
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            SecItemAdd(item as CFDictionary, nil)
+        }
+    }
+
+    func selectAccountAndAutofill(_ accountId: String) {
+        pipelineConfig.selectedAccountId = accountId
+        pipelineConfig.authType = "account"
+
+        if let saved = loadCredentialsForAccount(accountId) {
+            if let c = saved["cookie"], !c.isEmpty { pipelineConfig.cookie = c }
+            if let csrf = saved["csrfToken"], !csrf.isEmpty { pipelineConfig.csrfToken = csrf }
+            if let t = saved["token"], !t.isEmpty { pipelineConfig.token = t }
+            logConsole("✅ Đã tự động điền Cookie & CSRF từ tài khoản [\(accounts.first(where: { $0.id == accountId })?.name ?? accountId)]")
+            pipelineStatusMessage = "Đã tự động nạp Cookie & CSRF của tài khoản!"
+        } else {
+            saveCredentialsForAccount(accountId, cookie: pipelineConfig.cookie, csrf: pipelineConfig.csrfToken, token: pipelineConfig.token)
+            logConsole("✅ Đã liên kết Cookie & CSRF với tài khoản [\(accounts.first(where: { $0.id == accountId })?.name ?? accountId)]")
+            pipelineStatusMessage = "Đã liên kết và sẵn sàng cho tài khoản này!"
+        }
+        savePipelineConfig(pipelineConfig)
+    }
+
+    func loadPipelineConfig() {
+        var cfg = PipelineConfig()
+        let ud = UserDefaults.standard
+        if let repo = ud.string(forKey: "bb_pipeline_repo"), !repo.isEmpty { cfg.repository = repo }
+        if let branch = ud.string(forKey: "bb_pipeline_branch"), !branch.isEmpty {
+            cfg.branch = branch == "main" ? "devops" : branch
+        } else {
+            cfg.branch = "devops"
+        }
+        if let auth = ud.string(forKey: "bb_pipeline_auth_type"), !auth.isEmpty { cfg.authType = auth }
+        if let user = ud.string(forKey: "bb_pipeline_username") { cfg.username = user }
+        if let accId = ud.string(forKey: "bb_pipeline_acc_id") { cfg.selectedAccountId = accId }
+
+        var query = pipelineKeychainQuery
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+           let data = result as? Data,
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            cfg.token = dict["token"] ?? ""
+            cfg.cookie = dict["cookie"] ?? ""
+            cfg.csrfToken = dict["csrfToken"] ?? "1rfIZh8UmWS7a162UeggG2niaPCrYM7z"
+        } else {
+            cfg.csrfToken = "1rfIZh8UmWS7a162UeggG2niaPCrYM7z"
+        }
+        pipelineConfig = cfg
+        loadPipelineLogs()
+    }
+
+    func sanitizeCookie(_ raw: String) -> String {
+        var c = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if c.lowercased().hasPrefix("cookie:") {
+            if let idx = c.firstIndex(of: ":") {
+                c = String(c[c.index(after: idx)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        if (c.hasPrefix("\"") && c.hasSuffix("\"")) || (c.hasPrefix("'") && c.hasSuffix("'")) {
+            c = String(c.dropFirst().dropLast())
+        }
+        return c.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func sanitizeCsrf(_ raw: String) -> String {
+        var c = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if c.lowercased().hasPrefix("x-csrftoken:") {
+            if let idx = c.firstIndex(of: ":") {
+                c = String(c[c.index(after: idx)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        if (c.hasPrefix("\"") && c.hasSuffix("\"")) || (c.hasPrefix("'") && c.hasSuffix("'")) {
+            c = String(c.dropFirst().dropLast())
+        }
+        return c.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func savePipelineConfig(_ cfg: PipelineConfig) {
+        var cleanCfg = cfg
+        cleanCfg.cookie = sanitizeCookie(cfg.cookie)
+        cleanCfg.csrfToken = sanitizeCsrf(cfg.csrfToken)
+        pipelineConfig = cleanCfg
+        let ud = UserDefaults.standard
+        ud.set(cleanCfg.repository, forKey: "bb_pipeline_repo")
+        ud.set(cleanCfg.branch, forKey: "bb_pipeline_branch")
+        ud.set(cleanCfg.authType, forKey: "bb_pipeline_auth_type")
+        ud.set(cleanCfg.username, forKey: "bb_pipeline_username")
+        ud.set(cleanCfg.selectedAccountId, forKey: "bb_pipeline_acc_id")
+
+        let secrets: [String: String] = [
+            "token": cleanCfg.token,
+            "cookie": cleanCfg.cookie,
+            "csrfToken": cleanCfg.csrfToken
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: secrets) {
+            SecItemDelete(pipelineKeychainQuery as CFDictionary)
+            var item = pipelineKeychainQuery
+            item[kSecValueData as String] = data
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            SecItemAdd(item as CFDictionary, nil)
+        }
+    }
+
+    func loadPipelineLogs() {
+        if let data = UserDefaults.standard.data(forKey: "bb_pipeline_logs"),
+           let logs = try? JSONDecoder().decode([PipelineTriggerLog].self, from: data) {
+            pipelineLogs = logs
+        }
+    }
+
+    func appendPipelineLog(_ log: PipelineTriggerLog) {
+        pipelineLogs.insert(log, at: 0)
+        if pipelineLogs.count > 50 { pipelineLogs = Array(pipelineLogs.prefix(50)) }
+        if let data = try? JSONEncoder().encode(pipelineLogs) {
+            UserDefaults.standard.set(data, forKey: "bb_pipeline_logs")
+        }
+    }
+
+    func clearPipelineLogs() {
+        pipelineLogs.removeAll()
+        UserDefaults.standard.removeObject(forKey: "bb_pipeline_logs")
+    }
+
+    func hasValidPipelineAuth() -> Bool {
+        if pipelineConfig.authType == "account" {
+            return !pipelineConfig.selectedAccountId.isEmpty || !pipelineConfig.token.isEmpty || !sanitizeCookie(pipelineConfig.cookie).isEmpty
+        } else if pipelineConfig.authType == "session" {
+            return !sanitizeCookie(pipelineConfig.cookie).isEmpty
+        } else {
+            return !pipelineConfig.token.isEmpty
+        }
+    }
+
+    func logConsole(_ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        let timestamp = formatter.string(from: Date())
+        let line = "[\(timestamp)] \(message)"
+        pipelineConsoleLogs.insert(line, at: 0)
+        if pipelineConsoleLogs.count > 100 {
+            pipelineConsoleLogs = Array(pipelineConsoleLogs.prefix(100))
+        }
+    }
+
+    func parseAndApplyClipboard() {
+        guard let clip = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !clip.isEmpty else {
+            pipelineStatusMessage = "Clipboard trống!"
+            logConsole("⚠️ Clipboard trống!")
+            return
+        }
+
+        var extractedCookie = ""
+        var extractedCsrf = ""
+
+        let lines = clip.components(separatedBy: .newlines)
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lower = trimmed.lowercased()
+            if lower.hasPrefix("cookie:") || lower.hasPrefix("-h 'cookie:") || lower.hasPrefix("-h \"cookie:") {
+                if let colonIdx = trimmed.firstIndex(of: ":") {
+                    var val = String(trimmed[trimmed.index(after: colonIdx)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if val.hasSuffix("'") || val.hasSuffix("\"") { val.removeLast() }
+                    extractedCookie = val
+                }
+            } else if lower.hasPrefix("x-csrftoken:") || lower.hasPrefix("-h 'x-csrftoken:") || lower.hasPrefix("-h \"x-csrftoken:") {
+                if let colonIdx = trimmed.firstIndex(of: ":") {
+                    var val = String(trimmed[trimmed.index(after: colonIdx)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if val.hasSuffix("'") || val.hasSuffix("\"") { val.removeLast() }
+                    extractedCsrf = val
+                }
+            }
+        }
+
+        if extractedCookie.isEmpty && (clip.contains("=") && (clip.contains("session") || clip.contains("token") || clip.contains(";"))) {
+            extractedCookie = clip
+        }
+
+        var updated = false
+        if !extractedCookie.isEmpty {
+            pipelineConfig.cookie = extractedCookie
+            updated = true
+            logConsole("✅ Đã nhận Session Cookie (\(extractedCookie.count) ký tự)")
+        }
+        if !extractedCsrf.isEmpty {
+            pipelineConfig.csrfToken = extractedCsrf
+            updated = true
+            logConsole("✅ Đã nhận CSRF Token: \(extractedCsrf)")
+        }
+
+        if updated {
+            savePipelineConfig(pipelineConfig)
+            pipelineStatusMessage = "Đã dán và lưu CSRF & Cookie từ Clipboard thành công!"
+        } else {
+            pipelineStatusMessage = "Không tìm thấy Cookie hoặc CSRF trong Clipboard!"
+            logConsole("⚠️ Không tìm thấy Cookie hoặc CSRF trong nội dung vừa sao chép.")
+        }
+    }
+
+    func triggerEnvironmentPipeline(env: String, action: String, services: String) async {
+        let variables: [[String: String]] = [
+            ["key": "App", "value": "digifact"],
+            ["key": "Action", "value": action],
+            ["key": "Env", "value": env],
+            ["key": "Services", "value": services]
+        ]
+        await triggerBitbucketPipeline(
+            pattern: "start-stop-environment",
+            variables: variables,
+            env: env,
+            action: action,
+            serviceDetail: services == "All" ? "Tất cả dịch vụ" : "Chỉ Database"
+        )
+    }
+
+    func triggerRestartAllServices(env: String) async {
+        let variables: [[String: String]] = [
+            ["key": "App", "value": "digifact"],
+            ["key": "Env", "value": env]
+        ]
+        await triggerBitbucketPipeline(
+            pattern: "restart-all-services",
+            variables: variables,
+            env: env,
+            action: "restart-all",
+            serviceDetail: "Toàn bộ ECS Services"
+        )
+    }
+
+    func triggerRestartOneService(env: String, service: String) async {
+        let variables: [[String: String]] = [
+            ["key": "Service", "value": service],
+            ["key": "Env", "value": env]
+        ]
+        await triggerBitbucketPipeline(
+            pattern: "restart-one-service",
+            variables: variables,
+            env: env,
+            action: "restart-service",
+            serviceDetail: service
+        )
+    }
+
+    func testPipelineConnection(config: PipelineConfig) async {
+        pipelineTesting = true
+        pipelineTestMessage = "Đang kiểm tra quyền truy cập Pipelines..."
+        defer { pipelineTesting = false }
+
+        let repo = config.repository.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "msm-software/digifact-utilities"
+            : config.repository.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let cleanCookie = sanitizeCookie(config.cookie)
+        let isSession = config.authType == "session" || (!cleanCookie.isEmpty && config.authType != "token")
+        let endpoint = isSession
+            ? "https://bitbucket.org/!api/2.0/repositories/\(repo)/pipelines/?pagelen=1"
+            : "https://api.bitbucket.org/2.0/repositories/\(repo)/pipelines/?pagelen=1"
+
+        guard let url = URL(string: endpoint) else {
+            pipelineTestMessage = "URL repository không hợp lệ: \(endpoint)"
+            return
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyAuth(to: &req, config: config, repo: repo)
+
+        do {
+            let (data, response) = try await pipelineSession.data(for: req)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 500
+            if code >= 200 && code < 300 {
+                pipelineTestMessage = "Kết nối thành công! Đã xác thực với Bitbucket Pipelines (HTTP \(code))."
+                logConsole("✅ Kiểm tra kết nối thành công (HTTP \(code))")
+            } else {
+                let errText = String(data: data, encoding: .utf8) ?? ""
+                var dMsg = errText
+                if let errJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let errObj = errJson["error"] as? [String: Any] {
+                    let m = errObj["message"] as? String ?? ""
+                    let d = errObj["detail"] as? String ?? ""
+                    dMsg = d.isEmpty ? m : "\(m): \(d)"
+                }
+                pipelineTestMessage = "Xác thực thất bại (HTTP \(code)): \(dMsg.prefix(120))"
+                logConsole("❌ Xác thực thất bại (HTTP \(code)): \(dMsg.prefix(150))")
+            }
+        } catch {
+            pipelineTestMessage = "Lỗi kết nối: \(error.localizedDescription)"
+            logConsole("❌ Lỗi kết nối test: \(error.localizedDescription)")
+        }
+    }
+
+    private func applyAuth(to req: inout URLRequest, config: PipelineConfig, repo: String) {
+        req.httpShouldHandleCookies = false
+        let cleanCookie = sanitizeCookie(config.cookie)
+        let cleanCsrf = sanitizeCsrf(config.csrfToken)
+
+        if config.authType == "account" {
+            if let account = accounts.first(where: { $0.id == config.selectedAccountId }) {
+                if account.authType == "session" && !cleanCookie.isEmpty {
+                    req.setValue(cleanCookie, forHTTPHeaderField: "Cookie")
+                    if !cleanCsrf.isEmpty { req.setValue(cleanCsrf, forHTTPHeaderField: "x-csrftoken") }
+                    req.setValue("XMLHttpRequest", forHTTPHeaderField: "x-requested-with")
+                    req.setValue("frontbucket", forHTTPHeaderField: "x-bitbucket-frontend")
+                    req.setValue("https://bitbucket.org", forHTTPHeaderField: "origin")
+                    req.setValue("https://bitbucket.org/\(repo)/pipelines", forHTTPHeaderField: "referer")
+                    return
+                }
+                if let user = account.username, !user.isEmpty, !config.token.isEmpty {
+                    let auth = Data("\(user):\(config.token)".utf8).base64EncodedString()
+                    req.setValue("Basic \(auth)", forHTTPHeaderField: "Authorization")
+                    return
+                }
+            }
+            if !config.token.isEmpty {
+                let user = config.username.isEmpty ? (accounts.first(where: { $0.id == config.selectedAccountId })?.username ?? "") : config.username
+                if !user.isEmpty {
+                    let auth = Data("\(user):\(config.token)".utf8).base64EncodedString()
+                    req.setValue("Basic \(auth)", forHTTPHeaderField: "Authorization")
+                } else {
+                    req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+                }
+                return
+            }
+            if !cleanCookie.isEmpty {
+                req.setValue(cleanCookie, forHTTPHeaderField: "Cookie")
+                if !cleanCsrf.isEmpty { req.setValue(cleanCsrf, forHTTPHeaderField: "x-csrftoken") }
+                req.setValue("XMLHttpRequest", forHTTPHeaderField: "x-requested-with")
+                req.setValue("frontbucket", forHTTPHeaderField: "x-bitbucket-frontend")
+                req.setValue("https://bitbucket.org", forHTTPHeaderField: "origin")
+                req.setValue("https://bitbucket.org/\(repo)/pipelines", forHTTPHeaderField: "referer")
+                return
+            }
+        } else if config.authType == "session" || (!cleanCookie.isEmpty && config.authType != "token") {
+            if !cleanCookie.isEmpty { req.setValue(cleanCookie, forHTTPHeaderField: "Cookie") }
+            if !cleanCsrf.isEmpty { req.setValue(cleanCsrf, forHTTPHeaderField: "x-csrftoken") }
+            req.setValue("XMLHttpRequest", forHTTPHeaderField: "x-requested-with")
+            req.setValue("frontbucket", forHTTPHeaderField: "x-bitbucket-frontend")
+            req.setValue("https://bitbucket.org", forHTTPHeaderField: "origin")
+            req.setValue("https://bitbucket.org/\(repo)/pipelines", forHTTPHeaderField: "referer")
+            req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36", forHTTPHeaderField: "user-agent")
+        } else {
+            if !config.username.isEmpty && !config.token.isEmpty {
+                let auth = Data("\(config.username):\(config.token)".utf8).base64EncodedString()
+                req.setValue("Basic \(auth)", forHTTPHeaderField: "Authorization")
+            } else if !config.token.isEmpty {
+                req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+            }
+        }
+    }
+
+    private func triggerBitbucketPipeline(pattern: String, variables: [[String: String]], env: String, action: String, serviceDetail: String) async {
+        pipelineBusy = true
+        let actLabel = action == "start" ? "BẬT" : action == "stop" ? "TẮT" : "RESTART"
+        logConsole("🚀 Bắt đầu gửi lệnh: \(actLabel) \(env.uppercased()) (\(serviceDetail))...")
+
+        let nowFormatter = DateFormatter()
+        nowFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
+        let nowStr = nowFormatter.string(from: Date())
+        var logItem = PipelineTriggerLog(
+            timestamp: nowStr,
+            env: env,
+            action: action,
+            services: serviceDetail,
+            status: "PENDING",
+            buildNumber: nil,
+            pipelineUuid: nil,
+            pipelineUrl: nil,
+            message: "Đang gửi lệnh đến Bitbucket Pipelines..."
+        )
+
+        let repo = pipelineConfig.repository.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "msm-software/digifact-utilities"
+            : pipelineConfig.repository.trimmingCharacters(in: .whitespacesAndNewlines)
+        let branch = pipelineConfig.branch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "main"
+            : pipelineConfig.branch.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let cleanCookie = sanitizeCookie(pipelineConfig.cookie)
+        let isSession = pipelineConfig.authType == "session" || (!cleanCookie.isEmpty && pipelineConfig.authType != "token" && pipelineConfig.token.isEmpty)
+        let endpoint = isSession
+            ? "https://bitbucket.org/!api/2.0/repositories/\(repo)/pipelines/"
+            : "https://api.bitbucket.org/2.0/repositories/\(repo)/pipelines/"
+
+        if isSession && cleanCookie.isEmpty {
+            let msg = "Chưa có Session Cookie! Dán Cookie từ trình duyệt hoặc bấm 'Đăng nhập trong App'."
+            logItem.status = "FAILED"
+            logItem.message = msg
+            logConsole("❌ \(msg)")
+            appendPipelineLog(logItem)
+            lastTriggeredLog = logItem
+            pipelineStatusMessage = msg
+            executionAlertResult = AlertInfo(title: "Chưa có Cookie", message: msg, isSuccess: false, url: nil)
+            pipelineBusy = false
+            return
+        }
+
+        guard let url = URL(string: endpoint) else {
+            let msg = "URL repository không hợp lệ: \(endpoint)"
+            logItem.status = "FAILED"
+            logItem.message = msg
+            logConsole("❌ \(msg)")
+            appendPipelineLog(logItem)
+            lastTriggeredLog = logItem
+            pipelineStatusMessage = msg
+            executionAlertResult = AlertInfo(title: "Lỗi URL", message: msg, isSuccess: false, url: nil)
+            pipelineBusy = false
+            return
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyAuth(to: &req, config: pipelineConfig, repo: repo)
+
+        let payload: [String: Any] = [
+            "target": [
+                "type": "pipeline_ref_target",
+                "ref_type": "branch",
+                "ref_name": branch,
+                "selector": [
+                    "type": "custom",
+                    "pattern": pattern
+                ]
+            ],
+            "variables": variables
+        ]
+
+        logConsole("📡 POST \(endpoint)")
+        logConsole("📦 Pattern: \(pattern), Branch: \(branch)")
+        let varSummary = variables.map { "\($0["key"] ?? "")=\($0["value"] ?? "")" }.joined(separator: ", ")
+        logConsole("📋 Variables: [\(varSummary)]")
+
+        do {
+            req.httpBody = try JSONSerialization.data(withJSONObject: payload)
+            let (data, response) = try await pipelineSession.data(for: req)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 500
+
+            if code == 201 || code == 200 {
+                var buildNum: Int? = nil
+                var uuidStr: String? = nil
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    buildNum = json["build_number"] as? Int
+                    uuidStr = json["uuid"] as? String
+                }
+                if uuidStr == nil, let loc = (response as? HTTPURLResponse)?.allHeaderFields["Location"] as? String ?? (response as? HTTPURLResponse)?.allHeaderFields["location"] as? String {
+                    if let lastComp = loc.split(separator: "/").last {
+                        uuidStr = String(lastComp)
+                    }
+                }
+
+                logItem.status = "SUCCESS"
+                logItem.buildNumber = buildNum
+                logItem.pipelineUuid = uuidStr
+                if let buildNum {
+                    logItem.pipelineUrl = "https://bitbucket.org/\(repo)/pipelines/results/\(buildNum)"
+                } else if let uuidStr {
+                    let clean = uuidStr.replacingOccurrences(of: "{", with: "").replacingOccurrences(of: "}", with: "")
+                    logItem.pipelineUrl = "https://bitbucket.org/\(repo)/pipelines/results/\(clean)"
+                } else {
+                    logItem.pipelineUrl = "https://bitbucket.org/\(repo)/pipelines"
+                }
+
+                logItem.message = "Đã kích hoạt pipeline \(actLabel) \(env.uppercased()) thành công (HTTP \(code))."
+                pipelineStatusMessage = logItem.message
+                logConsole("🎉 THÀNH CÔNG! Bitbucket HTTP \(code) · Build #\(buildNum.map { String($0) } ?? "Mới")")
+                if let pUrl = logItem.pipelineUrl {
+                    logConsole("🔗 \(pUrl)")
+                }
+
+                executionAlertResult = AlertInfo(
+                    title: "🎉 Kích hoạt thành công!",
+                    message: "Pipeline \(actLabel) \(env.uppercased()) (\(serviceDetail)) đã được tạo trên Bitbucket (HTTP \(code)).\nBuild: #\(buildNum.map { String($0) } ?? "Mới")",
+                    isSuccess: true,
+                    url: logItem.pipelineUrl
+                )
+            } else {
+                let errText = String(data: data, encoding: .utf8) ?? "HTTP \(code)"
+                var detailMsg = errText
+                if let errJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let errObj = errJson["error"] as? [String: Any] {
+                    let m = errObj["message"] as? String ?? ""
+                    let d = errObj["detail"] as? String ?? ""
+                    detailMsg = d.isEmpty ? m : "\(m): \(d)"
+                }
+                logItem.status = "FAILED"
+                logItem.message = "Bitbucket trả mã HTTP \(code): \(detailMsg.prefix(150))"
+                pipelineStatusMessage = "Kích hoạt pipeline thất bại: HTTP \(code)"
+                logConsole("❌ Bitbucket trả HTTP \(code): \(detailMsg.prefix(180))")
+                if code == 401 || code == 403 {
+                    logConsole("💡 Gợi ý: Phiên xác thực có thể đã hết hạn. Hãy kiểm tra lại Account hoặc dán Cookie mới.")
+                }
+
+                executionAlertResult = AlertInfo(
+                    title: "❌ Kích hoạt thất bại (HTTP \(code))",
+                    message: "Bitbucket phản hồi:\n\(detailMsg.prefix(250))",
+                    isSuccess: false,
+                    url: nil
+                )
+            }
+        } catch {
+            logItem.status = "FAILED"
+            logItem.message = "Lỗi mạng hoặc kết nối: \(error.localizedDescription)"
+            pipelineStatusMessage = logItem.message
+            logConsole("❌ Lỗi mạng: \(error.localizedDescription)")
+            executionAlertResult = AlertInfo(
+                title: "❌ Lỗi kết nối",
+                message: "Không thể gửi request: \(error.localizedDescription)",
+                isSuccess: false,
+                url: nil
+            )
+        }
+
+        appendPipelineLog(logItem)
+        lastTriggeredLog = logItem
+        pipelineBusy = false
+    }
+
+    // MARK: - FortiClient VPN & Reconnect Capabilities
+
+    func toggleVpnAutoReconnect() {
+        vpnAutoReconnect.toggle()
+        UserDefaults.standard.set(vpnAutoReconnect, forKey: "vpnAutoReconnect")
+        logConsole(vpnAutoReconnect ? "🟢 [VPN] Đã BẬT tự động kết nối lại khi mất VPN." : "⚪ [VPN] Đã TẮT tự động kết nối lại.")
+        if vpnAutoReconnect && vpnStatus == .disconnected {
+            Task { await manualReconnectVpn() }
+        }
+    }
+
+    func cancelVpnReconnect() {
+        vpnStatus = .disconnected
+        vpnReconnectAttempts = 0
+        vpnStatusMessage = "Đã dừng kết nối lại VPN."
+        logConsole("⏹️ [VPN] Người dùng đã hủy tiến trình kết nối lại.")
+        triggerVpnDisconnect()
+    }
+
+    func checkVpnHealth() async {
+        guard !vpnProbing && vpnStatus != .reconnecting else { return }
+
+        let gateway = vpnGatewayIp
+        let probe = await probeVpnGateway(host: gateway, port: 443, timeoutSeconds: 1.2)
+        let tunnel = getActiveVpnTunnelInfo()
+
+        vpnLastChecked = Date()
+        vpnLatencyMs = probe.reachable ? probe.latencyMs : nil
+        vpnTunnelIp = tunnel.ip
+        vpnTunnelInterface = tunnel.interface
+
+        if tunnel.hasTunnel || (probe.reachable && isFortiTunnelProcessRunning()) {
+            vpnStatus = .connected
+            vpnReconnectAttempts = 0
+            vpnStatusMessage = "FortiClient VPN đã kết nối an toàn (\(String(format: "%.1f", probe.latencyMs)) ms)"
+        } else {
+            // Tunnel is down
+            if vpnAutoReconnect {
+                await executeReconnectFlow(manual: false)
+            } else {
+                vpnStatus = .disconnected
+                vpnReconnectAttempts = 0
+                vpnStatusMessage = "VPN ngắt kết nối. Tự động kết nối lại đang TẮT. Bấm nút để kết nối thủ công."
+            }
+        }
+    }
+
+    func manualReconnectVpn() async {
+        await executeReconnectFlow(manual: true)
+    }
+
+    private func executeReconnectFlow(manual: Bool) async {
+        guard !vpnProbing else { return }
+        vpnProbing = true
+        defer { vpnProbing = false }
+
+        vpnStatus = .reconnecting
+        vpnReconnectAttempts = manual ? 1 : (vpnReconnectAttempts + 1)
+        vpnStatusMessage = "Đang kết nối lại chạy ẩn (Lần \(vpnReconnectAttempts)/3)..."
+        logConsole("🔄 [VPN] Bắt đầu kết nối lại ở chế độ chạy ẩn (Lần \(vpnReconnectAttempts)/3)...")
+
+        // 1. Trigger background connection headlessly
+        triggerVpnReconnect()
+
+        // 2. Poll every 1.5s up to 10.5 seconds timeout (7 steps)
+        var connected = false
+        for _ in 1...7 {
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if vpnStatus != .reconnecting {
+                // User clicked Cancel
+                triggerVpnDisconnect()
+                return
+            }
+
+            let tunnel = getActiveVpnTunnelInfo()
+            let probe = await probeVpnGateway(host: vpnGatewayIp, port: 443, timeoutSeconds: 1.0)
+            if tunnel.hasTunnel || (probe.reachable && isFortiTunnelProcessRunning()) {
+                connected = true
+                vpnTunnelIp = tunnel.ip
+                vpnTunnelInterface = tunnel.interface
+                vpnLatencyMs = probe.reachable ? probe.latencyMs : nil
+                break
+            }
+        }
+
+        if connected {
+            vpnStatus = .connected
+            vpnReconnectAttempts = 0
+            vpnStatusMessage = "FortiClient VPN đã kết nối an toàn"
+            logConsole("✅ [VPN] Kết nối thành công tới \(vpnGatewayIp)!")
+        } else {
+            // Failed: Clean up dangling tunnel state to prevent getting stuck
+            triggerVpnDisconnect()
+            if vpnAutoReconnect && vpnReconnectAttempts < 3 && !manual {
+                vpnStatusMessage = "Kết nối bị ngắt bất ngờ. Thử lại sau 5s (Lần \(vpnReconnectAttempts)/3)..."
+                logConsole("⚠️ [VPN] Lượt kết nối chưa thành công. Tự động thử lại sau 5s...")
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                if vpnAutoReconnect && vpnStatus == .reconnecting {
+                    await executeReconnectFlow(manual: false)
+                }
+            } else {
+                vpnStatus = .disconnected
+                vpnReconnectAttempts = 0
+                vpnStatusMessage = "Kết nối bị ngắt bất ngờ (Terminated). Đã dừng để tránh treo."
+                logConsole("❌ [VPN] Kết nối không thành công. Đã đưa về trạng thái Ngắt kết nối.")
+            }
+        }
+    }
+
+    func openFortiClientApp() {
+        let url = URL(fileURLWithPath: "/Applications/FortiClient.app")
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, err in
+            Task { @MainActor in
+                if let err {
+                    self.logConsole("⚠️ Không thể mở FortiClient: \(err.localizedDescription)")
+                } else {
+                    self.logConsole("🚀 Đã mở ứng dụng FortiClient")
+                }
+            }
+        }
+    }
+
+    private func triggerVpnReconnect() {
+        logConsole("🔄 [VPN] Gửi lệnh kết nối ngầm (Background Headless)...")
+        runConnectorScript(action: "connect")
+    }
+
+    private func triggerVpnDisconnect() {
+        logConsole("⏹️ [VPN] Dọn dẹp session VPN ngầm...")
+        runConnectorScript(action: "disconnect")
+    }
+
+    private func runConnectorScript(action: String) {
+        var scriptPath = Bundle.main.path(forResource: "forticlient_connector", ofType: "js")
+        if scriptPath == nil {
+            let devPath = "/Users/hungnv/DigifactoryBTM/bitbucket-pr-approver/macos-app/Assets/forticlient_connector.js"
+            if FileManager.default.fileExists(atPath: devPath) {
+                scriptPath = devPath
+            }
+        }
+        guard let path = scriptPath else { return }
+
+        let nodeExecutable = FileManager.default.fileExists(atPath: "/usr/local/bin/node")
+            ? "/usr/local/bin/node"
+            : "/usr/bin/node"
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: nodeExecutable)
+        p.arguments = [path, action]
+        try? p.run()
+    }
+
+    private func isFortiTunnelProcessRunning() -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        p.arguments = ["-f", "fct_tunnel_ctl"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        try? p.run()
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+}
+
+enum VpnConnectionStatus: String {
+    case connected = "CONNECTED"
+    case reconnecting = "RECONNECTING"
+    case disconnected = "DISCONNECTED"
+    case checking = "CHECKING"
+}
+
+private func probeVpnGateway(host: String, port: Int32 = 443, timeoutSeconds: TimeInterval = 1.5) async -> (reachable: Bool, latencyMs: Double) {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global(qos: .userInitiated).async {
+            let start = CFAbsoluteTimeGetCurrent()
+            var hints = addrinfo(
+                ai_flags: AI_NUMERICHOST,
+                ai_family: AF_INET,
+                ai_socktype: SOCK_STREAM,
+                ai_protocol: IPPROTO_TCP,
+                ai_addrlen: 0,
+                ai_canonname: nil,
+                ai_addr: nil,
+                ai_next: nil
+            )
+            var res: UnsafeMutablePointer<addrinfo>?
+            guard getaddrinfo(host, "\(port)", &hints, &res) == 0, let info = res else {
+                continuation.resume(returning: (false, 0))
+                return
+            }
+            defer { freeaddrinfo(res) }
+
+            let sock = socket(info.pointee.ai_family, info.pointee.ai_socktype, info.pointee.ai_protocol)
+            guard sock >= 0 else {
+                continuation.resume(returning: (false, 0))
+                return
+            }
+            defer { close(sock) }
+
+            let flags = fcntl(sock, F_GETFL, 0)
+            _ = fcntl(sock, F_SETFL, flags | O_NONBLOCK)
+
+            let connectRes = connect(sock, info.pointee.ai_addr, info.pointee.ai_addrlen)
+            if connectRes == 0 {
+                let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
+                continuation.resume(returning: (true, elapsed))
+                return
+            }
+            if errno != EINPROGRESS {
+                continuation.resume(returning: (false, 0))
+                return
+            }
+
+            var pollFd = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
+            let pollRes = poll(&pollFd, 1, Int32(timeoutSeconds * 1000))
+            if pollRes > 0 && (pollFd.revents & Int16(POLLOUT)) != 0 {
+                var err: Int32 = 0
+                var len = socklen_t(MemoryLayout<Int32>.size)
+                getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len)
+                if err == 0 {
+                    let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
+                    continuation.resume(returning: (true, elapsed))
+                    return
+                }
+            }
+            continuation.resume(returning: (false, 0))
+        }
+    }
+}
+
+private func getActiveVpnTunnelInfo() -> (hasTunnel: Bool, ip: String?, interface: String?) {
+    var ifaddr: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return (false, nil, nil) }
+    defer { freeifaddrs(ifaddr) }
+
+    var cursor: UnsafeMutablePointer<ifaddrs>? = firstAddr
+    while let ptr = cursor {
+        let flags = Int32(ptr.pointee.ifa_flags)
+        let name = String(cString: ptr.pointee.ifa_name)
+        if (flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING) {
+            if (name.hasPrefix("utun") || name.hasPrefix("ppp")) && ptr.pointee.ifa_addr != nil {
+                let family = ptr.pointee.ifa_addr.pointee.sa_family
+                if family == UInt8(AF_INET) {
+                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    if getnameinfo(ptr.pointee.ifa_addr, socklen_t(ptr.pointee.ifa_addr.pointee.sa_len),
+                                   &hostname, socklen_t(hostname.count),
+                                   nil, 0, NI_NUMERICHOST) == 0 {
+                        let ip = String(cString: hostname)
+                        if !ip.isEmpty && !ip.hasPrefix("127.") && !ip.hasPrefix("169.254.") {
+                            return (true, ip, name)
+                        }
+                    }
+                }
+            }
+        }
+        cursor = ptr.pointee.ifa_next
+    }
+    return (false, nil, nil)
 }
 
 private extension URL {
@@ -814,6 +1731,129 @@ private struct WorkflowArtwork: View {
     }
 }
 
+private struct VpnRadarWaveView: View {
+    let status: VpnConnectionStatus
+    let latencyMs: Double?
+    let gatewayIp: String
+    let isAutoReconnect: Bool
+    let onAction: () -> Void
+
+    @State private var waveAnimation = false
+
+    private var statusColor: Color {
+        switch status {
+        case .connected: return AppPalette.mint
+        case .reconnecting: return Color.orange
+        case .disconnected: return Color(red: 0.95, green: 0.35, blue: 0.35)
+        case .checking: return AppPalette.blue
+        }
+    }
+
+    private var statusText: String {
+        switch status {
+        case .connected: return "Connected"
+        case .reconnecting: return "Reconnecting..."
+        case .disconnected: return "Disconnected"
+        case .checking: return "Checking..."
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            ZStack {
+                // Layer 1: Emitting Concentric Ripple Waves (ExpressVPN style)
+                if status == .connected || status == .reconnecting {
+                    ForEach(0..<3) { i in
+                        Circle()
+                            .stroke(
+                                statusColor.opacity(waveAnimation ? 0.0 : 0.65),
+                                lineWidth: waveAnimation ? 1.0 : 2.5
+                            )
+                            .scaleEffect(waveAnimation ? 1.85 : 1.0)
+                            .frame(width: 96, height: 96)
+                            .animation(
+                                Animation.easeOut(duration: status == .reconnecting ? 1.3 : 2.2)
+                                    .repeatForever(autoreverses: false)
+                                    .delay(Double(i) * (status == .reconnecting ? 0.4 : 0.7)),
+                                value: waveAnimation
+                            )
+                    }
+                } else {
+                    Circle()
+                        .stroke(
+                            statusColor.opacity(0.28),
+                            style: StrokeStyle(lineWidth: 1.5, dash: [4, 4])
+                        )
+                        .frame(width: 130, height: 130)
+                }
+
+                // Layer 2: Outer Status Ring with Glow
+                Circle()
+                    .stroke(statusColor.opacity(0.25), lineWidth: 8)
+                    .frame(width: 104, height: 104)
+
+                Circle()
+                    .stroke(statusColor, lineWidth: 3.5)
+                    .frame(width: 96, height: 96)
+                    .shadow(color: statusColor.opacity(0.65), radius: 8)
+
+                // Layer 3: Central Circular Button
+                Button(action: onAction) {
+                    ZStack {
+                        Circle()
+                            .fill(
+                                RadialGradient(
+                                    colors: [
+                                        statusColor.opacity(0.95),
+                                        statusColor.opacity(0.75),
+                                        AppPalette.navy
+                                    ],
+                                    center: .center,
+                                    startRadius: 4,
+                                    endRadius: 44
+                                )
+                            )
+                            .frame(width: 86, height: 86)
+                            .shadow(color: statusColor.opacity(0.5), radius: 6, y: 3)
+
+                        VStack(spacing: 2) {
+                            Image(systemName: status == .connected ? "power" :
+                                              status == .reconnecting ? "arrow.triangle.2.circlepath" : "power")
+                                .font(.system(size: 26, weight: .bold))
+                                .foregroundStyle(.white)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .help(status == .connected ? "VPN đang hoạt động. Bấm để kiểm tra lại." : "Bấm để thử kết nối lại ngay.")
+            }
+            .frame(width: 180, height: 140)
+
+            // Status Typography below the button
+            VStack(spacing: 3) {
+                Text(statusText)
+                    .font(.headline.bold())
+                    .foregroundStyle(.white)
+
+                HStack(spacing: 6) {
+                    Text(gatewayIp)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(Color.white.opacity(0.7))
+
+                    if let ms = latencyMs {
+                        Text("• \(String(format: "%.0f", ms))ms")
+                            .font(.caption2.bold())
+                            .foregroundStyle(AppPalette.mint)
+                    }
+                }
+            }
+        }
+        .onAppear {
+            waveAnimation = true
+        }
+    }
+}
+
 private struct GenerativeAgentsBoardView: NSViewRepresentable {
     let workersJson: String
     let runsJson: String
@@ -856,6 +1896,112 @@ private struct GenerativeAgentsBoardView: NSViewRepresentable {
     }
 }
 
+private struct BitbucketLoginWebView: NSViewRepresentable {
+    let onCookiesExtracted: (String, String) -> Void
+
+    class Coordinator: NSObject, WKNavigationDelegate {
+        var parent: BitbucketLoginWebView
+        var timer: Timer?
+        weak var currentWebView: WKWebView?
+
+        init(_ parent: BitbucketLoginWebView) {
+            self.parent = parent
+            super.init()
+            self.timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+                self?.pollCookies()
+            }
+        }
+
+        deinit {
+            timer?.invalidate()
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            self.currentWebView = webView
+            pollCookies()
+        }
+
+        func pollCookies() {
+            guard let webView = currentWebView else { return }
+            let store = webView.configuration.websiteDataStore.httpCookieStore
+            store.getAllCookies { [weak self] cookies in
+                guard let self else { return }
+                let bbCookies = cookies.filter { $0.domain.contains("bitbucket.org") }
+                guard !bbCookies.isEmpty else { return }
+                let cookieStr = bbCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+                let csrf = bbCookies.first(where: { $0.name == "csrftoken" || $0.name == "csrf" })?.value ?? ""
+                if !cookieStr.isEmpty && (cookieStr.contains("session") || cookieStr.contains("token")) {
+                    DispatchQueue.main.async {
+                        self.parent.onCookiesExtracted(cookieStr, csrf)
+                    }
+                }
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        context.coordinator.currentWebView = webView
+        if let url = URL(string: "https://bitbucket.org/account/signin/") {
+            webView.load(URLRequest(url: url))
+        }
+        return webView
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {}
+}
+
+private struct BitbucketLoginSheet: View {
+    @Binding var isPresented: Bool
+    let onExtracted: (String, String) -> Void
+    @State private var status = "Vui lòng đăng nhập Bitbucket bên dưới để tự động lấy Cookie..."
+    @State private var hasFound = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Đăng nhập Bitbucket để lấy Session Cookie & CSRF").font(.headline.bold())
+                    Text(status).font(.caption).foregroundStyle(hasFound ? AppPalette.mint : .secondary)
+                }
+                Spacer()
+                Button {
+                    isPresented = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill").font(.title3).foregroundStyle(.secondary)
+                }.buttonStyle(.plain)
+            }
+            .padding(.horizontal, 20).padding(.vertical, 14)
+            .background(AppPalette.surface)
+            Divider()
+            BitbucketLoginWebView { cookie, csrf in
+                hasFound = true
+                status = "Đã tìm thấy Cookie & CSRF! Đã tự động cập nhật vào app."
+                onExtracted(cookie, csrf)
+            }
+            .frame(minWidth: 780, minHeight: 620)
+            Divider()
+            HStack {
+                Text("Sau khi đăng nhập xong, app sẽ tự động trích xuất cookie và cập nhật vào cấu hình.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Đóng") {
+                    isPresented = false
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(.horizontal, 20).padding(.vertical, 12)
+            .background(AppPalette.surface)
+        }
+        .frame(width: 820, height: 680)
+    }
+}
+
 private struct AppView: View {
     @StateObject private var model = AppModel()
     @State private var draftAccount = AccountDraft()
@@ -874,16 +2020,29 @@ private struct AppView: View {
     @State private var selectedRunId: String?
     @State private var runFilter = "Tất cả"
     @State private var confirmUpdate = false
+    @State private var showingPipelineConfig = false
+    @State private var draftPipelineConfig = PipelineConfig()
+    @State private var serverActionToConfirm: ServerActionConfirmation?
+    @State private var selectedEnvScopes: [String: String] = ["dev": "All", "qc": "All", "uat": "All", "demo": "All"]
+    @State private var selectedEnvRestartService: [String: String] = ["dev": "core-fe", "qc": "core-fe", "uat": "core-fe", "demo": "core-fe"]
+    @State private var showingLoginWebView = false
+    @State private var missingCredentialAlert = false
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.availableUpdate != nil { updateBanner }
             if model.authenticated { content } else { login }
         }
         .frame(minWidth: 1100, minHeight: 700)
         .tint(AppPalette.blue)
         .sheet(isPresented: $showingAccount) { accountForm }
         .sheet(isPresented: $showingJob) { jobForm }
+        .sheet(isPresented: Binding(
+            get: { model.availableUpdate != nil && !showingAccount && !showingJob },
+            set: { if !$0 { model.availableUpdate = nil } }
+        )) {
+            updateModalSheet
+        }
+        .sheet(isPresented: $showingPipelineConfig) { pipelineConfigSheet }
         .confirmationDialog("Xóa Bitbucket account?", isPresented: Binding(
             get: { accountToDelete != nil }, set: { if !$0 { accountToDelete = nil } })) {
             Button("Xóa account", role: .destructive) {
@@ -914,31 +2073,129 @@ private struct AppView: View {
         .task {
             await model.checkForUpdate()
             await model.restoreLogin()
+            await model.checkVpnHealth()
         }
         .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { _ in
             if model.authenticated && !model.needsReauth && !model.busy { Task { await model.refresh() } }
+            Task { await model.checkVpnHealth() }
         }
         .onReceive(Timer.publish(every: 600, on: .main, in: .common).autoconnect()) { _ in
             Task { await model.checkForUpdate() }
         }
     }
 
-    private var updateBanner: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "arrow.down.app.fill").foregroundStyle(AppPalette.blue)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Có bản mới \(model.availableUpdate?.version ?? "")").font(.subheadline.bold())
-                Text(model.updateMessage.isEmpty ? "Bản cập nhật sẵn sàng để tải và cài đặt." : model.updateMessage)
-                    .font(.caption).foregroundStyle(.secondary)
+    private var updateModalSheet: some View {
+        VStack(spacing: 0) {
+            // Header with App Icon and Badge
+            VStack(spacing: 14) {
+                ZStack {
+                    Circle()
+                        .fill(AppPalette.blue.opacity(0.12))
+                        .frame(width: 64, height: 64)
+                    Image(systemName: "arrow.down.app.fill")
+                        .font(.system(size: 32, weight: .semibold))
+                        .foregroundStyle(AppPalette.blue)
+                }
+
+                VStack(spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text("Bản Cập Nhật Mới").font(.title2.bold())
+                        Text("v\(model.availableUpdate?.version ?? "")")
+                            .font(.caption.bold())
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .background(AppPalette.mint.opacity(0.18), in: Capsule())
+                            .foregroundStyle(AppPalette.mint)
+                    }
+                    Text(model.updateMessage.isEmpty ? "Đã sẵn sàng để nâng cấp phiên bản cho macOS." : model.updateMessage)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
             }
+            .padding(.top, 28)
+            .padding(.horizontal, 24)
+
+            // Release Details Card
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "sparkles").foregroundStyle(AppPalette.blue)
+                    Text("Thông tin bản phát hành").font(.caption.bold()).foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Phiên bản hiện tại:")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.17")
+                            .font(.caption.monospaced()).bold()
+                    }
+                    Divider()
+                    HStack {
+                        Text("Phiên bản mới:")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Text("v\(model.availableUpdate?.version ?? "")")
+                            .font(.caption.monospaced()).bold().foregroundStyle(AppPalette.mint)
+                    }
+                    if let size = model.availableUpdate?.sizeBytes {
+                        Divider()
+                        HStack {
+                            Text("Dung lượng tải về:")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Text(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))
+                                .font(.caption.monospaced())
+                        }
+                    }
+                }
+                .padding(14)
+                .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 12))
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 18)
+
+            if model.updateBusy {
+                VStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.regular)
+                    Text(model.updateMessage.isEmpty ? "Đang tải xuống và cài đặt..." : model.updateMessage)
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.top, 16)
+            }
+
             Spacer()
-            if model.updateBusy { ProgressView().controlSize(.small) }
-            Button("Để sau") { model.availableUpdate = nil }.disabled(model.updateBusy)
-            Button("Cập nhật") { confirmUpdate = true }
-                .buttonStyle(.borderedProminent).disabled(model.updateBusy || showingAccount || showingJob)
+
+            Divider()
+
+            // Footer actions
+            HStack(spacing: 12) {
+                Button("Để sau") {
+                    model.availableUpdate = nil
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.updateBusy)
+
+                Spacer()
+
+                Button {
+                    Task { await model.installUpdate() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                        Text("Cập nhật & Khởi động lại")
+                            .font(.subheadline.bold())
+                    }
+                    .padding(.horizontal, 16).padding(.vertical, 8)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.updateBusy || showingAccount || showingJob)
+            }
+            .padding(.horizontal, 24).padding(.vertical, 16)
+            .background(AppPalette.surface)
         }
-        .padding(.horizontal, 24).padding(.vertical, 10)
-        .background(AppPalette.canvas)
+        .frame(width: 480, height: 400)
     }
 
     private var login: some View {
@@ -1022,6 +2279,7 @@ private struct AppView: View {
                 sidebarButton("Mac Worker", "desktopcomputer", 3)
                 sidebarButton("Lịch sử chạy", "clock.arrow.circlepath", 4)
                 sidebarButton("Town Board 2D", "map.fill", 5)
+                sidebarButton("Bật/Tắt Server", "server.rack", 6)
                 Spacer()
                 if let local = model.workers.first(where: { $0.id == model.localWorkerId }) {
                     Label(local.state == "ONLINE" ? "Worker online" : "Worker: \(local.state)",
@@ -1061,6 +2319,7 @@ private struct AppView: View {
         case 3: worker
         case 4: logs
         case 5: generativeBoard
+        case 6: serverControl
         default: overview
         }
     }
@@ -1073,6 +2332,9 @@ private struct AppView: View {
                 Spacer()
                 if tab == 4 && model.runs.contains(where: { $0.status == "FAILED" }) {
                     Circle().fill(.red).frame(width: 7, height: 7).accessibilityHidden(true)
+                }
+                if tab == 6 && model.pipelineBusy {
+                    ProgressView().controlSize(.mini)
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 12)
@@ -1088,31 +2350,7 @@ private struct AppView: View {
     private var overview: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                HStack(alignment: .top, spacing: 20) {
-                    VStack(alignment: .leading, spacing: 14) {
-                        Text("CONTROL CENTER").font(.caption.bold()).tracking(1.6)
-                            .foregroundStyle(AppPalette.mint)
-                        Text("Tự động duyệt PR,\nkiểm soát từng lượt.")
-                            .font(.system(size: 32, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text("Tạo job trên Mac, theo dõi Worker và xem kết quả phê duyệt trong cùng một nơi.")
-                            .foregroundStyle(Color.white.opacity(0.8))
-                            .fixedSize(horizontal: false, vertical: true)
-                        HStack(spacing: 10) {
-                            Button("Tạo job") {
-                                draftJob = JobDraft(); draftJob.workerId = model.localWorkerId ?? ""
-                                jobError = ""; showingJob = true
-                            }.buttonStyle(.borderedProminent)
-                            Button("Xem lịch sử") { selectedTab = 4 }
-                                .buttonStyle(.bordered).foregroundStyle(.white)
-                        }.padding(.top, 6)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    WorkflowArtwork().frame(width: 308, height: 210)
-                }
-                .padding(26)
-                .background(AppPalette.navy, in: RoundedRectangle(cornerRadius: 22))
+                vpnControlCenterHero
 
                 HStack(spacing: 14) {
                     stat("Accounts", model.accounts.count, "key.horizontal", "Token quản lý")
@@ -1140,6 +2378,30 @@ private struct AppView: View {
                     }
                     Spacer()
                     Button("Mở Town Board 2D") { selectedTab = 5 }
+                        .buttonStyle(.borderedProminent)
+                }
+                .padding(18)
+                .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 16))
+
+                HStack(spacing: 16) {
+                    Image(systemName: "server.rack")
+                        .font(.title)
+                        .foregroundStyle(AppPalette.blue)
+                        .frame(width: 48, height: 48)
+                        .background(AppPalette.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 8) {
+                            Text("Bật / Tắt Server Môi Trường").font(.headline.bold())
+                            Text("dev · qc · uat · demo").font(.caption.bold())
+                                .padding(.horizontal, 8).padding(.vertical, 2)
+                                .background(AppPalette.mint.opacity(0.15), in: Capsule())
+                                .foregroundStyle(AppPalette.mint)
+                        }
+                        Text("Điều khiển Start/Stop và Restart dịch vụ ECS cluster qua Bitbucket Pipelines.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Điều khiển Server") { selectedTab = 6 }
                         .buttonStyle(.borderedProminent)
                 }
                 .padding(18)
@@ -1183,6 +2445,188 @@ private struct AppView: View {
                     .font(.callout).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading).padding(28)
         }
+    }
+
+    private var vpnColor: Color {
+        switch model.vpnStatus {
+        case .connected: return AppPalette.mint
+        case .reconnecting: return Color.orange
+        case .disconnected: return Color(red: 0.95, green: 0.35, blue: 0.35)
+        case .checking: return AppPalette.blue
+        }
+    }
+
+    private var vpnControlCenterHero: some View {
+        HStack(alignment: .center, spacing: 24) {
+            // Left Column: Control Center Info, Auto Reconnect Toggle, Action Buttons
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 8) {
+                    Text("CONTROL CENTER").font(.caption.bold()).tracking(1.6)
+                        .foregroundStyle(AppPalette.mint)
+                    Text("•").foregroundStyle(.white.opacity(0.3))
+                    Text("FORTICLIENT VPN SHIELD").font(.caption.bold()).tracking(1.4)
+                        .foregroundStyle(AppPalette.blue)
+                }
+
+                Text("Tự động duyệt PR,\nkiểm soát từng lượt.")
+                    .font(.system(size: 30, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // VPN Status Pill & Gateway Info
+                HStack(spacing: 10) {
+                    HStack(spacing: 6) {
+                        Circle().fill(vpnColor)
+                            .frame(width: 8, height: 8)
+                        Text(model.vpnStatus == .connected ? "ĐÃ KẾT NỐI (SSL-VPN)" :
+                             model.vpnStatus == .reconnecting ? "ĐANG KẾT NỐI LẠI CHẠY ẨN..." : "ĐÃ NGẮT KẾT NỐI")
+                            .font(.caption.bold())
+                            .foregroundStyle(vpnColor)
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(vpnColor.opacity(0.16), in: Capsule())
+
+                    HStack(spacing: 5) {
+                        Image(systemName: "network").font(.caption2).foregroundStyle(.white.opacity(0.7))
+                        Text(model.vpnGatewayIp)
+                            .font(.caption.monospaced()).foregroundStyle(.white.opacity(0.85))
+                        if let ms = model.vpnLatencyMs {
+                            Text("(\(String(format: "%.1f", ms))ms)")
+                                .font(.caption2.monospaced()).foregroundStyle(AppPalette.mint)
+                        }
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(Color.white.opacity(0.08), in: Capsule())
+                }
+
+                if !model.vpnStatusMessage.isEmpty {
+                    Text(model.vpnStatusMessage)
+                        .font(.caption)
+                        .foregroundStyle(vpnColor.opacity(0.95))
+                        .lineLimit(1)
+                }
+
+                // Auto Reconnect Toggle Sub-Card
+                HStack(alignment: .center, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Text("Tự động kết nối lại khi mất VPN").font(.subheadline.bold())
+                                .foregroundStyle(.white)
+                            Text(model.vpnAutoReconnect ? "BẬT" : "TẮT")
+                                .font(.caption2.bold())
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(model.vpnAutoReconnect ? AppPalette.mint.opacity(0.2) : Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
+                                .foregroundStyle(model.vpnAutoReconnect ? AppPalette.mint : Color.white.opacity(0.6))
+                        }
+                        Text(model.vpnAutoReconnect
+                            ? "Khi rớt mạng tới 115.78.233.162, app tự động thử kết nối lại ngầm sau 5s."
+                            : "Đã tắt: Khi mất VPN, worker dừng chờ an toàn và không tự kết nối lại.")
+                            .font(.caption)
+                            .foregroundStyle(Color.white.opacity(0.7))
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { model.vpnAutoReconnect },
+                        set: { _ in model.toggleVpnAutoReconnect() }
+                    ))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                }
+                .padding(.horizontal, 14).padding(.vertical, 10)
+                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                )
+
+                // Quick Action Buttons
+                HStack(spacing: 10) {
+                    if model.vpnStatus == .reconnecting {
+                        Button {
+                            model.cancelVpnReconnect()
+                        } label: {
+                            Label("Hủy kết nối lại", systemImage: "xmark.circle")
+                                .foregroundStyle(Color.red)
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button {
+                            Task { await model.manualReconnectVpn() }
+                        } label: {
+                            Label("Thử lại ngầm", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered).foregroundStyle(.white)
+                    } else if model.vpnStatus == .disconnected {
+                        Button {
+                            Task { await model.manualReconnectVpn() }
+                        } label: {
+                            Label("Kết nối lại ngầm", systemImage: "play.circle.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+
+                        Button {
+                            model.openFortiClientApp()
+                        } label: {
+                            Label("Mở FortiClient", systemImage: "arrow.up.forward.app")
+                        }
+                        .buttonStyle(.bordered).foregroundStyle(.white.opacity(0.9))
+                    } else {
+                        Button("Tạo job") {
+                            draftJob = JobDraft(); draftJob.workerId = model.localWorkerId ?? ""
+                            jobError = ""; showingJob = true
+                        }.buttonStyle(.borderedProminent)
+
+                        Button("Xem lịch sử") { selectedTab = 4 }
+                            .buttonStyle(.bordered).foregroundStyle(.white)
+
+                        Button {
+                            model.openFortiClientApp()
+                        } label: {
+                            Label("Mở FortiClient", systemImage: "arrow.up.forward.app")
+                        }
+                        .buttonStyle(.bordered).foregroundStyle(.white.opacity(0.9))
+                    }
+
+                    Button {
+                        Task { await model.checkVpnHealth() }
+                    } label: {
+                        if model.vpnProbing {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Label("Kiểm tra Ping", systemImage: "waveform.path.ecg")
+                        }
+                    }
+                    .buttonStyle(.bordered).foregroundStyle(.white.opacity(0.9))
+                    .disabled(model.vpnProbing)
+                }
+                .padding(.top, 4)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            // Right Column: ExpressVPN Style Radar Pulse Wave View
+            VpnRadarWaveView(
+                status: model.vpnStatus,
+                latencyMs: model.vpnLatencyMs,
+                gatewayIp: model.vpnGatewayIp,
+                isAutoReconnect: model.vpnAutoReconnect,
+                onAction: {
+                    Task {
+                        if model.vpnStatus == .connected {
+                            await model.checkVpnHealth()
+                        } else {
+                            await model.manualReconnectVpn()
+                        }
+                    }
+                }
+            )
+            .frame(width: 270, height: 230)
+        }
+        .padding(26)
+        .background(AppPalette.navy, in: RoundedRectangle(cornerRadius: 22))
+        .overlay(
+            RoundedRectangle(cornerRadius: 22)
+                .stroke(vpnColor.opacity(0.35), lineWidth: 1.5)
+        )
     }
 
     private func stat(_ title: String, _ value: Int, _ icon: String, _ subtitle: String) -> some View {
@@ -1815,6 +3259,803 @@ private struct AppView: View {
         case "RETRYABLE": return "Chờ kết nối"
         default: return status
         }
+    }
+
+    // MARK: - Server Control (dev, qc, uat, demo)
+
+    private var serverControl: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                // Header Section
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("AWS ECS CLOUD PIPELINES").font(.caption.bold()).tracking(1.5).foregroundStyle(AppPalette.blue)
+                        Text("Bật / Tắt Server Môi Trường").font(.largeTitle.bold())
+                        Text("Điều khiển Start/Stop và Restart dịch vụ ECS cluster qua Bitbucket Pipelines.")
+                            .font(.body).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    HStack(spacing: 10) {
+                        Button {
+                            draftPipelineConfig = model.pipelineConfig
+                            showingPipelineConfig = true
+                        } label: {
+                            Label("Cấu hình nâng cao", systemImage: "gearshape")
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button {
+                            let repo = model.pipelineConfig.repository.isEmpty ? "msm-software/digifact-utilities" : model.pipelineConfig.repository
+                            if let url = URL(string: "https://bitbucket.org/\(repo)/pipelines") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        } label: {
+                            Label("Mở Bitbucket", systemImage: "safari")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+
+                // Bitbucket Authentication Header (Clean, Pro Max - Account Only)
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack {
+                        HStack(spacing: 10) {
+                            Image(systemName: "person.crop.circle.badge.checkmark")
+                                .font(.title2)
+                                .foregroundStyle(model.hasValidPipelineAuth() ? AppPalette.mint : .orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Tài khoản Bitbucket Pipelines").font(.headline.bold())
+                                Text("Chọn tài khoản để tự động nạp cấu hình xác thực cho toàn bộ thao tác Bật/Tắt Server.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        if model.hasValidPipelineAuth() {
+                            Label("Sẵn sàng hoạt động", systemImage: "checkmark.circle.fill")
+                                .font(.caption.bold())
+                                .foregroundStyle(AppPalette.mint)
+                                .padding(.horizontal, 10).padding(.vertical, 4)
+                                .background(AppPalette.mint.opacity(0.15), in: Capsule())
+                        } else {
+                            Label("Cần chọn Account", systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption.bold())
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 10).padding(.vertical, 4)
+                                .background(Color.orange.opacity(0.15), in: Capsule())
+                        }
+                    }
+
+                    HStack(spacing: 16) {
+                        // Dropdown chọn Account
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Tài khoản trong App:").font(.caption.bold()).foregroundStyle(.secondary)
+                            if model.accounts.isEmpty {
+                                HStack(spacing: 6) {
+                                    Text("Chưa có account trong app").font(.caption).foregroundStyle(.orange)
+                                    Button("Thêm Account") { selectedTab = 1 }.buttonStyle(.bordered).controlSize(.small)
+                                }
+                            } else {
+                                Picker("", selection: Binding(
+                                    get: { model.pipelineConfig.selectedAccountId },
+                                    set: { newId in
+                                        model.selectAccountAndAutofill(newId)
+                                    }
+                                )) {
+                                    Text("-- Chọn Account --").tag("")
+                                    ForEach(model.accounts) { acc in
+                                        Text("👤 \(acc.name) (\(acc.username ?? "Session/OAuth"))").tag(acc.id)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .labelsHidden()
+                                .frame(minWidth: 280)
+                            }
+                        }
+
+                        // Branch Selector
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Branch Pipeline:").font(.caption.bold()).foregroundStyle(.secondary)
+                            Picker("", selection: Binding(
+                                get: { model.pipelineConfig.branch },
+                                set: { newBranch in
+                                    model.pipelineConfig.branch = newBranch
+                                    model.savePipelineConfig(model.pipelineConfig)
+                                }
+                            )) {
+                                Text("devops (Chuẩn)").tag("devops")
+                                Text("main").tag("main")
+                                Text("scheduled").tag("scheduled")
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                            .frame(width: 150)
+                        }
+
+                        Spacer()
+
+                        // Action Buttons
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Thao tác").font(.caption.bold()).foregroundStyle(.secondary).opacity(0)
+                            HStack(spacing: 8) {
+                                Button {
+                                    Task { await model.testPipelineConnection(config: model.pipelineConfig) }
+                                } label: {
+                                    if model.pipelineTesting {
+                                        ProgressView().controlSize(.small)
+                                    } else {
+                                        Label("Kiểm tra kết nối", systemImage: "network")
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(model.pipelineTesting)
+
+                                Button {
+                                    showingPipelineConfig = true
+                                } label: {
+                                    Label("Cấu hình nâng cao", systemImage: "gearshape")
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                    }
+
+                    // Tóm tắt trạng thái liên kết
+                    if !model.pipelineConfig.selectedAccountId.isEmpty,
+                       let acc = model.accounts.first(where: { $0.id == model.pipelineConfig.selectedAccountId }) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.seal.fill").foregroundStyle(AppPalette.mint)
+                            Text("Đang liên kết với: \(acc.name) · Tự động nạp Cookie & CSRF ngầm và lưu cố định (không thay đổi).")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+
+                    if !model.pipelineStatusMessage.isEmpty {
+                        Text(model.pipelineStatusMessage)
+                            .font(.caption)
+                            .foregroundStyle(model.pipelineStatusMessage.contains("thất bại") || model.pipelineStatusMessage.contains("Thiếu") || model.pipelineStatusMessage.contains("Lỗi") ? .red : AppPalette.mint)
+                    }
+                    if !model.pipelineTestMessage.isEmpty {
+                        Text(model.pipelineTestMessage)
+                            .font(.caption)
+                            .foregroundStyle(model.pipelineTestMessage.contains("thành công") ? AppPalette.mint : .red)
+                    }
+                }
+                .padding(18)
+                .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .stroke(model.hasValidPipelineAuth() ? AppPalette.mint.opacity(0.4) : Color.orange.opacity(0.4), lineWidth: 1.5)
+                )
+
+                // Active feedback banner
+                if model.pipelineBusy {
+                    HStack(spacing: 12) {
+                        ProgressView().controlSize(.small)
+                        Text("Đang gửi yêu cầu kích hoạt pipeline lên Bitbucket...")
+                            .font(.subheadline.bold())
+                    }
+                    .padding(14).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(AppPalette.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                } else if let last = model.lastTriggeredLog {
+                    HStack(spacing: 14) {
+                        Image(systemName: last.status == "SUCCESS" ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                            .font(.title3)
+                            .foregroundStyle(last.status == "SUCCESS" ? AppPalette.mint : .red)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(last.message).font(.subheadline.bold())
+                            if let num = last.buildNumber {
+                                Text("Build #\(num) · \(displayDate(last.timestamp))").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        if let link = last.pipelineUrl, let url = URL(string: link) {
+                            Button {
+                                NSWorkspace.shared.open(url)
+                            } label: {
+                                Label("Xem Pipeline", systemImage: "safari")
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    .padding(14)
+                    .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 12))
+                }
+
+                // 4 Environment Cards in Grid
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 460), spacing: 20)], spacing: 20) {
+                    environmentCard(
+                        env: "dev",
+                        title: "Môi trường DEV",
+                        subtitle: "Phát triển & thử nghiệm nội bộ",
+                        clusterName: "msm-digifact-dev-ecs-cluster",
+                        accentColor: AppPalette.blue,
+                        icon: "hammer.fill"
+                    )
+
+                    environmentCard(
+                        env: "qc",
+                        title: "Môi trường QC",
+                        subtitle: "Kiểm thử chất lượng & QA",
+                        clusterName: "msm-digifact-qc-ecs-cluster",
+                        accentColor: Color.orange,
+                        icon: "checkmark.shield.fill"
+                    )
+
+                    environmentCard(
+                        env: "uat",
+                        title: "Môi trường UAT",
+                        subtitle: "Nghiệm thu tính năng",
+                        clusterName: "msm-digifact-uat-ecs-cluster",
+                        accentColor: Color(red: 0.6, green: 0.35, blue: 0.85),
+                        icon: "person.3.fill"
+                    )
+
+                    environmentCard(
+                        env: "demo",
+                        title: "Môi trường DEMO",
+                        subtitle: "Trình diễn đối tác & khách hàng",
+                        clusterName: "msm-digifact-demo-ecs-cluster",
+                        accentColor: AppPalette.mint,
+                        icon: "sparkles"
+                    )
+                }
+
+                // Live Activity & Terminal Output
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Label("Nhật ký thực thi (Live Console)", systemImage: "terminal.fill")
+                            .font(.headline.bold())
+                        Spacer()
+                        if !model.pipelineConsoleLogs.isEmpty {
+                            Button("Xóa nhật ký") {
+                                model.pipelineConsoleLogs.removeAll()
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 4) {
+                            if model.pipelineConsoleLogs.isEmpty {
+                                Text("Chưa có lệnh nào được gửi. Bấm BẬT SERVER hoặc TẮT SERVER để xem diễn biến tại đây.")
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(model.pipelineConsoleLogs, id: \.self) { line in
+                                    Text(line)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(line.contains("❌") ? .red : line.contains("✅") || line.contains("🎉") ? AppPalette.mint : .primary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                        }
+                        .padding(12)
+                    }
+                    .frame(height: 120)
+                    .background(Color.black.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.08), lineWidth: 1))
+                }
+                .padding(18)
+                .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 14))
+
+                // Recent pipeline triggers history table
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Lịch sử kích hoạt Pipeline").font(.title2.bold())
+                            Text("Các lượt gửi lệnh bật/tắt và restart từ máy này").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if !model.pipelineLogs.isEmpty {
+                            Button("Xóa lịch sử") {
+                                model.clearPipelineLogs()
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if model.pipelineLogs.isEmpty {
+                        HStack(spacing: 14) {
+                            Image(systemName: "server.rack").font(.title2).foregroundStyle(AppPalette.blue)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Chưa có lượt kích hoạt nào").font(.headline)
+                                Text("Khi bạn bật hoặc tắt server, lịch sử và link xem pipeline trên Bitbucket sẽ hiển thị tại đây.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(20)
+                        .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 14))
+                    } else {
+                        VStack(spacing: 8) {
+                            ForEach(model.pipelineLogs) { log in
+                                pipelineLogItemView(log)
+                            }
+                        }
+                    }
+                }
+                .padding(.top, 10)
+            }
+            .padding(28)
+        }
+        .alert(
+            serverActionToConfirm?.title ?? "Xác nhận thao tác Server",
+            isPresented: Binding(
+                get: { serverActionToConfirm != nil },
+                set: { if !$0 { serverActionToConfirm = nil } }
+            ),
+            presenting: serverActionToConfirm
+        ) { action in
+            Button(action.title, role: action.action == "stop" ? .destructive : nil) {
+                Task {
+                    if action.action == "start" || action.action == "stop" {
+                        await model.triggerEnvironmentPipeline(env: action.env, action: action.action, services: action.services)
+                    } else if action.action == "restart-all" {
+                        await model.triggerRestartAllServices(env: action.env)
+                    } else if action.action == "restart-service", let sName = action.serviceName {
+                        await model.triggerRestartOneService(env: action.env, service: sName)
+                    }
+                }
+                serverActionToConfirm = nil
+            }
+            Button("Hủy", role: .cancel) { serverActionToConfirm = nil }
+        } message: { action in
+            Text(action.message)
+        }
+        .alert("Chưa thiết lập xác thực Bitbucket", isPresented: $missingCredentialAlert) {
+            if model.pipelineConfig.authType == "session" {
+                Button("Dán từ Clipboard") {
+                    model.parseAndApplyClipboard()
+                }
+                Button("Đăng nhập Bitbucket trong App") {
+                    showingLoginWebView = true
+                }
+            }
+            Button("Đóng", role: .cancel) {}
+        } message: {
+            Text("Vui lòng chọn Tài khoản trong App hoặc nhập Cookie/Token ở khung 'Xác thực Bitbucket Pipelines' phía trên rồi bấm 'Lưu cố định' trước khi thực hiện thao tác.")
+        }
+        .sheet(isPresented: $showingLoginWebView) {
+            BitbucketLoginSheet(isPresented: $showingLoginWebView) { cookie, csrf in
+                model.pipelineConfig.cookie = cookie
+                if !csrf.isEmpty { model.pipelineConfig.csrfToken = csrf }
+                model.savePipelineConfig(model.pipelineConfig)
+                model.logConsole("✅ Đã tự động cập nhật Cookie & CSRF từ trình duyệt app!")
+                showingLoginWebView = false
+            }
+        }
+        .alert(
+            model.executionAlertResult?.title ?? "Kết quả Pipeline",
+            isPresented: Binding(
+                get: { model.executionAlertResult != nil },
+                set: { if !$0 { model.executionAlertResult = nil } }
+            ),
+            presenting: model.executionAlertResult
+        ) { result in
+            if let link = result.url, let url = URL(string: link) {
+                Button("Mở xem trên Bitbucket") {
+                    NSWorkspace.shared.open(url)
+                    model.executionAlertResult = nil
+                }
+            }
+            Button("Đóng", role: .cancel) {
+                model.executionAlertResult = nil
+            }
+        } message: { result in
+            Text(result.message)
+        }
+    }
+
+    @ViewBuilder
+    private func environmentCard(
+        env: String,
+        title: String,
+        subtitle: String,
+        clusterName: String,
+        accentColor: Color,
+        icon: String
+    ) -> some View {
+        let scopeBinding = Binding<String>(
+            get: { selectedEnvScopes[env] ?? "All" },
+            set: { selectedEnvScopes[env] = $0 }
+        )
+        let restartServiceBinding = Binding<String>(
+            get: { selectedEnvRestartService[env] ?? "core-fe" },
+            set: { selectedEnvRestartService[env] = $0 }
+        )
+        let currentScope = selectedEnvScopes[env] ?? "All"
+
+        VStack(alignment: .leading, spacing: 16) {
+            // Header
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.title2)
+                    .foregroundStyle(accentColor)
+                    .frame(width: 44, height: 44)
+                    .background(accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text(title).font(.title3.bold())
+                        Text(env.uppercased())
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .background(accentColor.opacity(0.18), in: Capsule())
+                            .foregroundStyle(accentColor)
+                    }
+                    Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            // Cluster info tag
+            HStack(spacing: 6) {
+                Image(systemName: "cpu")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Text(clusterName)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
+
+            // Scope Selector
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Phạm vi thao tác (Services):").font(.caption.bold()).foregroundStyle(.secondary)
+                Picker("Phạm vi", selection: scopeBinding) {
+                    Text("Tất cả dịch vụ (All)").tag("All")
+                    Text("Chỉ Database").tag("Database")
+                }
+                .pickerStyle(.segmented)
+            }
+
+            // Main Actions (START / STOP)
+            HStack(spacing: 12) {
+                // START Button
+                Button {
+                    if !model.hasValidPipelineAuth() {
+                        missingCredentialAlert = true
+                    } else {
+                        Task {
+                            await model.triggerEnvironmentPipeline(env: env, action: "start", services: currentScope)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "play.fill")
+                        Text("BẬT SERVER")
+                            .font(.subheadline.bold())
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(AppPalette.mint, in: RoundedRectangle(cornerRadius: 10))
+                    .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+                .disabled(model.pipelineBusy)
+
+                // STOP Button
+                Button {
+                    if !model.hasValidPipelineAuth() {
+                        missingCredentialAlert = true
+                    } else {
+                        serverActionToConfirm = ServerActionConfirmation(
+                            env: env,
+                            action: "stop",
+                            services: currentScope,
+                            serviceName: nil,
+                            title: "Tắt server \(env.uppercased())",
+                            message: "Bạn có chắc chắn muốn TẮT \(currentScope == "All" ? "tất cả dịch vụ" : "Database") trên môi trường \(env.uppercased()) (\(clusterName)) không?"
+                        )
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "stop.fill")
+                        Text("TẮT SERVER")
+                            .font(.subheadline.bold())
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(Color.red.opacity(0.9), in: RoundedRectangle(cornerRadius: 10))
+                    .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+                .disabled(model.pipelineBusy)
+            }
+
+            Divider()
+
+            // Advanced Service Operations (Restart)
+            VStack(alignment: .leading, spacing: 10) {
+                Text("KHỞI ĐỘNG LẠI (RESTART)").font(.caption2.bold()).tracking(1.1).foregroundStyle(.secondary)
+
+                HStack(spacing: 10) {
+                    Button {
+                        if !model.hasValidPipelineAuth() {
+                            missingCredentialAlert = true
+                        } else {
+                            serverActionToConfirm = ServerActionConfirmation(
+                                env: env,
+                                action: "restart-all",
+                                services: "All",
+                                serviceName: nil,
+                                title: "Restart tất cả services \(env.uppercased())",
+                                message: "Khởi động lại toàn bộ ECS services trên môi trường \(env.uppercased())?"
+                            )
+                        }
+                    } label: {
+                        Label("Restart tất cả", systemImage: "arrow.clockwise")
+                            .font(.caption.bold())
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.pipelineBusy)
+
+                    Spacer()
+                }
+
+                HStack(spacing: 8) {
+                    Picker("", selection: restartServiceBinding) {
+                        ForEach(kAvailableServices, id: \.self) { sName in
+                            Text(sName).tag(sName)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+
+                    Button {
+                        if !model.hasValidPipelineAuth() {
+                            missingCredentialAlert = true
+                        } else {
+                            let targetService = selectedEnvRestartService[env] ?? "core-fe"
+                            serverActionToConfirm = ServerActionConfirmation(
+                                env: env,
+                                action: "restart-service",
+                                services: targetService,
+                                serviceName: targetService,
+                                title: "Restart \(targetService)",
+                                message: "Khởi động lại dịch vụ \(targetService) trên môi trường \(env.uppercased())?"
+                            )
+                        }
+                    } label: {
+                        Text("Restart Service")
+                            .font(.caption.bold())
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.pipelineBusy)
+                }
+            }
+        }
+        .padding(20)
+        .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(accentColor.opacity(0.2), lineWidth: 1)
+        )
+    }
+
+    private func pipelineLogItemView(_ log: PipelineTriggerLog) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: log.status == "SUCCESS" ? "checkmark.circle.fill" : log.status == "FAILED" ? "xmark.circle.fill" : "clock.fill")
+                .foregroundStyle(log.status == "SUCCESS" ? AppPalette.mint : log.status == "FAILED" ? .red : .orange)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(log.env.uppercased())
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(envColor(log.env).opacity(0.18), in: RoundedRectangle(cornerRadius: 4))
+                        .foregroundStyle(envColor(log.env))
+
+                    Text(actionDisplayTitle(log.action))
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(actionColor(log.action).opacity(0.18), in: RoundedRectangle(cornerRadius: 4))
+                        .foregroundStyle(actionColor(log.action))
+
+                    Text(log.services).font(.caption.bold())
+
+                    if let num = log.buildNumber {
+                        Text("#\(num)").font(.caption.monospaced()).foregroundStyle(.secondary)
+                    }
+                }
+                Text(log.message).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+
+            Spacer()
+
+            Text(displayDate(log.timestamp)).font(.caption2).foregroundStyle(.secondary)
+
+            if let link = log.pipelineUrl, let url = URL(string: link) {
+                Button {
+                    NSWorkspace.shared.open(url)
+                } label: {
+                    Image(systemName: "arrow.up.right.square")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(AppPalette.blue)
+            }
+        }
+        .padding(12)
+        .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func envColor(_ env: String) -> Color {
+        switch env.lowercased() {
+        case "dev": return AppPalette.blue
+        case "qc": return Color.orange
+        case "uat": return Color(red: 0.6, green: 0.35, blue: 0.85)
+        case "demo": return AppPalette.mint
+        default: return .secondary
+        }
+    }
+
+    private func actionDisplayTitle(_ action: String) -> String {
+        switch action {
+        case "start": return "BẬT"
+        case "stop": return "TẮT"
+        case "restart-all": return "RESTART ALL"
+        case "restart-service": return "RESTART 1 SVC"
+        default: return action.uppercased()
+        }
+    }
+
+    private func actionColor(_ action: String) -> Color {
+        switch action {
+        case "start": return AppPalette.mint
+        case "stop": return .red
+        case "restart-all": return AppPalette.blue
+        case "restart-service": return Color(red: 0.6, green: 0.35, blue: 0.85)
+        default: return .secondary
+        }
+    }
+
+    private var pipelineConfigSheet: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Cấu hình Bitbucket Pipelines").font(.headline.bold())
+                    Text("Thiết lập Repository và phương thức xác thực để kích hoạt pipeline bật/tắt server.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    showingPipelineConfig = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill").font(.title3).foregroundStyle(.secondary)
+                }.buttonStyle(.plain)
+            }
+            .padding(.horizontal, 24).padding(.vertical, 16)
+            .background(AppPalette.surface)
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    // Repo & Branch
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("THÔNG TIN REPOSITORY").font(.caption.bold()).tracking(1.2).foregroundStyle(AppPalette.blue)
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Repository Slug (workspace/repo)").font(.caption).foregroundStyle(.secondary)
+                                TextField("msm-software/digifact-utilities", text: $draftPipelineConfig.repository)
+                                    .textFieldStyle(.roundedBorder)
+                            }
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Branch").font(.caption).foregroundStyle(.secondary)
+                                TextField("main", text: $draftPipelineConfig.branch)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 140)
+                            }
+                        }
+                    }
+                    .padding(16)
+                    .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 12))
+
+                    // Auth Type
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("XÁC THỰC BITBUCKET").font(.caption.bold()).tracking(1.2).foregroundStyle(AppPalette.blue)
+                        Picker("Phương thức xác thực", selection: $draftPipelineConfig.authType) {
+                            Text("Session Cookie & CSRF").tag("session")
+                            Text("App Password / Token").tag("token")
+                            Text("Dùng Account trong app").tag("account")
+                        }
+                        .pickerStyle(.segmented)
+
+                        if draftPipelineConfig.authType == "session" {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Label("Sử dụng thông tin phiên làm việc từ trình duyệt (như trong cURL / Network tab)", systemImage: "info.circle")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("CSRF Token (x-csrftoken)").font(.caption).foregroundStyle(.secondary)
+                                    TextField("1rfIZh8UmWS7a162UeggG2niaPCrYM7z", text: $draftPipelineConfig.csrfToken)
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.system(.body, design: .monospaced))
+                                }
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Session Cookie").font(.caption).foregroundStyle(.secondary)
+                                    SecureField("bb_session=...; cloud.session.token=...", text: $draftPipelineConfig.cookie)
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.system(.body, design: .monospaced))
+                                }
+                            }
+                        } else if draftPipelineConfig.authType == "token" {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Label("Tạo App Password trên Bitbucket Settings > Personal Bitbucket settings > App passwords với quyền Pipelines: Write", systemImage: "key.fill")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Atlassian Username").font(.caption).foregroundStyle(.secondary)
+                                    TextField("username", text: $draftPipelineConfig.username)
+                                        .textFieldStyle(.roundedBorder)
+                                }
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("App Password / Access Token").font(.caption).foregroundStyle(.secondary)
+                                    SecureField("App Password hoặc Bearer Token", text: $draftPipelineConfig.token)
+                                        .textFieldStyle(.roundedBorder)
+                                }
+                            }
+                        } else {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Chọn Bitbucket Account đã kết nối").font(.caption).foregroundStyle(.secondary)
+                                Picker("Account", selection: $draftPipelineConfig.selectedAccountId) {
+                                    Text("-- Chọn Account --").tag("")
+                                    ForEach(model.accounts) { acc in
+                                        Text("\(acc.name) (\(acc.username ?? "Token"))").tag(acc.id)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                            }
+                        }
+                    }
+                    .padding(16)
+                    .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 12))
+
+                    // Test result message
+                    if !model.pipelineTestMessage.isEmpty {
+                        HStack(spacing: 8) {
+                            Image(systemName: model.pipelineTestMessage.contains("thành công") ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                .foregroundStyle(model.pipelineTestMessage.contains("thành công") ? AppPalette.mint : .red)
+                            Text(model.pipelineTestMessage)
+                                .font(.caption).foregroundStyle(.primary)
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+                .padding(24)
+            }
+
+            Divider()
+            HStack(spacing: 12) {
+                Button {
+                    Task { await model.testPipelineConnection(config: draftPipelineConfig) }
+                } label: {
+                    if model.pipelineTesting {
+                        ProgressView().controlSize(.small)
+                        Text("Đang kiểm tra...")
+                    } else {
+                        Label("Kiểm tra kết nối", systemImage: "network")
+                    }
+                }
+                .disabled(model.pipelineTesting)
+
+                Spacer()
+
+                Button("Hủy") {
+                    showingPipelineConfig = false
+                }
+
+                Button("Lưu cấu hình") {
+                    model.savePipelineConfig(draftPipelineConfig)
+                    showingPipelineConfig = false
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(.horizontal, 24).padding(.vertical, 14)
+            .background(AppPalette.surface)
+        }
+        .frame(width: 580, height: 500)
     }
 
     private func displayDate(_ value: String) -> String {
