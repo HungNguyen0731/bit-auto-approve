@@ -1445,6 +1445,7 @@ private let kAvailableServices: [String] = [
         UserDefaults.standard.set(vpnAutoReconnect, forKey: "vpnAutoReconnect")
         logConsole(vpnAutoReconnect ? "🟢 [VPN] Đã BẬT tự động kết nối lại khi mất VPN." : "⚪ [VPN] Đã TẮT tự động kết nối lại.")
         if vpnAutoReconnect && vpnStatus == .disconnected {
+            isUserManualDisconnect = false
             Task { await manualReconnectVpn() }
         }
     }
@@ -1455,7 +1456,7 @@ private let kAvailableServices: [String] = [
         isUserManualDisconnect = true
         vpnStatusMessage = "Đã dừng kết nối lại VPN."
         logConsole("⏹️ [VPN] Người dùng đã hủy tiến trình kết nối lại.")
-        triggerVpnDisconnect()
+        Task { await runConnectorScript(action: "disconnect") }
     }
 
     func manualDisconnectVpn() async {
@@ -1464,14 +1465,14 @@ private let kAvailableServices: [String] = [
         vpnReconnectAttempts = 0
         vpnStatusMessage = "Đã chủ động ngắt kết nối theo yêu cầu."
         logConsole("🔌 [VPN] Người dùng chủ động ngắt kết nối VPN.")
-        triggerVpnDisconnect()
+        await runConnectorScript(action: "disconnect")
     }
 
     func checkVpnHealth() async {
         guard !vpnProbing && vpnStatus != .reconnecting else { return }
 
         let gateway = vpnGatewayIp
-        let probe = await probeVpnGateway(host: gateway, port: 443, timeoutSeconds: 1.2)
+        let probe = await probeVpnGateway(host: gateway, port: 443, timeoutSeconds: 1.0)
         let tunnel = getActiveVpnTunnelInfo()
 
         vpnLastChecked = Date()
@@ -1492,7 +1493,7 @@ private let kAvailableServices: [String] = [
                 vpnReconnectAttempts = 0
                 vpnStatusMessage = "Đã ngắt kết nối theo yêu cầu. Bấm nút nguồn để kết nối lại."
             } else if vpnAutoReconnect {
-                logConsole("⚡ [VPN] Mất kết nối VPN ngoài ý muốn! Đang tự động kết nối lại...")
+                logConsole("⚡ [VPN] Phát hiện mất kết nối VPN! Đang tự động kết nối lại...")
                 await executeReconnectFlow(manual: false)
             } else {
                 vpnStatus = .disconnected
@@ -1513,56 +1514,58 @@ private let kAvailableServices: [String] = [
         defer { vpnProbing = false }
 
         vpnStatus = .reconnecting
-        vpnReconnectAttempts = manual ? 1 : (vpnReconnectAttempts + 1)
-        vpnStatusMessage = "Đang kết nối lại chạy ẩn (Lần \(vpnReconnectAttempts)/3)..."
-        logConsole("🔄 [VPN] Bắt đầu kết nối lại ở chế độ chạy ẩn (Lần \(vpnReconnectAttempts)/3)...")
+        let maxAttempts = manual ? 1 : 3
 
-        // 1. Trigger background connection headlessly
-        triggerVpnReconnect()
-
-        // 2. Poll every 1.5s up to 10.5 seconds timeout (7 steps)
-        var connected = false
-        for _ in 1...7 {
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
+        for attempt in 1...maxAttempts {
             if vpnStatus != .reconnecting {
-                // User clicked Cancel
-                triggerVpnDisconnect()
+                // User clicked cancel
+                await runConnectorScript(action: "disconnect")
                 return
             }
 
-            let tunnel = getActiveVpnTunnelInfo()
-            let probe = await probeVpnGateway(host: vpnGatewayIp, port: 443, timeoutSeconds: 1.0)
-            if tunnel.hasTunnel, let ip = tunnel.ip, !ip.isEmpty {
-                connected = true
-                vpnTunnelIp = ip
-                vpnTunnelInterface = tunnel.interface
-                vpnLatencyMs = probe.reachable ? probe.latencyMs : nil
-                break
+            vpnReconnectAttempts = attempt
+            vpnStatusMessage = "Đang kết nối lại chạy ẩn (Lần \(attempt)/\(maxAttempts))..."
+            logConsole("🔄 [VPN] Bắt đầu kết nối lại ở chế độ chạy ẩn (Lần \(attempt)/\(maxAttempts))...")
+
+            // 1. Dispatch headless connect command via node script
+            await runConnectorScript(action: "connect")
+
+            // 2. Poll every 1.0s up to 6 seconds for tunnel to appear
+            for _ in 1...6 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if vpnStatus != .reconnecting {
+                    await runConnectorScript(action: "disconnect")
+                    return
+                }
+
+                let tunnel = getActiveVpnTunnelInfo()
+                if tunnel.hasTunnel, let ip = tunnel.ip, !ip.isEmpty {
+                    let probe = await probeVpnGateway(host: vpnGatewayIp, port: 443, timeoutSeconds: 1.0)
+                    vpnStatus = .connected
+                    vpnReconnectAttempts = 0
+                    isUserManualDisconnect = false
+                    vpnTunnelIp = ip
+                    vpnTunnelInterface = tunnel.interface
+                    vpnLatencyMs = probe.reachable ? probe.latencyMs : nil
+                    let msText = probe.reachable ? " (\(String(format: "%.1f", probe.latencyMs)) ms)" : ""
+                    vpnStatusMessage = "FortiClient VPN đã kết nối an toàn [\(tunnel.interface ?? "utun"): \(ip)]\(msText)"
+                    logConsole("✅ [VPN] Đã kết nối lại thành công tới \(vpnGatewayIp) [\(ip)]!")
+                    return
+                }
+            }
+
+            if attempt < maxAttempts {
+                vpnStatusMessage = "Chưa nhận IP tunnel. Thử lại sau 3s (Lần \(attempt + 1)/\(maxAttempts))..."
+                logConsole("⚠️ [VPN] Lần \(attempt) chưa thông tunnel. Chuẩn bị thử lại...")
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
             }
         }
 
-        if connected {
-            vpnStatus = .connected
-            vpnReconnectAttempts = 0
-            vpnStatusMessage = "FortiClient VPN đã kết nối an toàn"
-            logConsole("✅ [VPN] Kết nối thành công tới \(vpnGatewayIp)!")
-        } else {
-            // Failed: Clean up dangling tunnel state to prevent getting stuck
-            triggerVpnDisconnect()
-            if vpnAutoReconnect && vpnReconnectAttempts < 3 && !manual {
-                vpnStatusMessage = "Kết nối bị ngắt bất ngờ. Thử lại sau 5s (Lần \(vpnReconnectAttempts)/3)..."
-                logConsole("⚠️ [VPN] Lượt kết nối chưa thành công. Tự động thử lại sau 5s...")
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                if vpnAutoReconnect && vpnStatus == .reconnecting {
-                    await executeReconnectFlow(manual: false)
-                }
-            } else {
-                vpnStatus = .disconnected
-                vpnReconnectAttempts = 0
-                vpnStatusMessage = "Kết nối bị ngắt bất ngờ (Terminated). Đã dừng để tránh treo."
-                logConsole("❌ [VPN] Kết nối không thành công. Đã đưa về trạng thái Ngắt kết nối.")
-            }
-        }
+        // All attempts finished without connection
+        vpnStatus = .disconnected
+        vpnReconnectAttempts = 0
+        vpnStatusMessage = "Không thể tự kết nối sau \(maxAttempts) lần thử. Bấm nút nguồn để thử lại."
+        logConsole("❌ [VPN] Tự động kết nối không thành công sau \(maxAttempts) lần thử.")
     }
 
     func openFortiClientApp() {
@@ -1578,17 +1581,7 @@ private let kAvailableServices: [String] = [
         }
     }
 
-    private func triggerVpnReconnect() {
-        logConsole("🔄 [VPN] Gửi lệnh kết nối ngầm (Background Headless)...")
-        runConnectorScript(action: "connect")
-    }
-
-    private func triggerVpnDisconnect() {
-        logConsole("⏹️ [VPN] Dọn dẹp session VPN ngầm...")
-        runConnectorScript(action: "disconnect")
-    }
-
-    private func runConnectorScript(action: String) {
+    private func runConnectorScript(action: String) async {
         var scriptPath = Bundle.main.path(forResource: "forticlient_connector", ofType: "js")
         if scriptPath == nil {
             let devPath = "/Users/hungnv/DigifactoryBTM/bitbucket-pr-approver/macos-app/Assets/forticlient_connector.js"
@@ -1596,16 +1589,41 @@ private let kAvailableServices: [String] = [
                 scriptPath = devPath
             }
         }
-        guard let path = scriptPath else { return }
+        guard let path = scriptPath else {
+            logConsole("⚠️ Không tìm thấy script forticlient_connector.js")
+            return
+        }
 
         let nodeExecutable = FileManager.default.fileExists(atPath: "/usr/local/bin/node")
             ? "/usr/local/bin/node"
-            : "/usr/bin/node"
+            : (FileManager.default.fileExists(atPath: "/opt/homebrew/bin/node") ? "/opt/homebrew/bin/node" : "/usr/bin/node")
 
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: nodeExecutable)
-        p.arguments = [path, action]
-        try? p.run()
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: nodeExecutable)
+                p.arguments = [path, action]
+                let pipe = Pipe()
+                p.standardOutput = pipe
+                p.standardError = pipe
+                do {
+                    try p.run()
+                    p.waitUntilExit()
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let out = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if !out.isEmpty {
+                        Task { @MainActor in
+                            self.logConsole("📡 [Connector] \(out.prefix(120))")
+                        }
+                    }
+                } catch {
+                    Task { @MainActor in
+                        self.logConsole("❌ [Connector] Lỗi thực thi: \(error.localizedDescription)")
+                    }
+                }
+                continuation.resume()
+            }
+        }
     }
 
     private func isFortiTunnelProcessRunning() -> Bool {
