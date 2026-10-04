@@ -992,6 +992,10 @@ private let kAvailableServices: [String] = [
         ud.set(cleanCfg.username, forKey: "bb_pipeline_username")
         ud.set(cleanCfg.selectedAccountId, forKey: "bb_pipeline_acc_id")
 
+        if !cleanCfg.selectedAccountId.isEmpty {
+            saveCredentialsForAccount(cleanCfg.selectedAccountId, cookie: cleanCfg.cookie, csrf: cleanCfg.csrfToken, token: cleanCfg.token)
+        }
+
         let secrets: [String: String] = [
             "token": cleanCfg.token,
             "cookie": cleanCfg.cookie,
@@ -1027,12 +1031,15 @@ private let kAvailableServices: [String] = [
     }
 
     func hasValidPipelineAuth() -> Bool {
+        let hasCookie = !sanitizeCookie(pipelineConfig.cookie).isEmpty
+        let hasToken = !pipelineConfig.token.isEmpty
         if pipelineConfig.authType == "account" {
-            return !pipelineConfig.selectedAccountId.isEmpty || !pipelineConfig.token.isEmpty || !sanitizeCookie(pipelineConfig.cookie).isEmpty
+            let hasAcc = !pipelineConfig.selectedAccountId.isEmpty
+            return hasAcc && (hasToken || hasCookie)
         } else if pipelineConfig.authType == "session" {
-            return !sanitizeCookie(pipelineConfig.cookie).isEmpty
+            return hasCookie
         } else {
-            return !pipelineConfig.token.isEmpty
+            return hasToken
         }
     }
 
@@ -1281,20 +1288,21 @@ private let kAvailableServices: [String] = [
             : pipelineConfig.branch.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let cleanCookie = sanitizeCookie(pipelineConfig.cookie)
-        let isSession = pipelineConfig.authType == "session" || (!cleanCookie.isEmpty && pipelineConfig.authType != "token" && pipelineConfig.token.isEmpty)
+        let hasToken = !pipelineConfig.token.isEmpty
+        let isSession = pipelineConfig.authType == "session" || (!cleanCookie.isEmpty && pipelineConfig.authType != "token" && !hasToken)
         let endpoint = isSession
             ? "https://bitbucket.org/!api/2.0/repositories/\(repo)/pipelines/"
             : "https://api.bitbucket.org/2.0/repositories/\(repo)/pipelines/"
 
-        if isSession && cleanCookie.isEmpty {
-            let msg = "Chưa có Session Cookie! Dán Cookie từ trình duyệt hoặc bấm 'Đăng nhập trong App'."
+        if cleanCookie.isEmpty && !hasToken {
+            let msg = "Thiếu thông tin xác thực Bitbucket! Vui lòng bấm 'Đăng nhập Bitbucket' hoặc 'Dán Cookie' để hoàn tất xác thực."
             logItem.status = "FAILED"
             logItem.message = msg
             logConsole("❌ \(msg)")
             appendPipelineLog(logItem)
             lastTriggeredLog = logItem
             pipelineStatusMessage = msg
-            executionAlertResult = AlertInfo(title: "Chưa có Cookie", message: msg, isSuccess: false, url: nil)
+            executionAlertResult = AlertInfo(title: "Chưa có xác thực Bitbucket", message: msg, isSuccess: false, url: nil)
             pipelineBusy = false
             return
         }
@@ -3354,13 +3362,13 @@ private struct AppView: View {
                         }
                         Spacer()
                         if model.hasValidPipelineAuth() {
-                            Label("Sẵn sàng hoạt động", systemImage: "checkmark.circle.fill")
+                            Label("Đã xác thực & Sẵn sàng", systemImage: "checkmark.circle.fill")
                                 .font(.caption.bold())
                                 .foregroundStyle(AppPalette.mint)
                                 .padding(.horizontal, 10).padding(.vertical, 4)
                                 .background(AppPalette.mint.opacity(0.15), in: Capsule())
                         } else {
-                            Label("Cần chọn Account", systemImage: "exclamationmark.triangle.fill")
+                            Label("Cần Cookie hoặc Token", systemImage: "exclamationmark.triangle.fill")
                                 .font(.caption.bold())
                                 .foregroundStyle(.orange)
                                 .padding(.horizontal, 10).padding(.vertical, 4)
@@ -3391,7 +3399,7 @@ private struct AppView: View {
                                 }
                                 .pickerStyle(.menu)
                                 .labelsHidden()
-                                .frame(minWidth: 280)
+                                .frame(minWidth: 260)
                             }
                         }
 
@@ -3411,7 +3419,29 @@ private struct AppView: View {
                             }
                             .pickerStyle(.menu)
                             .labelsHidden()
-                            .frame(width: 150)
+                            .frame(width: 140)
+                        }
+
+                        // Quick Auth Actions
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Xác thực nhanh:").font(.caption.bold()).foregroundStyle(.secondary)
+                            HStack(spacing: 8) {
+                                Button {
+                                    showingLoginWebView = true
+                                } label: {
+                                    Label("Đăng nhập Bitbucket", systemImage: "safari.fill")
+                                        .font(.caption.bold())
+                                }
+                                .buttonStyle(.borderedProminent)
+
+                                Button {
+                                    model.parseAndApplyClipboard()
+                                } label: {
+                                    Label("Dán Cookie", systemImage: "doc.on.clipboard")
+                                        .font(.caption)
+                                }
+                                .buttonStyle(.bordered)
+                            }
                         }
 
                         Spacer()
@@ -3648,22 +3678,23 @@ private struct AppView: View {
             Text(action.message)
         }
         .alert("Chưa thiết lập xác thực Bitbucket", isPresented: $missingCredentialAlert) {
-            if model.pipelineConfig.authType == "session" {
-                Button("Dán từ Clipboard") {
-                    model.parseAndApplyClipboard()
-                }
-                Button("Đăng nhập Bitbucket trong App") {
-                    showingLoginWebView = true
-                }
+            Button("Đăng nhập Bitbucket trong App") {
+                showingLoginWebView = true
+            }
+            Button("Dán từ Clipboard") {
+                model.parseAndApplyClipboard()
             }
             Button("Đóng", role: .cancel) {}
         } message: {
-            Text("Vui lòng chọn Tài khoản trong App hoặc nhập Cookie/Token ở khung 'Xác thực Bitbucket Pipelines' phía trên rồi bấm 'Lưu cố định' trước khi thực hiện thao tác.")
+            Text("Tài khoản chưa có Cookie phiên làm việc hoặc Token! Vui lòng bấm 'Đăng nhập Bitbucket trong App' hoặc 'Dán từ Clipboard' để nạp xác thực trước khi Bật/Tắt Server.")
         }
         .sheet(isPresented: $showingLoginWebView) {
             BitbucketLoginSheet(isPresented: $showingLoginWebView) { cookie, csrf in
                 model.pipelineConfig.cookie = cookie
                 if !csrf.isEmpty { model.pipelineConfig.csrfToken = csrf }
+                if !model.pipelineConfig.selectedAccountId.isEmpty {
+                    model.saveCredentialsForAccount(model.pipelineConfig.selectedAccountId, cookie: cookie, csrf: csrf, token: model.pipelineConfig.token)
+                }
                 model.savePipelineConfig(model.pipelineConfig)
                 model.logConsole("✅ Đã tự động cập nhật Cookie & CSRF từ trình duyệt app!")
                 showingLoginWebView = false
