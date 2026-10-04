@@ -5,6 +5,7 @@ import Darwin
 import CryptoKit
 import Security
 import WebKit
+import Network
 
 private struct APIError: Decodable { let code: String?; let message: String? }
 private struct Envelope<T: Decodable>: Decodable { let success: Bool; let data: T?; let error: APIError? }
@@ -314,6 +315,8 @@ private let kAvailableServices: [String] = [
     @Published var vpnStatusMessage: String = "Đang kiểm tra kết nối VPN..."
     @Published var vpnProbing: Bool = false
     @Published var isUserManualDisconnect: Bool = false
+    private let pathMonitor = NWPathMonitor()
+    private let pathMonitorQueue = DispatchQueue(label: "com.hungnv.vpn-path-monitor")
     private var historyGeneration = 0
     private var csrf = ""
     private let session: URLSession = {
@@ -336,6 +339,12 @@ private let kAvailableServices: [String] = [
 
     init() {
         loadPipelineConfig()
+        pathMonitor.pathUpdateHandler = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.checkVpnHealth()
+            }
+        }
+        pathMonitor.start(queue: pathMonitorQueue)
         Task { [weak self] in
             await self?.checkVpnHealth()
         }
@@ -1470,11 +1479,12 @@ private let kAvailableServices: [String] = [
         vpnTunnelIp = tunnel.ip
         vpnTunnelInterface = tunnel.interface
 
-        if tunnel.hasTunnel || (probe.reachable && isFortiTunnelProcessRunning()) {
+        if tunnel.hasTunnel, let ip = tunnel.ip, !ip.isEmpty {
             vpnStatus = .connected
             vpnReconnectAttempts = 0
             isUserManualDisconnect = false
-            vpnStatusMessage = "FortiClient VPN đã kết nối an toàn (\(String(format: "%.1f", probe.latencyMs)) ms)"
+            let msText = probe.reachable ? " (\(String(format: "%.1f", probe.latencyMs)) ms)" : ""
+            vpnStatusMessage = "FortiClient VPN đã kết nối an toàn [\(tunnel.interface ?? "utun"): \(ip)]\(msText)"
         } else {
             // Tunnel is down
             if isUserManualDisconnect {
@@ -1522,9 +1532,9 @@ private let kAvailableServices: [String] = [
 
             let tunnel = getActiveVpnTunnelInfo()
             let probe = await probeVpnGateway(host: vpnGatewayIp, port: 443, timeoutSeconds: 1.0)
-            if tunnel.hasTunnel || (probe.reachable && isFortiTunnelProcessRunning()) {
+            if tunnel.hasTunnel, let ip = tunnel.ip, !ip.isEmpty {
                 connected = true
-                vpnTunnelIp = tunnel.ip
+                vpnTunnelIp = ip
                 vpnTunnelInterface = tunnel.interface
                 vpnLatencyMs = probe.reachable ? probe.latencyMs : nil
                 break
@@ -2101,9 +2111,11 @@ private struct AppView: View {
             await model.restoreLogin()
             await model.checkVpnHealth()
         }
+        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+            Task { await model.checkVpnHealth() }
+        }
         .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { _ in
             if model.authenticated && !model.needsReauth && !model.busy { Task { await model.refresh() } }
-            Task { await model.checkVpnHealth() }
         }
         .onReceive(Timer.publish(every: 600, on: .main, in: .common).autoconnect()) { _ in
             Task { await model.checkForUpdate() }

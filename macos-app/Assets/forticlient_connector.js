@@ -4,21 +4,29 @@ const { execSync } = require('child_process');
 const nodePath = "/Applications/FortiClient.app/Contents/Resources/app.asar.unpacked/assets/js/guimessenger_jyp.node";
 
 function runConnector(action = "connect") {
-  // 1. Dismiss any error dialog in FortiClient (such as "Connection was terminated unexpectedly")
+  // 1. Dismiss any error dialog in FortiClient and trigger Connect
   try {
-    const dismissScript = `
+    const triggerScript = `
       tell application "System Events"
         if exists process "FortiClient" then
           tell process "FortiClient"
             try
               -- Click OK on error dialog if present
-              click (first button of window 1 whose name is "OK" or description is "OK")
+              click (first button of window 1 whose name is "OK" or name is "Đồng ý" or description is "OK")
+              delay 0.3
+            end try
+            try
+              click (first button of window 1 whose name is "Connect" or name is "Kết nối" or description is "Connect")
+            on error
+              try
+                key code 36
+              end try
             end try
           end tell
         end if
       end tell
     `;
-    execSync(`osascript -e '${dismissScript.replace(/'/g, "'\\''")}'`, { stdio: 'pipe' });
+    execSync(`osascript -e '${triggerScript.replace(/'/g, "'\\''")}'`, { stdio: 'pipe' });
   } catch (_) {}
 
   // 2. Interact with native FortiClient addon headlessly
