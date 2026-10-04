@@ -313,6 +313,7 @@ private let kAvailableServices: [String] = [
     @Published var vpnReconnectAttempts: Int = 0
     @Published var vpnStatusMessage: String = "Đang kiểm tra kết nối VPN..."
     @Published var vpnProbing: Bool = false
+    @Published var isUserManualDisconnect: Bool = false
     private var historyGeneration = 0
     private var csrf = ""
     private let session: URLSession = {
@@ -1434,8 +1435,18 @@ private let kAvailableServices: [String] = [
     func cancelVpnReconnect() {
         vpnStatus = .disconnected
         vpnReconnectAttempts = 0
+        isUserManualDisconnect = true
         vpnStatusMessage = "Đã dừng kết nối lại VPN."
         logConsole("⏹️ [VPN] Người dùng đã hủy tiến trình kết nối lại.")
+        triggerVpnDisconnect()
+    }
+
+    func manualDisconnectVpn() async {
+        isUserManualDisconnect = true
+        vpnStatus = .disconnected
+        vpnReconnectAttempts = 0
+        vpnStatusMessage = "Đã chủ động ngắt kết nối theo yêu cầu."
+        logConsole("🔌 [VPN] Người dùng chủ động ngắt kết nối VPN.")
         triggerVpnDisconnect()
     }
 
@@ -1454,10 +1465,16 @@ private let kAvailableServices: [String] = [
         if tunnel.hasTunnel || (probe.reachable && isFortiTunnelProcessRunning()) {
             vpnStatus = .connected
             vpnReconnectAttempts = 0
+            isUserManualDisconnect = false
             vpnStatusMessage = "FortiClient VPN đã kết nối an toàn (\(String(format: "%.1f", probe.latencyMs)) ms)"
         } else {
             // Tunnel is down
-            if vpnAutoReconnect {
+            if isUserManualDisconnect {
+                vpnStatus = .disconnected
+                vpnReconnectAttempts = 0
+                vpnStatusMessage = "Đã ngắt kết nối theo yêu cầu. Bấm nút nguồn để kết nối lại."
+            } else if vpnAutoReconnect {
+                logConsole("⚡ [VPN] Mất kết nối VPN ngoài ý muốn! Đang tự động kết nối lại...")
                 await executeReconnectFlow(manual: false)
             } else {
                 vpnStatus = .disconnected
@@ -1468,6 +1485,7 @@ private let kAvailableServices: [String] = [
     }
 
     func manualReconnectVpn() async {
+        isUserManualDisconnect = false
         await executeReconnectFlow(manual: true)
     }
 
@@ -1825,7 +1843,7 @@ private struct VpnRadarWaveView: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .help(status == .connected ? "VPN đang hoạt động. Bấm để kiểm tra lại." : "Bấm để thử kết nối lại ngay.")
+                .help(status == .connected ? "VPN đang kết nối. Bấm để ngắt kết nối ngay." : status == .reconnecting ? "Đang kết nối lại. Bấm để hủy." : "Bấm để kết nối lại.")
             }
             .frame(width: 180, height: 140)
 
@@ -2570,6 +2588,29 @@ private struct AppView: View {
                             Label("Mở FortiClient", systemImage: "arrow.up.forward.app")
                         }
                         .buttonStyle(.bordered).foregroundStyle(.white.opacity(0.9))
+                    } else if model.vpnStatus == .connected {
+                        Button {
+                            Task { await model.manualDisconnectVpn() }
+                        } label: {
+                            Label("Ngắt kết nối", systemImage: "stop.circle")
+                                .foregroundStyle(Color.red)
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button("Tạo job") {
+                            draftJob = JobDraft(); draftJob.workerId = model.localWorkerId ?? ""
+                            jobError = ""; showingJob = true
+                        }.buttonStyle(.borderedProminent)
+
+                        Button("Xem lịch sử") { selectedTab = 4 }
+                            .buttonStyle(.bordered).foregroundStyle(.white)
+
+                        Button {
+                            model.openFortiClientApp()
+                        } label: {
+                            Label("Mở FortiClient", systemImage: "arrow.up.forward.app")
+                        }
+                        .buttonStyle(.bordered).foregroundStyle(.white.opacity(0.9))
                     } else {
                         Button("Tạo job") {
                             draftJob = JobDraft(); draftJob.workerId = model.localWorkerId ?? ""
@@ -2612,7 +2653,9 @@ private struct AppView: View {
                 onAction: {
                     Task {
                         if model.vpnStatus == .connected {
-                            await model.checkVpnHealth()
+                            await model.manualDisconnectVpn()
+                        } else if model.vpnStatus == .reconnecting {
+                            model.cancelVpnReconnect()
                         } else {
                             await model.manualReconnectVpn()
                         }
