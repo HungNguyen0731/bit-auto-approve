@@ -446,7 +446,9 @@ private let kAvailableServices: [String] = [
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = [helper.path, candidate.path, target.path, String(ProcessInfo.processInfo.processIdentifier), manifest.version]
             try process.run()
-            NSApplication.shared.terminate(nil)
+            // The helper cannot replace the bundle until this process exits. SwiftUI can keep
+            // a sheet alive after terminate(_:) returns, so exit after the verified helper starts.
+            Darwin.exit(EXIT_SUCCESS)
         } catch {
             updateMessage = error.localizedDescription
             updateBusy = false
