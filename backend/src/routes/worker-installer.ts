@@ -9,6 +9,47 @@ import { ownerSessionId } from './session.js';
 
 const VERSION = '0.1.0';
 const FILE_NAME = `BitbucketPRWorker-${VERSION}-dev.pkg`;
+const RELEASE_API = 'https://api.github.com/repos/HungNguyen0731/bit-auto-approve/releases/latest';
+const RELEASE_ASSET_ORIGIN = 'https://github.com';
+const RELEASE_CACHE_MS = 10 * 60 * 1000;
+const RELEASE_STALE_MS = 60 * 60 * 1000;
+
+type MacRelease = { version: string; downloadUrl: string; sha256: string; sizeBytes: number };
+let cachedMacRelease: { value: MacRelease; fetchedAt: number } | undefined;
+
+async function latestMacRelease(): Promise<MacRelease> {
+  const now = Date.now();
+  if (cachedMacRelease && now - cachedMacRelease.fetchedAt < RELEASE_CACHE_MS) return cachedMacRelease.value;
+  try {
+    const response = await fetch(RELEASE_API, {
+      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'bitbucket-pr-approver' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!response.ok) throw new Error(`GitHub releases returned HTTP ${response.status}`);
+    const release = await response.json() as {
+      tag_name?: unknown;
+      assets?: Array<{ name?: unknown; size?: unknown; digest?: unknown; browser_download_url?: unknown }>;
+    };
+    const tag = release.tag_name;
+    if (typeof tag !== 'string' || !/^v\d+\.\d+\.\d+$/.test(tag)) throw new Error('Invalid Mac release tag');
+    const version = tag.slice(1);
+    const name = `Bitbucket-PR-Approver-${version}-macOS.zip`;
+    const asset = release.assets?.find((candidate) => candidate.name === name);
+    const expectedUrl = `${RELEASE_ASSET_ORIGIN}/HungNguyen0731/bit-auto-approve/releases/download/${tag}/${name}`;
+    if (!asset || asset.browser_download_url !== expectedUrl ||
+        typeof asset.digest !== 'string' || !/^sha256:[a-fA-F0-9]{64}$/.test(asset.digest) ||
+        typeof asset.size !== 'number' || !Number.isSafeInteger(asset.size) ||
+        asset.size < 100_000 || asset.size > 100_000_000) {
+      throw new Error('Mac release ZIP or integrity metadata is unavailable');
+    }
+    const value = { version, downloadUrl: expectedUrl, sha256: asset.digest.slice(7).toLowerCase(), sizeBytes: asset.size };
+    cachedMacRelease = { value, fetchedAt: now };
+    return value;
+  } catch (error) {
+    if (cachedMacRelease && now - cachedMacRelease.fetchedAt < RELEASE_STALE_MS) return cachedMacRelease.value;
+    throw error;
+  }
+}
 
 function validatePairUrl(pairUrl: string, expectedOrigin: string): void {
   const parsed = new URL(pairUrl);
@@ -74,56 +115,38 @@ export async function registerWorkerInstallerRoutes(
   app: FastifyInstance,
   options: { auth: ControlPlaneAuth }
 ): Promise<void> {
-  const macAppVersion = '0.3.24';
-  const macAppName = `Bitbucket-PR-Approver-${macAppVersion}-macOS.zip`;
-  const macAppPath = path.resolve(process.cwd(), '../macos-app/releases', macAppName);
   app.get('/api/mac-app/latest', async (_request, reply) => {
-    if (!fs.existsSync(macAppPath)) {
-      return reply.status(404).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app update is unavailable' } });
+    try {
+      const release = await latestMacRelease();
+      reply.header('Cache-Control', 'no-store');
+      return reply.send({ success: true, data: {
+        version: release.version,
+        downloadUrl: `/downloads/Bitbucket-PR-Approver-${release.version}-macOS.zip`,
+        sha256: release.sha256,
+        sizeBytes: release.sizeBytes,
+      } });
+    } catch {
+      return reply.status(503).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app release metadata is temporarily unavailable' } });
     }
-    const archive = fs.readFileSync(macAppPath);
-    reply.header('Cache-Control', 'no-store');
-    return reply.send({
-      success: true,
-      data: {
-        version: macAppVersion,
-        downloadUrl: `/downloads/${macAppName}`,
-        sha256: crypto.createHash('sha256').update(archive).digest('hex'),
-        sizeBytes: archive.length,
-      },
-    });
   });
-  app.get(`/downloads/${macAppName}`, async (request, reply) => {
-    if (!fs.existsSync(macAppPath)) {
-      return reply.status(404).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app download is unavailable' } });
+  app.get('/downloads/mac-app/latest', async (_request, reply) => {
+    try {
+      const release = await latestMacRelease();
+      return reply.header('Cache-Control', 'no-store').redirect(release.downloadUrl, 302);
+    } catch {
+      return reply.status(503).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app download is temporarily unavailable' } });
     }
-    const fileSize = fs.statSync(macAppPath).size;
-    const range = request.headers.range;
-    let start = 0;
-    let end = fileSize - 1;
-    if (range) {
-      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
-      if (!match || (!match[1] && !match[2])) {
-        return reply.status(416).header('Content-Range', `bytes */${fileSize}`).send();
-      }
-      if (match[1]) {
-        start = Number(match[1]);
-        end = match[2] ? Math.min(Number(match[2]), fileSize - 1) : end;
-      } else {
-        const suffixLength = Number(match[2]);
-        start = Math.max(fileSize - suffixLength, 0);
-      }
-      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= fileSize) {
-        return reply.status(416).header('Content-Range', `bytes */${fileSize}`).send();
-      }
-      reply.status(206).header('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+  });
+  app.get<{ Params: { filename: string } }>('/downloads/:filename', async (request, reply) => {
+    const match = /^Bitbucket-PR-Approver-(\d+\.\d+\.\d+)-macOS\.zip$/.exec(request.params.filename);
+    if (!match) return reply.status(404).send();
+    try {
+      const release = await latestMacRelease();
+      if (match[1] !== release.version) return reply.status(404).send();
+      return reply.header('Cache-Control', 'no-store').redirect(release.downloadUrl, 302);
+    } catch {
+      return reply.status(503).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app download is temporarily unavailable' } });
     }
-    reply.header('Content-Disposition', `attachment; filename="${macAppName}"`);
-    reply.header('Cache-Control', 'public, max-age=3600');
-    reply.header('Accept-Ranges', 'bytes');
-    reply.header('Content-Length', end - start + 1);
-    reply.type('application/zip');
-    return reply.send(fs.createReadStream(macAppPath, { start, end }));
   });
 
   const packagePath = path.resolve(process.cwd(), '../worker/dist-packages', FILE_NAME);
