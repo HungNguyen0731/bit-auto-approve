@@ -10,6 +10,7 @@ import { ownerSessionId } from './session.js';
 const VERSION = '0.1.0';
 const FILE_NAME = `BitbucketPRWorker-${VERSION}-dev.pkg`;
 const RELEASE_API = 'https://api.github.com/repos/HungNguyen0731/bit-auto-approve/releases/latest';
+const RELEASE_MANIFEST = 'https://github.com/HungNguyen0731/bit-auto-approve/releases/latest/download/mac-app-update.json';
 const RELEASE_ASSET_ORIGIN = 'https://github.com';
 const RELEASE_CACHE_MS = 10 * 60 * 1000;
 const RELEASE_STALE_MS = 60 * 60 * 1000;
@@ -17,32 +18,53 @@ const RELEASE_STALE_MS = 60 * 60 * 1000;
 type MacRelease = { version: string; downloadUrl: string; sha256: string; sizeBytes: number };
 let cachedMacRelease: { value: MacRelease; fetchedAt: number } | undefined;
 
+function validatedMacRelease(tag: unknown, name: unknown, size: unknown, digest: unknown, url: unknown): MacRelease {
+  if (typeof tag !== 'string' || !/^v\d+\.\d+\.\d+$/.test(tag)) throw new Error('Invalid Mac release tag');
+  const version = tag.slice(1);
+  const expectedName = `Bitbucket-PR-Approver-${version}-macOS.zip`;
+  const expectedUrl = `${RELEASE_ASSET_ORIGIN}/HungNguyen0731/bit-auto-approve/releases/download/${tag}/${expectedName}`;
+  if (name !== expectedName || url !== expectedUrl ||
+      typeof digest !== 'string' || !/^sha256:[a-fA-F0-9]{64}$/.test(digest) ||
+      typeof size !== 'number' || !Number.isSafeInteger(size) || size < 100_000 || size > 100_000_000) {
+    throw new Error('Mac release ZIP or integrity metadata is unavailable');
+  }
+  return { version, downloadUrl: expectedUrl, sha256: digest.slice(7).toLowerCase(), sizeBytes: size };
+}
+
+async function macReleaseFromManifest(): Promise<MacRelease> {
+  const response = await fetch(RELEASE_MANIFEST, {
+    headers: { Accept: 'application/json', 'User-Agent': 'bitbucket-pr-approver' },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!response.ok) throw new Error(`GitHub release manifest returned HTTP ${response.status}`);
+  const body = await response.text();
+  if (body.length > 4096) throw new Error('Mac release manifest is too large');
+  const manifest = JSON.parse(body) as { tag?: unknown; name?: unknown; size?: unknown; digest?: unknown; downloadUrl?: unknown };
+  return validatedMacRelease(manifest.tag, manifest.name, manifest.size, manifest.digest, manifest.downloadUrl);
+}
+
+async function macReleaseFromApi(): Promise<MacRelease> {
+  const response = await fetch(RELEASE_API, {
+    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'bitbucket-pr-approver' },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!response.ok) throw new Error(`GitHub releases returned HTTP ${response.status}`);
+  const release = await response.json() as {
+    tag_name?: unknown;
+    assets?: Array<{ name?: unknown; size?: unknown; digest?: unknown; browser_download_url?: unknown }>;
+  };
+  const tag = release.tag_name;
+  if (typeof tag !== 'string' || !/^v\d+\.\d+\.\d+$/.test(tag)) throw new Error('Invalid Mac release tag');
+  const name = `Bitbucket-PR-Approver-${tag.slice(1)}-macOS.zip`;
+  const asset = release.assets?.find((candidate) => candidate.name === name);
+  return validatedMacRelease(tag, asset?.name, asset?.size, asset?.digest, asset?.browser_download_url);
+}
+
 async function latestMacRelease(): Promise<MacRelease> {
   const now = Date.now();
   if (cachedMacRelease && now - cachedMacRelease.fetchedAt < RELEASE_CACHE_MS) return cachedMacRelease.value;
   try {
-    const response = await fetch(RELEASE_API, {
-      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'bitbucket-pr-approver' },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!response.ok) throw new Error(`GitHub releases returned HTTP ${response.status}`);
-    const release = await response.json() as {
-      tag_name?: unknown;
-      assets?: Array<{ name?: unknown; size?: unknown; digest?: unknown; browser_download_url?: unknown }>;
-    };
-    const tag = release.tag_name;
-    if (typeof tag !== 'string' || !/^v\d+\.\d+\.\d+$/.test(tag)) throw new Error('Invalid Mac release tag');
-    const version = tag.slice(1);
-    const name = `Bitbucket-PR-Approver-${version}-macOS.zip`;
-    const asset = release.assets?.find((candidate) => candidate.name === name);
-    const expectedUrl = `${RELEASE_ASSET_ORIGIN}/HungNguyen0731/bit-auto-approve/releases/download/${tag}/${name}`;
-    if (!asset || asset.browser_download_url !== expectedUrl ||
-        typeof asset.digest !== 'string' || !/^sha256:[a-fA-F0-9]{64}$/.test(asset.digest) ||
-        typeof asset.size !== 'number' || !Number.isSafeInteger(asset.size) ||
-        asset.size < 100_000 || asset.size > 100_000_000) {
-      throw new Error('Mac release ZIP or integrity metadata is unavailable');
-    }
-    const value = { version, downloadUrl: expectedUrl, sha256: asset.digest.slice(7).toLowerCase(), sizeBytes: asset.size };
+    const value = await macReleaseFromManifest().catch(() => macReleaseFromApi());
     cachedMacRelease = { value, fetchedAt: now };
     return value;
   } catch (error) {
