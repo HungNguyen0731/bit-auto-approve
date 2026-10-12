@@ -2183,7 +2183,7 @@ private struct AppView: View {
                         Text("Phiên bản hiện tại:")
                             .font(.caption).foregroundStyle(.secondary)
                         Spacer()
-                        Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.23")
+                        Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.24")
                             .font(.caption.monospaced()).bold()
                     }
                     Divider()
@@ -2941,10 +2941,20 @@ private struct AppView: View {
 
     private var jobForm: some View {
         VStack(spacing: 0) {
-          Form {
+          HStack {
             Text(draftJob.id == nil ? "Tạo job tự động" : "Sửa job").font(.title2.bold())
-            TextField("Tên job", text: $draftJob.name)
-            TextField("Mô tả (tùy chọn)", text: $draftJob.description)
+            Spacer()
+          }
+          .padding(.horizontal, 24).padding(.vertical, 18)
+          Divider()
+          ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 14) {
+            LabeledContent("Tên job") {
+                TextField("Tên job", text: $draftJob.name)
+            }
+            LabeledContent("Mô tả") {
+                TextField("Mô tả (tùy chọn)", text: $draftJob.description)
+            }
             Picker("Bitbucket account", selection: $draftJob.accountId) {
                 Text("Chọn account").tag("")
                 ForEach(model.accounts) { account in Text(account.name).tag(account.id) }
@@ -2959,13 +2969,27 @@ private struct AppView: View {
                 Text("Mac này chưa ghép Worker với server đang chọn. Vào tab Mac Worker để ghép đôi trước.")
                     .font(.caption).foregroundStyle(.orange)
             }
-            TextField("Repository: workspace/repo, ngăn bằng dấu phẩy", text: $draftJob.repositories)
-            TextField("Target branches: dev, main, release/*", text: $draftJob.targetBranches)
-            TextField("Source branches (để trống = tất cả)", text: $draftJob.sourceBranches)
-            TextField("Author whitelist (để trống = tất cả)", text: $draftJob.authors)
-            TextField("Author blacklist", text: $draftJob.blockedAuthors)
-            TextField("Title phải có", text: $draftJob.titleIncludes)
-            TextField("Title loại trừ", text: $draftJob.titleExcludes)
+            LabeledContent("Repository") {
+                TextField("workspace/repo, ngăn bằng dấu phẩy", text: $draftJob.repositories)
+            }
+            LabeledContent("Target branches") {
+                TextField("dev, main, release/*", text: $draftJob.targetBranches)
+            }
+            LabeledContent("Source branches") {
+                TextField("Để trống = tất cả", text: $draftJob.sourceBranches)
+            }
+            LabeledContent("Author whitelist") {
+                TextField("Để trống = tất cả", text: $draftJob.authors)
+            }
+            LabeledContent("Author blacklist") {
+                TextField("Author blacklist", text: $draftJob.blockedAuthors)
+            }
+            LabeledContent("Title phải có") {
+                TextField("Title phải có", text: $draftJob.titleIncludes)
+            }
+            LabeledContent("Title loại trừ") {
+                TextField("Title loại trừ", text: $draftJob.titleExcludes)
+            }
             Stepper("Chu kỳ: \(draftJob.intervalSeconds) giây", value: $draftJob.intervalSeconds, in: 10...86400, step: 5)
             Stepper("Số approval tối thiểu: \(draftJob.minApprovals)", value: $draftJob.minApprovals, in: 0...20)
             Toggle("Bật lịch tự động", isOn: $draftJob.enabled)
@@ -2977,7 +3001,9 @@ private struct AppView: View {
                 .font(.caption).foregroundStyle(.secondary)
             Toggle("Tự merge sau approve và CI thành công", isOn: $draftJob.autoMergeOnSuccessfulBuild)
             if draftJob.autoMergeOnSuccessfulBuild {
-                TextField("Chỉ merge vào branch: dev, qc (không nhập uat)", text: $draftJob.mergeTargetBranches)
+                LabeledContent("Merge branches") {
+                    TextField("dev, qc (không nhập uat)", text: $draftJob.mergeTargetBranches)
+                }
                 Text("Chỉ merge PR khớp rule, có CI xanh, được account này approve và commit nguồn không đổi. Để trống danh sách branch sẽ không merge. Dry Run không merge.")
                     .font(.caption).foregroundStyle(.orange)
                 if model.workers.first(where: { $0.id == draftJob.workerId })?.supportsAutoMerge != true {
@@ -2985,10 +3011,18 @@ private struct AppView: View {
                         .font(.caption).foregroundStyle(.red)
                 }
             }
+            }
+            .textFieldStyle(.roundedBorder)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(24)
           }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+          Divider()
           VStack(alignment: .leading, spacing: 10) {
             if !jobError.isEmpty {
-                Text(jobError).foregroundStyle(.red).font(.callout).accessibilityLabel("Lỗi lưu job: \(jobError)")
+                Text(jobError).foregroundStyle(.red).font(.callout)
+                    .lineLimit(3).help(jobError)
+                    .accessibilityLabel("Lỗi lưu job: \(jobError)")
             }
             if model.needsReauth {
                 SecureField("Owner password để đăng nhập lại", text: $ownerPassword)
@@ -3016,7 +3050,7 @@ private struct AppView: View {
                 }.buttonStyle(.borderedProminent)
                     .disabled(jobSubmitting || model.busy || (model.needsReauth && ownerPassword.isEmpty && !model.hasSavedPassword) || draftJob.name.isEmpty || draftJob.repositories.split(separator: ",").allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } || draftJob.accountId.isEmpty || draftJob.workerId.isEmpty || (draftJob.autoMergeOnSuccessfulBuild && draftJob.mergeTargetBranches.split(separator: ",").allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) || (draftJob.autoMergeOnSuccessfulBuild && model.workers.first(where: { $0.id == draftJob.workerId })?.supportsAutoMerge != true))
             }
-          }.padding()
+          }.padding(.horizontal, 24).padding(.vertical, 16)
         }.frame(width: 680, height: 640)
     }
 
