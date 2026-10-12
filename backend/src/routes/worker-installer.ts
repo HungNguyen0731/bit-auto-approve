@@ -32,7 +32,7 @@ async function fetchGitHubResource(url: string, accept: string, timeoutMs: numbe
       const location = response.headers.get('location');
       if (!location) throw new Error('GitHub release redirect has no location');
       const next = new URL(location, current);
-      if (next.protocol !== 'https:' || !['github.com', 'api.github.com', 'release-assets.githubusercontent.com'].includes(next.hostname)) {
+      if (next.protocol !== 'https:' || !['github.com', 'api.github.com', 'raw.githubusercontent.com', 'release-assets.githubusercontent.com'].includes(next.hostname)) {
         throw new Error('GitHub release redirect is not trusted');
       }
       current = next.href;
@@ -55,9 +55,8 @@ async function readGitHubJson(url: string, accept: string, maxBytes: number): Pr
   return JSON.parse(body.toString('utf8'));
 }
 
-async function macReleaseArchive(release: MacRelease): Promise<Buffer> {
-  if (cachedMacArchive?.sha256 === release.sha256) return cachedMacArchive.data;
-  const response = await fetchGitHubResource(release.downloadUrl, 'application/zip', 60_000);
+async function verifiedMacArchive(url: string, release: MacRelease): Promise<Buffer> {
+  const response = await fetchGitHubResource(url, 'application/zip', 60_000);
   const contentLength = Number(response.headers.get('content-length'));
   if (contentLength && contentLength !== release.sizeBytes) throw new Error('Mac release ZIP size does not match the manifest');
   if (!response.body) throw new Error('Mac release ZIP has no body');
@@ -80,6 +79,14 @@ async function macReleaseArchive(release: MacRelease): Promise<Buffer> {
       crypto.createHash('sha256').update(archive).digest('hex') !== release.sha256) {
     throw new Error('Mac release ZIP failed integrity verification');
   }
+  return archive;
+}
+
+async function macReleaseArchive(release: MacRelease): Promise<Buffer> {
+  if (cachedMacArchive?.sha256 === release.sha256) return cachedMacArchive.data;
+  const fileName = `Bitbucket-PR-Approver-${release.version}-macOS.zip`;
+  const rawUrl = `https://raw.githubusercontent.com/HungNguyen0731/bit-auto-approve/v${release.version}/macos-app/releases/${fileName}`;
+  const archive = await verifiedMacArchive(rawUrl, release).catch(() => verifiedMacArchive(release.downloadUrl, release));
   cachedMacArchive = { sha256: release.sha256, data: archive };
   return archive;
 }
