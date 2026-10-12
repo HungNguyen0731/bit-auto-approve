@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { gunzipSync } from 'node:zlib';
 import type { FastifyInstance } from 'fastify';
 import type { ControlPlaneAuth } from '../services/control-plane-auth.js';
 import { ownerSessionId } from './session.js';
@@ -18,6 +19,36 @@ const RELEASE_STALE_MS = 60 * 60 * 1000;
 type MacRelease = { version: string; downloadUrl: string; sha256: string; sizeBytes: number };
 let cachedMacRelease: { value: MacRelease; fetchedAt: number } | undefined;
 
+async function readGitHubJson(url: string, accept: string, maxBytes: number): Promise<unknown> {
+  let current = url;
+  for (let redirects = 0; redirects < 6; redirects += 1) {
+    const response = await fetch(current, {
+      headers: { Accept: accept, 'Accept-Encoding': 'identity', 'User-Agent': 'bitbucket-pr-approver' },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(8000),
+    });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get('location');
+      if (!location) throw new Error('GitHub release redirect has no location');
+      const next = new URL(location, current);
+      if (next.protocol !== 'https:' || !['github.com', 'api.github.com', 'release-assets.githubusercontent.com'].includes(next.hostname)) {
+        throw new Error('GitHub release redirect is not trusted');
+      }
+      current = next.href;
+      continue;
+    }
+    if (!response.ok) throw new Error(`GitHub release metadata returned HTTP ${response.status}`);
+    const encoded = Buffer.from(await response.arrayBuffer());
+    if (encoded.length > maxBytes) throw new Error('GitHub release metadata is too large');
+    const body = encoded[0] === 0x1f && encoded[1] === 0x8b
+      ? gunzipSync(encoded, { maxOutputLength: maxBytes })
+      : encoded;
+    if (body.length > maxBytes) throw new Error('GitHub release metadata is too large');
+    return JSON.parse(body.toString('utf8'));
+  }
+  throw new Error('Too many GitHub release redirects');
+}
+
 function validatedMacRelease(tag: unknown, name: unknown, size: unknown, digest: unknown, url: unknown): MacRelease {
   if (typeof tag !== 'string' || !/^v\d+\.\d+\.\d+$/.test(tag)) throw new Error('Invalid Mac release tag');
   const version = tag.slice(1);
@@ -32,24 +63,14 @@ function validatedMacRelease(tag: unknown, name: unknown, size: unknown, digest:
 }
 
 async function macReleaseFromManifest(): Promise<MacRelease> {
-  const response = await fetch(RELEASE_MANIFEST, {
-    headers: { Accept: 'application/json', 'User-Agent': 'bitbucket-pr-approver' },
-    signal: AbortSignal.timeout(8000),
-  });
-  if (!response.ok) throw new Error(`GitHub release manifest returned HTTP ${response.status}`);
-  const body = await response.text();
-  if (body.length > 4096) throw new Error('Mac release manifest is too large');
-  const manifest = JSON.parse(body) as { tag?: unknown; name?: unknown; size?: unknown; digest?: unknown; downloadUrl?: unknown };
+  const manifest = await readGitHubJson(RELEASE_MANIFEST, 'application/json', 4096) as {
+    tag?: unknown; name?: unknown; size?: unknown; digest?: unknown; downloadUrl?: unknown;
+  };
   return validatedMacRelease(manifest.tag, manifest.name, manifest.size, manifest.digest, manifest.downloadUrl);
 }
 
 async function macReleaseFromApi(): Promise<MacRelease> {
-  const response = await fetch(RELEASE_API, {
-    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'bitbucket-pr-approver' },
-    signal: AbortSignal.timeout(8000),
-  });
-  if (!response.ok) throw new Error(`GitHub releases returned HTTP ${response.status}`);
-  const release = await response.json() as {
+  const release = await readGitHubJson(RELEASE_API, 'application/vnd.github+json', 1_000_000) as {
     tag_name?: unknown;
     assets?: Array<{ name?: unknown; size?: unknown; digest?: unknown; browser_download_url?: unknown }>;
   };
@@ -156,7 +177,7 @@ export async function registerWorkerInstallerRoutes(
       } });
     } catch (error) {
       app.log.warn({ error }, 'Mac app release metadata unavailable');
-      return reply.status(503).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: error instanceof Error ? error.message : 'Mac app release metadata is temporarily unavailable' } });
+      return reply.status(503).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app release metadata is temporarily unavailable' } });
     }
   });
   app.get('/downloads/mac-app/latest', async (_request, reply) => {
