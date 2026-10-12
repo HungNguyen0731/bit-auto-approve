@@ -18,14 +18,15 @@ const RELEASE_STALE_MS = 60 * 60 * 1000;
 
 type MacRelease = { version: string; downloadUrl: string; sha256: string; sizeBytes: number };
 let cachedMacRelease: { value: MacRelease; fetchedAt: number } | undefined;
+let cachedMacArchive: { sha256: string; data: Buffer } | undefined;
 
-async function readGitHubJson(url: string, accept: string, maxBytes: number): Promise<unknown> {
+async function fetchGitHubResource(url: string, accept: string, timeoutMs: number): Promise<Response> {
   let current = url;
   for (let redirects = 0; redirects < 6; redirects += 1) {
     const response = await fetch(current, {
       headers: { Accept: accept, 'Accept-Encoding': 'identity', 'User-Agent': 'bitbucket-pr-approver' },
       redirect: 'manual',
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('location');
@@ -37,16 +38,50 @@ async function readGitHubJson(url: string, accept: string, maxBytes: number): Pr
       current = next.href;
       continue;
     }
-    if (!response.ok) throw new Error(`GitHub release metadata returned HTTP ${response.status}`);
-    const encoded = Buffer.from(await response.arrayBuffer());
-    if (encoded.length > maxBytes) throw new Error('GitHub release metadata is too large');
-    const body = encoded[0] === 0x1f && encoded[1] === 0x8b
-      ? gunzipSync(encoded, { maxOutputLength: maxBytes })
-      : encoded;
-    if (body.length > maxBytes) throw new Error('GitHub release metadata is too large');
-    return JSON.parse(body.toString('utf8'));
+    if (!response.ok) throw new Error(`GitHub release asset returned HTTP ${response.status}`);
+    return response;
   }
   throw new Error('Too many GitHub release redirects');
+}
+
+async function readGitHubJson(url: string, accept: string, maxBytes: number): Promise<unknown> {
+  const response = await fetchGitHubResource(url, accept, 8000);
+  const encoded = Buffer.from(await response.arrayBuffer());
+  if (encoded.length > maxBytes) throw new Error('GitHub release metadata is too large');
+  const body = encoded[0] === 0x1f && encoded[1] === 0x8b
+    ? gunzipSync(encoded, { maxOutputLength: maxBytes })
+    : encoded;
+  if (body.length > maxBytes) throw new Error('GitHub release metadata is too large');
+  return JSON.parse(body.toString('utf8'));
+}
+
+async function macReleaseArchive(release: MacRelease): Promise<Buffer> {
+  if (cachedMacArchive?.sha256 === release.sha256) return cachedMacArchive.data;
+  const response = await fetchGitHubResource(release.downloadUrl, 'application/zip', 60_000);
+  const contentLength = Number(response.headers.get('content-length'));
+  if (contentLength && contentLength !== release.sizeBytes) throw new Error('Mac release ZIP size does not match the manifest');
+  if (!response.body) throw new Error('Mac release ZIP has no body');
+  const chunks: Buffer[] = [];
+  let received = 0;
+  const reader = response.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > release.sizeBytes) throw new Error('Mac release ZIP exceeds the manifest size');
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const archive = Buffer.concat(chunks, received);
+  if (archive.length !== release.sizeBytes ||
+      crypto.createHash('sha256').update(archive).digest('hex') !== release.sha256) {
+    throw new Error('Mac release ZIP failed integrity verification');
+  }
+  cachedMacArchive = { sha256: release.sha256, data: archive };
+  return archive;
 }
 
 function validatedMacRelease(tag: unknown, name: unknown, size: unknown, digest: unknown, url: unknown): MacRelease {
@@ -194,8 +229,35 @@ export async function registerWorkerInstallerRoutes(
     try {
       const release = await latestMacRelease();
       if (match[1] !== release.version) return reply.status(404).send();
-      return reply.header('Cache-Control', 'no-store').redirect(release.downloadUrl, 302);
-    } catch {
+      const archive = await macReleaseArchive(release);
+      const fileSize = archive.length;
+      let start = 0;
+      let end = fileSize - 1;
+      const range = request.headers.range;
+      if (range) {
+        const parts = /^bytes=(\d*)-(\d*)$/.exec(range);
+        if (!parts || (!parts[1] && !parts[2])) {
+          return reply.status(416).header('Content-Range', `bytes */${fileSize}`).send();
+        }
+        if (parts[1]) {
+          start = Number(parts[1]);
+          end = parts[2] ? Math.min(Number(parts[2]), fileSize - 1) : end;
+        } else {
+          start = Math.max(fileSize - Number(parts[2]), 0);
+        }
+        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= fileSize) {
+          return reply.status(416).header('Content-Range', `bytes */${fileSize}`).send();
+        }
+        reply.status(206).header('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+      }
+      reply.header('Content-Disposition', `attachment; filename="Bitbucket-PR-Approver-${release.version}-macOS.zip"`);
+      reply.header('Cache-Control', 'public, max-age=600');
+      reply.header('Accept-Ranges', 'bytes');
+      reply.header('Content-Length', end - start + 1);
+      reply.type('application/zip');
+      return reply.send(archive.subarray(start, end + 1));
+    } catch (error) {
+      app.log.warn({ error }, 'Mac app release download unavailable');
       return reply.status(503).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app download is temporarily unavailable' } });
     }
   });
