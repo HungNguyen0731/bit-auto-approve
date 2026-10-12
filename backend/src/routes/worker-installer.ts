@@ -64,7 +64,14 @@ async function latestMacRelease(): Promise<MacRelease> {
   const now = Date.now();
   if (cachedMacRelease && now - cachedMacRelease.fetchedAt < RELEASE_CACHE_MS) return cachedMacRelease.value;
   try {
-    const value = await macReleaseFromManifest().catch(() => macReleaseFromApi());
+    const value = await macReleaseFromManifest().catch(async (manifestError: unknown) => {
+      try {
+        return await macReleaseFromApi();
+      } catch (apiError) {
+        const summary = (error: unknown) => error instanceof Error ? error.message : 'Unknown upstream error';
+        throw new Error(`Release manifest: ${summary(manifestError)}; GitHub API: ${summary(apiError)}`);
+      }
+    });
     cachedMacRelease = { value, fetchedAt: now };
     return value;
   } catch (error) {
@@ -147,8 +154,9 @@ export async function registerWorkerInstallerRoutes(
         sha256: release.sha256,
         sizeBytes: release.sizeBytes,
       } });
-    } catch {
-      return reply.status(503).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app release metadata is temporarily unavailable' } });
+    } catch (error) {
+      app.log.warn({ error }, 'Mac app release metadata unavailable');
+      return reply.status(503).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: error instanceof Error ? error.message : 'Mac app release metadata is temporarily unavailable' } });
     }
   });
   app.get('/downloads/mac-app/latest', async (_request, reply) => {
