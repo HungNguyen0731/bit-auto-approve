@@ -2183,7 +2183,7 @@ private struct AppView: View {
                         Text("Phiên bản hiện tại:")
                             .font(.caption).foregroundStyle(.secondary)
                         Spacer()
-                        Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.17")
+                        Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.3.23")
                             .font(.caption.monospaced()).bold()
                     }
                     Divider()

@@ -118,15 +118,15 @@ async function run(): Promise<void> {
 
   const flushOutbox = async () => {
     while (outbox.size() > 0) {
-      const all = outbox.peek(20);
-      const executionId = all[0].executionId;
-      const items = all.filter((i) => i.executionId === executionId);
-      const lastSeq = items[items.length - 1].sequence;
-      const accepted = await client.sendLogs(executionId, {
-        sequence: lastSeq,
-        items,
+      // The control plane acknowledges one sequence per request. Sending several
+      // entries with the last entry's sequence creates a permanent SEQUENCE_GAP
+      // when a previous flush left multiple entries in the durable outbox.
+      const item = outbox.peek(1)[0];
+      const accepted = await client.sendLogs(item.executionId, {
+        sequence: item.sequence,
+        items: [item],
       });
-      outbox.acknowledge(executionId, accepted.acceptedThrough);
+      outbox.acknowledge(item.executionId, accepted.acceptedThrough);
     }
   };
 
