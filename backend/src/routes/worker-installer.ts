@@ -258,7 +258,7 @@ export async function registerWorkerInstallerRoutes(
       return reply.send(archive.subarray(start, end + 1));
     } catch (error) {
       app.log.warn({ error }, 'Mac app release download unavailable');
-      return reply.status(503).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: 'Mac app download is temporarily unavailable' } });
+      return reply.status(503).send({ success: false, error: { code: 'MAC_APP_UNAVAILABLE', message: error instanceof Error ? error.message : 'Mac app download is temporarily unavailable' } });
     }
   });
 
