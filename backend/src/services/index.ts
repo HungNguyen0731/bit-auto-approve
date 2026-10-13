@@ -9,3 +9,6 @@ export * from './worker-log-store.js';
 export * from './control-plane-auth.js';
 export * from './worker-auth.js';
 export * from './execution-dispatcher.js';
+export * from './git.js';
+export * from './git-diff-parser.js';
+

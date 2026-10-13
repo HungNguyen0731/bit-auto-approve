@@ -101,3 +101,73 @@ export const UpdateJobSchema = {
   },
   additionalProperties: false,
 } as const;
+
+export const GitScanReposSchema = {
+  type: 'object',
+  required: ['rootPath'],
+  properties: {
+    rootPath: { type: 'string', minLength: 1 },
+    maxDepth: { type: 'number', minimum: 1, maximum: 10, default: 4 },
+  },
+  additionalProperties: false,
+} as const;
+
+export const GitStageSchema = {
+  type: 'object',
+  required: ['repoPath'],
+  properties: {
+    repoPath: { type: 'string', minLength: 1 },
+    paths: {
+      type: 'array',
+      items: { type: 'string' },
+    },
+    all: { type: 'boolean' },
+  },
+  additionalProperties: false,
+} as const;
+
+export const GitCommitSchema = {
+  type: 'object',
+  required: ['repoPath', 'message'],
+  properties: {
+    repoPath: { type: 'string', minLength: 1 },
+    message: { type: 'string', minLength: 1 },
+    amend: { type: 'boolean' },
+  },
+  additionalProperties: false,
+} as const;
+
+export const GitBranchCreateSchema = {
+  type: 'object',
+  required: ['repoPath', 'branchName'],
+  properties: {
+    repoPath: { type: 'string', minLength: 1 },
+    branchName: { type: 'string', minLength: 1 },
+    startPoint: { type: 'string' },
+    checkout: { type: 'boolean' },
+  },
+  additionalProperties: false,
+} as const;
+
+export const GitBranchSwitchSchema = {
+  type: 'object',
+  required: ['repoPath', 'branchName'],
+  properties: {
+    repoPath: { type: 'string', minLength: 1 },
+    branchName: { type: 'string', minLength: 1 },
+    createNew: { type: 'boolean' },
+  },
+  additionalProperties: false,
+} as const;
+
+export const GitStashPushSchema = {
+  type: 'object',
+  required: ['repoPath'],
+  properties: {
+    repoPath: { type: 'string', minLength: 1 },
+    message: { type: 'string' },
+    includeUntracked: { type: 'boolean' },
+  },
+  additionalProperties: false,
+} as const;
+

@@ -30,9 +30,17 @@ export function drawSmallvilleMap(
   ctx.fillStyle = '#3A8FB7';
   ctx.beginPath();
   ctx.moveTo(1140, 0);
-  ctx.bezierCurveTo(1120, 250, 1160, 500, 1130, 880);
+  if (typeof ctx.bezierCurveTo === 'function') {
+    ctx.bezierCurveTo(1120, 250, 1160, 500, 1130, 880);
+  } else {
+    ctx.lineTo(1130, 880);
+  }
   ctx.lineTo(1210, 880);
-  ctx.bezierCurveTo(1240, 500, 1200, 250, 1220, 0);
+  if (typeof ctx.bezierCurveTo === 'function') {
+    ctx.bezierCurveTo(1240, 500, 1200, 250, 1220, 0);
+  } else {
+    ctx.lineTo(1220, 0);
+  }
   ctx.closePath();
   ctx.fill();
 

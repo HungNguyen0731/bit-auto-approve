@@ -14,7 +14,7 @@ export function WorkerSetup({ workers, onRefresh }: {
       <section className="overflow-hidden rounded-[28px] border border-app-line bg-app-panel shadow-soft">
         <div className="grid lg:grid-cols-[minmax(0,1.35fr)_minmax(18rem,0.65fr)]">
           <div className="px-6 py-8 sm:px-9 sm:py-10">
-            <p className="text-sm font-semibold text-brand-700">Bitbucket PR Approver cho Mac</p>
+            <p className="text-sm font-semibold text-brand-700">GitPulse cho Mac</p>
             <h2 className="mt-3 max-w-xl text-3xl font-bold leading-tight tracking-tight text-app-ink sm:text-4xl">
               Quản lý job ngay trên Mac của bạn.
             </h2>

@@ -26,6 +26,8 @@ import { BitbucketOAuth } from './services/bitbucket-oauth.js';
 import { registerAccountOAuthRoutes } from './routes/account-oauth.js';
 import { ExecutionDispatcher } from './services/execution-dispatcher.js';
 import { registerWorkerInstallerRoutes } from './routes/worker-installer.js';
+import { registerGitRoutes } from './routes/git.js';
+import { GitService } from './services/git.js';
 import { ownerSessionId } from './routes/session.js';
 
 export interface ServerInstance {
@@ -37,6 +39,7 @@ export interface ServerInstance {
   accounts: AccountStore;
   workerLogs: WorkerLogStore;
   executionDispatcher: ExecutionDispatcher;
+  gitService: GitService;
 }
 
 export interface BuildServerOptions {
@@ -114,6 +117,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
   const scheduler = new SchedulerService(storage, events, executionDispatcher);
   const controlPlaneAuth = new ControlPlaneAuth(storage.getDataDir());
   const workerAuth = new WorkerAuth(workerStore);
+  const gitService = new GitService();
 
   app.addHook('preHandler', async (request) => {
     if (!controlPlaneAuth.enabled || !request.url.startsWith('/api/')) return;
@@ -168,6 +172,7 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
     storage,
   });
   await registerWorkerInstallerRoutes(app, { auth: controlPlaneAuth });
+  await registerGitRoutes(app, { gitService });
 
   // 4. Register Frontend Static Files (if production build exists)
   const possibleFrontendDirs = [
@@ -237,5 +242,6 @@ export async function buildServer(options: BuildServerOptions = {}): Promise<Ser
     accounts,
     workerLogs,
     executionDispatcher,
+    gitService,
   };
 }

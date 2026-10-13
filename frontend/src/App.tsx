@@ -30,10 +30,12 @@ import { WorkerSetup } from './components/WorkerSetup';
 import { WorkerExecutionLog } from './components/WorkerExecutionLog';
 import { OwnerLogin } from './components/OwnerLogin';
 import { SmallvilleBoard } from './components/generative-agents';
+import { GitManager } from './components/git';
 import {
   Activity,
   Bot,
   ExternalLink,
+  GitBranch,
   Key,
   Loader2,
   Laptop,
@@ -43,7 +45,7 @@ import {
 } from 'lucide-react';
 
 export function App() {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'board' | 'jobs' | 'workers' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'board' | 'jobs' | 'workers' | 'settings' | 'git'>('dashboard');
   const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
 
   // Status & Data
@@ -630,6 +632,19 @@ export function App() {
             <Laptop className="w-4 h-4" />
             <span>App cho Mac ({workers.length})</span>
           </button>
+
+          <button
+            onClick={() => setActiveTab('git')}
+            className={`min-h-11 flex shrink-0 items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold transition-all active:scale-[0.98] ${
+              activeTab === 'git'
+                ? 'bg-brand-700 text-white shadow-sm'
+                : 'text-app-muted hover:text-app-ink hover:bg-brand-50'
+            }`}
+            data-testid="tab-git-manager"
+          >
+            <GitBranch className="w-4 h-4" />
+            <span>Git Manager</span>
+          </button>
         </div>
 
         {/* Tab Content */}
@@ -727,9 +742,9 @@ export function App() {
               </div>
 
               <SmallvilleBoard
-                workers={workers}
-                logs={workerLogs}
-                latestLog={workerLogs.length > 0 ? workerLogs[0] : null}
+                workers={Array.isArray(workers) ? workers : []}
+                logs={Array.isArray(workerLogs) ? workerLogs : []}
+                latestLog={Array.isArray(workerLogs) && workerLogs.length > 0 ? workerLogs[0] : null}
                 activeExecutionId={workers.find((w) => w.activeExecutionId)?.activeExecutionId || null}
                 onSelectWorker={(workerId) => {
                   setSelectedWorkerId(workerId);
@@ -787,9 +802,9 @@ export function App() {
               </div>
 
               <SmallvilleBoard
-                workers={workers}
-                logs={workerLogs}
-                latestLog={workerLogs.length > 0 ? workerLogs[0] : null}
+                workers={Array.isArray(workers) ? workers : []}
+                logs={Array.isArray(workerLogs) ? workerLogs : []}
+                latestLog={Array.isArray(workerLogs) && workerLogs.length > 0 ? workerLogs[0] : null}
                 activeExecutionId={workers.find((w) => w.activeExecutionId)?.activeExecutionId || null}
                 onSelectWorker={(workerId) => {
                   setSelectedWorkerId(workerId);
@@ -916,12 +931,18 @@ export function App() {
             <WorkerExecutionLog logs={workerLogs} workers={workers} />
           </div>
         )}
+
+        {activeTab === 'git' && (
+          <div className="space-y-6">
+            <GitManager onShowToast={addToast} />
+          </div>
+        )}
       </main>
       )}
 
       {/* Footer */}
       <footer className="border-t border-app-line py-4 bg-app-panel-muted/80 text-center text-xs text-app-muted font-mono">
-        Bitbucket PR Approver  |  Local Cloud automation  |  127.0.0.1
+        GitPulse  |  Git Workspace & PR Automation  |  127.0.0.1
       </footer>
 
       {/* Create / Edit Job Modal */}

@@ -3,7 +3,8 @@
  */
 
 export const APP_CONSTANTS = {
-  APP_NAME: 'Bitbucket PR Approver Local',
+  APP_NAME: 'GitPulse',
+  APP_LEGACY_NAME: 'Bitbucket PR Approver Local',
   APP_VERSION: '1.0.0',
   DEFAULT_PORT: 3100,
   DEFAULT_HOST: '127.0.0.1', // Strictly local loopback binding for security

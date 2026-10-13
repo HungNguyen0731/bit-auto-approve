@@ -1,5 +1,5 @@
-Bitbucket PR Approver for macOS
-================================
+GitPulse (Bitbucket PR Approver) for macOS
+========================================
 
 Ứng dụng SwiftUI này thay thế thao tác cấu hình job qua website. Người dùng nhập
 URL HTTPS của Control Plane và Owner password trong cửa sổ Mac, tạo các

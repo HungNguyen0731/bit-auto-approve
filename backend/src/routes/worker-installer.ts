@@ -231,7 +231,7 @@ export async function registerWorkerInstallerRoutes(
     }
   });
   app.get<{ Params: { filename: string } }>('/downloads/:filename', async (request, reply) => {
-    const match = /^Bitbucket-PR-Approver-(\d+\.\d+\.\d+)-macOS\.zip$/.exec(request.params.filename);
+    const match = /^(?:Bitbucket-PR-Approver|GitPulse)-(\d+\.\d+\.\d+)-macOS\.zip$/.exec(request.params.filename);
     if (!match) return reply.status(404).send();
     try {
       const release = await latestMacRelease();
@@ -257,7 +257,7 @@ export async function registerWorkerInstallerRoutes(
         }
         reply.status(206).header('Content-Range', `bytes ${start}-${end}/${fileSize}`);
       }
-      reply.header('Content-Disposition', `attachment; filename="Bitbucket-PR-Approver-${release.version}-macOS.zip"`);
+      reply.header('Content-Disposition', `attachment; filename="${request.params.filename}"`);
       reply.header('Cache-Control', 'public, max-age=600');
       reply.header('Accept-Ranges', 'bytes');
       reply.header('Content-Length', end - start + 1);

@@ -7,6 +7,3493 @@ import Security
 import WebKit
 import Network
 
+// MARK: - Native Git Manager
+
+private struct GitRepository: Identifiable, Codable {
+    var id: String { path }
+    let path: String
+    var branch: String
+    var summary: String
+    var dirty: Bool
+    var ahead: Int
+    var behind: Int
+}
+
+private enum GitStatusCategory {
+    case modified
+    case added
+    case deleted
+    case untracked
+    case conflicted
+    case renamed
+    case copied
+    case unknown(Character)
+
+    var code: String {
+        switch self {
+        case .modified: return "M"
+        case .added: return "A"
+        case .deleted: return "D"
+        case .untracked: return "?"
+        case .conflicted: return "!"
+        case .renamed: return "R"
+        case .copied: return "C"
+        case .unknown(let ch): return String(ch)
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .modified: return "Modified"
+        case .added: return "Added"
+        case .deleted: return "Deleted"
+        case .untracked: return "Untracked"
+        case .conflicted: return "Conflicted"
+        case .renamed: return "Renamed"
+        case .copied: return "Copied"
+        case .unknown: return "Changed"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .modified: return "square.and.pencil"
+        case .added: return "plus.circle.fill"
+        case .deleted: return "minus.circle.fill"
+        case .untracked: return "questionmark.circle.fill"
+        case .conflicted: return "exclamationmark.triangle.fill"
+        case .renamed: return "arrow.triangle.branch"
+        case .copied: return "doc.on.doc.fill"
+        case .unknown: return "doc.badge.ellipsis"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .modified: return AppPalette.amber
+        case .added: return AppPalette.mint
+        case .deleted: return AppPalette.red
+        case .untracked: return AppPalette.purple
+        case .conflicted: return AppPalette.red
+        case .renamed: return AppPalette.teal
+        case .copied: return AppPalette.teal
+        case .unknown: return Color.secondary
+        }
+    }
+}
+
+private struct GitStatusBadge: View {
+    let status: GitStatusCategory
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: status.systemImage)
+                .font(.system(size: 10, weight: .bold))
+            Text(status.code)
+                .font(.system(size: 9.5, weight: .heavy, design: .monospaced))
+        }
+        .foregroundStyle(status.color)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 2.5)
+        .background(status.color.opacity(0.14), in: RoundedRectangle(cornerRadius: 4))
+        .overlay(RoundedRectangle(cornerRadius: 4).stroke(status.color.opacity(0.35), lineWidth: 0.8))
+        .help(status.label)
+    }
+}
+
+private struct GitFileChange: Identifiable {
+    var id: String { path }
+    let path: String
+    let index: Character
+    let worktree: Character
+    var staged: Bool { index != " " && index != "?" }
+    var unstaged: Bool { worktree != " " || index == "?" }
+    var untracked: Bool { index == "?" }
+    var conflicted: Bool { index == "U" || worktree == "U" || (index == "A" && worktree == "A") || (index == "D" && worktree == "D") }
+
+    var filename: String {
+        URL(fileURLWithPath: path).lastPathComponent
+    }
+
+    var directory: String {
+        let parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
+        return (parent.isEmpty || parent == ".") ? "" : parent
+    }
+
+    func statusType(staged: Bool) -> GitStatusCategory {
+        if conflicted { return .conflicted }
+        let char = staged ? index : (untracked ? "?" : worktree)
+        switch char {
+        case "M": return .modified
+        case "A": return .added
+        case "D": return .deleted
+        case "?": return .untracked
+        case "U": return .conflicted
+        case "R": return .renamed
+        case "C": return .copied
+        default: return .unknown(char)
+        }
+    }
+}
+
+private struct GitCommit: Identifiable {
+    let id: String
+    let parents: [String]
+    let refs: String
+    let author: String
+    let date: String
+    let message: String
+}
+
+private struct GitSnapshot {
+    let repository: GitRepository
+    let changes: [GitFileChange]
+    let commits: [GitCommit]
+    let branches: [String]
+    let stashes: [String]
+    var remotes: [String] = []
+    var tags: [String] = []
+    var remoteBranches: [String] = []
+}
+
+private struct GitCommandError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// Invoked only on GitManagerModel's serial worker queue. No shell interpolation.
+private enum GitProcessService {
+    static func run(_ path: String, _ arguments: [String], allowed: Set<Int32> = [0]) throws -> String {
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let outURL = temporary.appendingPathComponent("stdout")
+        let errURL = temporary.appendingPathComponent("stderr")
+        FileManager.default.createFile(atPath: outURL.path, contents: nil)
+        FileManager.default.createFile(atPath: errURL.path, contents: nil)
+        let output = try FileHandle(forWritingTo: outURL)
+        let errors = try FileHandle(forWritingTo: errURL)
+        defer { try? output.close(); try? errors.close() }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["--literal-pathspecs", "-C", path] + arguments
+        process.standardOutput = output
+        process.standardError = errors
+        process.standardInput = FileHandle.nullDevice
+        var environment = ProcessInfo.processInfo.environment
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment["GIT_PAGER"] = "cat"
+        environment["LC_ALL"] = "C"
+        environment["GIT_OPTIONAL_LOCKS"] = "0"
+        process.environment = environment
+        try process.run()
+        let deadline = Date().addingTimeInterval(90)
+        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+        if process.isRunning {
+            process.terminate()
+            Thread.sleep(forTimeInterval: 0.2)
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            process.waitUntilExit()
+            throw GitCommandError(message: "Git operation timed out after 90 seconds. Refresh before retrying.")
+        }
+        process.waitUntilExit()
+        let result = String(decoding: try Data(contentsOf: outURL), as: UTF8.self)
+        if !allowed.contains(process.terminationStatus) {
+            let detail = String(decoding: (try? Data(contentsOf: errURL)) ?? Data(), as: UTF8.self)
+            throw GitCommandError(message: detail.isEmpty ? "Git exited with status \(process.terminationStatus)." : detail)
+        }
+        return result
+    }
+
+    static func parseStatus(_ raw: String) -> [GitFileChange] {
+        let entries = raw.split(separator: "\0", omittingEmptySubsequences: true).map(String.init)
+        var changes: [GitFileChange] = []
+        var i = 0
+        while i < entries.count {
+            let entry = entries[i]
+            let characters = Array(entry)
+            if characters.count >= 4 {
+                let x = characters[0], y = characters[1]
+                changes.append(GitFileChange(path: String(characters.dropFirst(3)), index: x, worktree: y))
+                // Porcelain -z records destination first, followed by original path for renames/copies.
+                if x == "R" || x == "C" || y == "R" || y == "C" { i += 1 }
+            }
+            i += 1
+        }
+        return changes
+    }
+
+    static func repository(_ path: String) throws -> GitRepository {
+        let changes = parseStatus(try run(path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]))
+        let branch = (try? run(path, ["symbolic-ref", "--quiet", "--short", "HEAD"]))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let detached = (try? run(path, ["rev-parse", "--short", "HEAD"]))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "unborn"
+        let counts = ((try? run(path, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])) ?? "").split(whereSeparator: { $0.isWhitespace }).compactMap { Int($0) }
+        let summary = ((try? run(path, ["log", "-1", "--format=%s"])) ?? "No commits yet").trimmingCharacters(in: .whitespacesAndNewlines)
+        return GitRepository(path: path, branch: branch ?? "Detached \(detached)", summary: summary,
+                             dirty: !changes.isEmpty, ahead: counts.first ?? 0, behind: counts.count > 1 ? counts[1] : 0)
+    }
+
+    static func scanSpecificFolders(_ urls: [URL]) -> [GitRepository] {
+        let manager = FileManager.default
+        var paths: Set<String> = []
+        for url in urls {
+            let standardized = url.standardizedFileURL
+            if manager.fileExists(atPath: standardized.appendingPathComponent(".git").path) {
+                paths.insert(standardized.path)
+            } else if let subdirs = try? manager.contentsOfDirectory(at: standardized, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
+                for sub in subdirs {
+                    if manager.fileExists(atPath: sub.appendingPathComponent(".git").path) {
+                        paths.insert(sub.standardizedFileURL.path)
+                    }
+                }
+            }
+        }
+        return paths.sorted().compactMap { try? repository($0) }
+    }
+
+    static func scan(_ root: URL) throws -> [GitRepository] {
+        let manager = FileManager.default
+        var paths: Set<String> = []
+        func inspect(_ url: URL) {
+            if manager.fileExists(atPath: url.appendingPathComponent(".git").path) { paths.insert(url.standardizedFileURL.path) }
+        }
+        inspect(root)
+        let excluded: Set<String> = [".git", "node_modules", ".build", "vendor", "Pods", "DerivedData", ".Trash"]
+        guard let enumerator = manager.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: [], errorHandler: { _, _ in true }) else {
+            throw GitCommandError(message: "Cannot read the selected folder.")
+        }
+        for case let url as URL in enumerator {
+            let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            if excluded.contains(url.lastPathComponent) || values?.isSymbolicLink == true { enumerator.skipDescendants(); continue }
+            if values?.isDirectory == true { inspect(url) }
+        }
+        return paths.sorted().compactMap { try? repository($0) }
+    }
+
+    static func snapshot(_ path: String) throws -> GitSnapshot {
+        let repo = try repository(path)
+        let changes = parseStatus(try run(path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]))
+        let raw = (try? run(path, ["log", "--all", "HEAD", "--topo-order", "-n", "250", "--date=iso-strict", "--format=%H%x00%P%x00%D%x00%an%x00%ad%x00%s%x00"])) ?? ""
+        let fields = raw.components(separatedBy: "\0")
+        var commits: [GitCommit] = []
+        var i = 0
+        while i + 5 < fields.count {
+            let hash = fields[i].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !hash.isEmpty {
+                commits.append(GitCommit(id: hash, parents: fields[i + 1].split(separator: " ").map(String.init), refs: fields[i + 2], author: fields[i + 3], date: fields[i + 4], message: fields[i + 5]))
+            }
+            i += 6
+        }
+        let branches = (try? run(path, ["for-each-ref", "--format=%(refname:short)", "refs/heads/"]))?
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty } ?? []
+        let stashes = (try? run(path, ["stash", "list", "--format=%gd: %s"]))?
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty } ?? []
+        let remotes = (try? run(path, ["remote"]))?
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty } ?? []
+        let tags = (try? run(path, ["tag", "-l"]))?
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty } ?? []
+        let remoteBranches = (try? run(path, ["branch", "-r", "--format=%(refname:short)"]))?
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.hasSuffix("/HEAD") } ?? []
+        return GitSnapshot(repository: repo, changes: changes, commits: commits, branches: branches, stashes: stashes, remotes: remotes, tags: tags, remoteBranches: remoteBranches)
+    }
+
+    static func diff(_ path: String, change: GitFileChange?, staged: Bool, commit: GitCommit?) throws -> String {
+        if let commit = commit { return try run(path, ["show", "--format=fuller", "--stat", "--patch", "--no-ext-diff", "--no-textconv", "--no-color", commit.id]) }
+        guard let change = change else { return "Select a file or commit to inspect its diff." }
+        if change.untracked {
+            return try run(path, ["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", "--", "/dev/null", change.path], allowed: [0, 1])
+        }
+        return try run(path, ["diff", "--no-ext-diff", "--no-textconv", "--no-color"] + (staged ? ["--cached"] : []) + ["--", change.path])
+    }
+}
+
+private enum GitViewMode {
+    case repositoryBrowser
+    case workspace
+}
+
+private final class GitManagerModel: ObservableObject {
+    @Published var root: URL?
+    @Published var repositories: [GitRepository] = []
+    @Published var excludedPaths: Set<String> = []
+    @Published var selectedPath: String?
+    @Published var viewMode: GitViewMode = .repositoryBrowser
+    @Published var openTabs: [String] = []
+    @Published var snapshot: GitSnapshot?
+    @Published var diff = "Select a file or commit to inspect its diff."
+    @Published var selectedCommit: GitCommit?
+    @Published var selectedFile: GitFileChange?
+    @Published var fileIsStaged = false
+    @Published var busy = false
+    @Published var message = "Choose a folder to discover Git repositories, including nested repositories."
+    private let queue = DispatchQueue(label: "app.git-manager", qos: .userInitiated)
+    private let excludedKey = "BitbucketPRApprover.GitManager.excludedPaths"
+    private let reposKey = "BitbucketPRApprover.GitManager.repositories"
+    private let selectedRepoKey = "BitbucketPRApprover.GitManager.selectedPath"
+    private let openTabsKey = "BitbucketPRApprover.GitManager.openTabs"
+    private var snapshotCache: [String: GitSnapshot] = [:]
+
+    init() {
+        if let stored = UserDefaults.standard.stringArray(forKey: excludedKey) {
+            excludedPaths = Set(stored)
+        }
+        if let data = UserDefaults.standard.data(forKey: reposKey),
+           let list = try? JSONDecoder().decode([GitRepository].self, from: data) {
+            repositories = list.filter { !excludedPaths.contains($0.path) }
+        }
+        if let tabs = UserDefaults.standard.stringArray(forKey: openTabsKey) {
+            openTabs = tabs
+        }
+        if let savedPath = UserDefaults.standard.string(forKey: selectedRepoKey),
+           repositories.contains(where: { $0.path == savedPath }) {
+            selectedPath = savedPath
+            viewMode = .workspace
+            refresh()
+        }
+    }
+
+    private func persistExcluded() {
+        UserDefaults.standard.set(Array(excludedPaths), forKey: excludedKey)
+    }
+
+    private func persistRepositories() {
+        if let data = try? JSONEncoder().encode(repositories) {
+            UserDefaults.standard.set(data, forKey: reposKey)
+        }
+    }
+
+    private func persistTabsAndSelection() {
+        UserDefaults.standard.set(openTabs, forKey: openTabsKey)
+        if let selectedPath = selectedPath {
+            UserDefaults.standard.set(selectedPath, forKey: selectedRepoKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: selectedRepoKey)
+        }
+    }
+
+    func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Git Repositories or Workspace Folder"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK {
+            let urls = panel.urls
+            if urls.count > 1 {
+                scanMultiple(urls)
+            } else if let single = urls.first {
+                scan(single)
+            }
+        }
+    }
+
+    func scanMultiple(_ urls: [URL]) {
+        guard !busy else { return }
+        root = urls.first
+        busy = true
+        message = "Scanning \(urls.count) selected folders…"
+        queue.async {
+            let repos = GitProcessService.scanSpecificFolders(urls)
+            DispatchQueue.main.async {
+                self.repositories = repos.filter { !self.excludedPaths.contains($0.path) }
+                self.persistRepositories()
+                self.snapshot = nil
+                self.selectedPath = nil
+                self.selectedFile = nil
+                self.selectedCommit = nil
+                self.diff = "Select a file or commit to inspect its diff."
+                self.busy = false
+                self.viewMode = .repositoryBrowser
+                let count = self.repositories.count
+                let excludedCount = self.excludedPaths.count
+                self.message = count == 0 ? "No Git repositories found in the selected folders." : "Found \(count) repositories\(excludedCount > 0 ? " (\(excludedCount) excluded)" : "")."
+            }
+        }
+    }
+
+    func scan(_ url: URL) {
+        guard !busy else { return }
+        root = url
+        busy = true
+        message = "Scanning \(url.path)…"
+        queue.async {
+            do {
+                let repos = try GitProcessService.scan(url)
+                DispatchQueue.main.async {
+                    self.repositories = repos.filter { !self.excludedPaths.contains($0.path) }
+                    self.persistRepositories()
+                    self.snapshot = nil
+                    self.selectedPath = nil
+                    self.selectedFile = nil
+                    self.selectedCommit = nil
+                    self.diff = "Select a file or commit to inspect its diff."
+                    self.busy = false
+                    self.viewMode = .repositoryBrowser
+                    let count = self.repositories.count
+                    let excludedCount = self.excludedPaths.count
+                    self.message = count == 0 ? "No repositories found. Bare repositories are not working copies." : "Found \(count) repositories\(excludedCount > 0 ? " (\(excludedCount) excluded)" : "")."
+                }
+            } catch { self.finish(error.localizedDescription) }
+        }
+    }
+
+    func openTab(_ path: String) {
+        if !openTabs.contains(path) {
+            openTabs.append(path)
+        }
+        select(path)
+        viewMode = .workspace
+        persistTabsAndSelection()
+    }
+
+    func closeTab(_ path: String) {
+        openTabs.removeAll { $0 == path }
+        if selectedPath == path {
+            if let next = openTabs.last {
+                select(next)
+            } else {
+                selectedPath = nil
+                snapshot = nil
+                selectedFile = nil
+                selectedCommit = nil
+                diff = "Select a file or commit to inspect its diff."
+                viewMode = .repositoryBrowser
+            }
+        }
+        persistTabsAndSelection()
+    }
+
+    func showBrowser() {
+        viewMode = .repositoryBrowser
+    }
+
+    func excludeRepository(_ path: String) {
+        excludedPaths.insert(path)
+        persistExcluded()
+        withAnimation(.easeInOut(duration: 0.2)) {
+            repositories.removeAll { $0.path == path }
+            persistRepositories()
+            openTabs.removeAll { $0 == path }
+            if selectedPath == path {
+                if let next = openTabs.last {
+                    select(next)
+                } else if let nextRepo = repositories.first {
+                    select(nextRepo.path)
+                } else {
+                    selectedPath = nil
+                    snapshot = nil
+                    selectedFile = nil
+                    selectedCommit = nil
+                    diff = "Select a file or commit to inspect its diff."
+                    viewMode = .repositoryBrowser
+                }
+            }
+            persistTabsAndSelection()
+        }
+        let repoName = URL(fileURLWithPath: path).lastPathComponent
+        message = "Excluded '\(repoName)' from list. (Files on disk remain unchanged)"
+    }
+
+    func restoreExcludedRepositories() {
+        excludedPaths.removeAll()
+        persistExcluded()
+        if let root = root {
+            scan(root)
+        } else {
+            message = "Excluded repository filters reset."
+        }
+    }
+
+    func restoreRepository(_ path: String) {
+        excludedPaths.remove(path)
+        persistExcluded()
+        if let root = root {
+            scan(root)
+        }
+    }
+
+    func select(_ path: String) {
+        guard !busy else { return }
+        selectedPath = path
+        selectedCommit = nil
+        selectedFile = nil
+        diff = "Select a file or commit to inspect its diff."
+        // Fast display from cache if available to prevent UI lag
+        if let cached = snapshotCache[path] {
+            snapshot = cached
+        } else {
+            snapshot = nil
+        }
+        persistTabsAndSelection()
+        refresh()
+    }
+
+    func refresh() { perform(nil) }
+
+    func perform(_ arguments: [String]?) {
+        guard !busy, let path = selectedPath else { return }
+        busy = true
+        queue.async {
+            do {
+                if let arguments = arguments { _ = try GitProcessService.run(path, arguments) }
+                let state = try GitProcessService.snapshot(path)
+                DispatchQueue.main.async {
+                    self.snapshotCache[path] = state
+                    self.snapshot = state
+                    if let index = self.repositories.firstIndex(where: { $0.path == path }) {
+                        self.repositories[index] = state.repository
+                        self.persistRepositories()
+                    }
+                    self.selectedFile = nil
+                    self.selectedCommit = nil
+                    self.diff = "Select a file or commit to inspect its diff."
+                    self.busy = false
+                    self.message = arguments == nil ? "Repository refreshed." : "Git operation completed."
+                }
+            } catch { self.finish(error.localizedDescription) }
+        }
+    }
+
+    func performSequence(_ commands: [[String]]) {
+        guard !busy, let path = selectedPath else { return }
+        busy = true
+        queue.async {
+            do {
+                for args in commands {
+                    _ = try GitProcessService.run(path, args)
+                }
+                let state = try GitProcessService.snapshot(path)
+                DispatchQueue.main.async {
+                    self.snapshot = state
+                    if let index = self.repositories.firstIndex(where: { $0.path == path }) { self.repositories[index] = state.repository }
+                    self.selectedFile = nil
+                    self.selectedCommit = nil
+                    self.diff = "Select a file or commit to inspect its diff."
+                    self.busy = false
+                    self.message = "Branch checked out and updated from remote."
+                }
+            } catch { self.finish(error.localizedDescription) }
+        }
+    }
+
+    func inspect(file: GitFileChange? = nil, staged: Bool = false, commit: GitCommit? = nil) {
+        guard !busy, let path = selectedPath else { return }
+        selectedFile = file
+        fileIsStaged = staged
+        selectedCommit = commit
+        busy = true
+        queue.async {
+            do {
+                let text = try GitProcessService.diff(path, change: file, staged: staged, commit: commit)
+                DispatchQueue.main.async {
+                    self.diff = text.isEmpty ? "No textual changes (the file may be binary)." : String(text.prefix(500_000))
+                    self.busy = false
+                }
+            } catch { self.finish(error.localizedDescription) }
+        }
+    }
+
+    func unstage(_ file: GitFileChange?) {
+        let paths = file.map { [$0.path] } ?? ["."]
+        // git rm --cached is the correct index-only operation on an unborn branch.
+        if snapshot?.commits.isEmpty == true {
+            perform(["rm", "--cached", "-r", "--"] + paths)
+        } else { perform(["reset", "HEAD", "--"] + paths) }
+    }
+
+    private func finish(_ text: String) {
+        DispatchQueue.main.async { self.message = text; self.busy = false }
+    }
+}
+
+private struct GitGraphRow {
+    let lane: Int
+    let before: [String]
+    let after: [String]
+    let parentLanes: [Int]
+}
+
+private enum GitGraphLayout {
+    static func rows(_ commits: [GitCommit]) -> [GitGraphRow] {
+        var lanes: [String] = []
+        return commits.map { commit in
+            if !lanes.contains(commit.id) { lanes.append(commit.id) }
+            let before = lanes
+            let lane = lanes.firstIndex(of: commit.id)!
+            lanes.remove(at: lane)
+            for (offset, parent) in commit.parents.enumerated() where !lanes.contains(parent) {
+                lanes.insert(parent, at: min(lane + offset, lanes.count))
+            }
+            return GitGraphRow(lane: lane, before: before, after: lanes, parentLanes: commit.parents.compactMap { lanes.firstIndex(of: $0) })
+        }
+    }
+}
+
+private struct GitGraphCell: View {
+    let row: GitGraphRow
+    private let colors: [Color] = [AppPalette.blue, AppPalette.amber, AppPalette.purple, AppPalette.mint, AppPalette.teal, Color.pink]
+    var body: some View {
+        Canvas { context, size in
+            func x(_ lane: Int) -> CGFloat { CGFloat(lane) * 16 + 10 }
+            for (index, hash) in row.before.enumerated() where index != row.lane {
+                if let next = row.after.firstIndex(of: hash) {
+                    var path = Path()
+                    path.move(to: CGPoint(x: x(index), y: 0))
+                    path.addCurve(to: CGPoint(x: x(next), y: size.height), control1: CGPoint(x: x(index), y: size.height * 0.5), control2: CGPoint(x: x(next), y: size.height * 0.5))
+                    context.stroke(path, with: .color(colors[index % colors.count]), lineWidth: 2)
+                }
+            }
+            var incoming = Path()
+            incoming.move(to: CGPoint(x: x(row.lane), y: 0))
+            incoming.addLine(to: CGPoint(x: x(row.lane), y: size.height / 2))
+            context.stroke(incoming, with: .color(colors[row.lane % colors.count]), lineWidth: 2)
+            for parent in row.parentLanes {
+                var path = Path()
+                path.move(to: CGPoint(x: x(row.lane), y: size.height / 2))
+                path.addCurve(to: CGPoint(x: x(parent), y: size.height), control1: CGPoint(x: x(row.lane), y: size.height * 0.8), control2: CGPoint(x: x(parent), y: size.height * 0.8))
+                context.stroke(path, with: .color(colors[parent % colors.count]), lineWidth: 2)
+            }
+            context.fill(Path(ellipseIn: CGRect(x: x(row.lane) - 4, y: size.height / 2 - 4, width: 8, height: 8)), with: .color(colors[row.lane % colors.count]))
+        }.frame(width: CGFloat(max(row.before.count, row.after.count, 1)) * 16 + 12, height: 50).accessibilityHidden(true)
+    }
+}
+
+private enum GitManagerSheet: Identifiable {
+    case pull, push, fetch, branch, merge, stash, checkoutRemote(String)
+    var id: String {
+        switch self {
+        case .pull: return "pull"
+        case .push: return "push"
+        case .fetch: return "fetch"
+        case .branch: return "branch"
+        case .merge: return "merge"
+        case .stash: return "stash"
+        case .checkoutRemote(let b): return "checkoutRemote_\(b)"
+        }
+    }
+}
+
+private struct GitManagerView: View {
+    @ObservedObject var model: GitManagerModel
+    @State private var search = ""
+    @State private var historySearch = ""
+    @State private var mode = 0
+    @State private var commitMessage = ""
+    @State private var amend = false
+    @State private var branchName = ""
+    @State private var stashMessage = ""
+    @State private var discard: GitFileChange?
+    @State private var confirmDiscard = false
+    @State private var confirmAmend = false
+    @State private var repoToExclude: GitRepository?
+    @State private var confirmExclude = false
+    @State private var isRepoListCollapsed = false
+    @State private var isDiffCollapsed = false
+    @State private var isDiffMaximized = false
+
+    // SourceTree Header Sheets state
+    @State private var activeSheet: GitManagerSheet? = nil
+    @State private var pullRemote = "origin"
+    @State private var pullBranch = ""
+    @State private var pullRebase = false
+
+    @State private var pushRemote = "origin"
+    @State private var pushForce = false
+    @State private var pushTags = false
+
+    @State private var fetchRemote = "origin"
+    @State private var fetchAllRemotes = true
+    @State private var fetchPrune = true
+    @State private var fetchTags = true
+
+    @State private var branchTab = 0
+    @State private var branchNameInput = ""
+    @State private var checkoutTargetBranch = ""
+    @State private var checkoutNewImmediately = true
+
+    @State private var mergeTargetBranch = ""
+    @State private var mergeNoFf = false
+
+    @State private var stashMessageInput = ""
+
+    // Checkout Remote Branch state (SourceTree style)
+    @State private var checkoutRemoteTarget = ""
+    @State private var checkoutRemoteLocalName = ""
+    @State private var checkoutRemoteTrack = true
+    @State private var checkoutRemotePull = true
+
+    var body: some View {
+        VStack(spacing: 0) {
+            navigationTabBar
+            Divider()
+            if model.viewMode == .repositoryBrowser || model.selectedPath == nil {
+                repositoryBrowserView
+            } else {
+                workspaceView
+            }
+            Divider()
+            statusBar
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .disabled(model.busy)
+        .alert("Discard working-copy changes?", isPresented: $confirmDiscard) {
+            Button("Cancel", role: .cancel) { discard = nil }
+            Button("Discard", role: .destructive) {
+                if let file = discard { model.perform(["restore", "--worktree", "--", file.path]) }
+                discard = nil
+            }
+        } message: { Text("This permanently discards unstaged changes to \(discard?.path ?? "the file"). Staged content is preserved. Untracked files cannot be discarded here.") }
+        .alert("Amend the latest commit?", isPresented: $confirmAmend) {
+            Button("Cancel", role: .cancel) {}
+            Button("Amend Commit", role: .destructive) { commit() }
+        } message: { Text("Amend rewrites the current branch's latest commit. Avoid amending commits already shared with others.") }
+        .alert("Exclude repository from list?", isPresented: $confirmExclude) {
+            Button("Cancel", role: .cancel) { repoToExclude = nil }
+            Button("Exclude from List", role: .destructive) {
+                if let repo = repoToExclude {
+                    model.excludeRepository(repo.path)
+                }
+                repoToExclude = nil
+            }
+        } message: {
+            Text("Exclude '\(repoToExclude.map { URL(fileURLWithPath: $0.path).lastPathComponent } ?? "this repository")' from the scanned list?\n\nThis will only hide it from the Git Manager list. No files or git histories will be deleted from your disk.")
+        }
+        .sheet(item: $activeSheet) { sheet in
+            switch sheet {
+            case .pull: pullSheet
+            case .push: pushSheet
+            case .fetch: fetchSheet
+            case .branch: branchSheet
+            case .merge: mergeSheet
+            case .stash: stashSheet
+            case .checkoutRemote(let rb): checkoutRemoteSheet(rb)
+            }
+        }
+    }
+
+    private var navigationTabBar: some View {
+        HStack(spacing: 4) {
+            // Back arrow button to return to Repositories list
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    model.showBrowser()
+                }
+            } label: {
+                Image(systemName: "arrow.left")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(model.viewMode == .repositoryBrowser ? Color.secondary.opacity(0.4) : AppPalette.blue)
+                    .frame(width: 26, height: 26)
+                    .background(
+                        model.viewMode == .repositoryBrowser
+                            ? Color.clear
+                            : AppPalette.blue.opacity(0.12),
+                        in: RoundedRectangle(cornerRadius: 6)
+                    )
+            }
+            .buttonStyle(.plain)
+            .disabled(model.viewMode == .repositoryBrowser)
+            .help("Back to Repositories list")
+            .padding(.leading, 8)
+
+            // Repositories Bookmarks Tab
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    model.showBrowser()
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "folder.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(AppPalette.blue)
+                    Text("Repositories")
+                        .font(.system(size: 11.5, weight: model.viewMode == .repositoryBrowser ? .bold : .medium))
+                    Text("\(model.repositories.count)")
+                        .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                        .padding(.horizontal, 4.5)
+                        .padding(.vertical, 1)
+                        .background(AppPalette.blue.opacity(0.15), in: Capsule())
+                        .foregroundStyle(AppPalette.blue)
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(
+                    model.viewMode == .repositoryBrowser
+                        ? AppPalette.surface
+                        : Color.secondary.opacity(0.06),
+                    in: RoundedRectangle(cornerRadius: 6)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(model.viewMode == .repositoryBrowser ? AppPalette.blue.opacity(0.45) : Color.clear, lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+            .help("View discovered repositories list")
+
+            // Open Repository Tabs
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(model.openTabs, id: \.self) { path in
+                        let repo = model.repositories.first(where: { $0.path == path })
+                        let repoName = repo.map { URL(fileURLWithPath: $0.path).lastPathComponent } ?? URL(fileURLWithPath: path).lastPathComponent
+                        let isActive = model.viewMode == .workspace && model.selectedPath == path
+                        let isDirty = repo?.dirty ?? false
+
+                        HStack(spacing: 5) {
+                            if isDirty {
+                                Circle()
+                                    .fill(AppPalette.amber)
+                                    .frame(width: 6, height: 6)
+                                    .help("Uncommitted changes")
+                            } else {
+                                Image(systemName: "arrow.triangle.branch")
+                                    .font(.system(size: 9.5))
+                                    .foregroundStyle(isActive ? AppPalette.blue : Color.secondary)
+                            }
+
+                            Text(repoName)
+                                .font(.system(size: 11.5, weight: isActive ? .bold : .medium))
+                                .foregroundStyle(isActive ? .primary : .secondary)
+                                .lineLimit(1)
+
+                            if let branch = repo?.branch {
+                                Text(branch)
+                                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                    .foregroundStyle(AppPalette.blue)
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 1)
+                                    .background(AppPalette.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 3))
+                                    .lineLimit(1)
+                            }
+
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    model.closeTab(path)
+                                }
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 8.5, weight: .bold))
+                                    .foregroundStyle(Color.secondary)
+                                    .frame(width: 14, height: 14)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help("Close \(repoName) tab")
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(
+                            isActive
+                                ? AppPalette.surface
+                                : Color.secondary.opacity(0.06),
+                            in: RoundedRectangle(cornerRadius: 6)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(isActive ? AppPalette.blue.opacity(0.5) : Color.clear, lineWidth: 1)
+                        )
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                model.select(path)
+                                model.viewMode = .workspace
+                            }
+                        }
+                    }
+                }
+            }
+
+            // '+' Button (Open another repository into tab)
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    model.showBrowser()
+                }
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Color.secondary)
+                    .frame(width: 24, height: 24)
+                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 5))
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 4)
+            .help("Open another repository into a new tab (+)")
+
+            Spacer()
+
+            // Active repository & branch info
+            if model.viewMode == .workspace, let snapshot = model.snapshot {
+                HStack(spacing: 6) {
+                    Text(URL(fileURLWithPath: snapshot.repository.path).lastPathComponent)
+                        .font(.system(size: 11, weight: .bold))
+                    Text("/")
+                        .foregroundStyle(.secondary)
+                    Text(snapshot.repository.branch)
+                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                        .foregroundStyle(AppPalette.blue)
+                }
+                .padding(.trailing, 12)
+            }
+        }
+        .padding(.vertical, 4)
+        .background(Color.secondary.opacity(0.04))
+    }
+
+    private var repositoryBrowserView: some View {
+        VStack(spacing: 0) {
+            // Browser Header
+            HStack(spacing: 12) {
+                HStack(spacing: 8) {
+                    Image(systemName: "folder.badge.gearshape")
+                        .font(.system(size: 20))
+                        .foregroundStyle(AppPalette.blue)
+                        .padding(8)
+                        .background(AppPalette.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text("Repositories")
+                                .font(.title3.bold())
+                            Text("\(model.repositories.count) found")
+                                .font(.caption.bold())
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(AppPalette.blue.opacity(0.14), in: Capsule())
+                                .foregroundStyle(AppPalette.blue)
+                        }
+                        Text("Choose folder(s) to scan: select multiple folders to add repositories directly, or one folder to scan all nested repositories")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Spacer()
+
+                // Filter search field
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField("Filter repositories…", text: $search)
+                        .textFieldStyle(.plain)
+                        .font(.caption)
+                    if !search.isEmpty {
+                        Button { search = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2), lineWidth: 0.8))
+                .frame(width: 220)
+
+                // Choose Folder Button
+                Button {
+                    model.chooseFolder()
+                } label: {
+                    Label("Choose Folder(s)…", systemImage: "folder.badge.plus")
+                        .font(.caption.bold())
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(AppPalette.blue)
+                .controlSize(.regular)
+                .help("Select one folder to scan all nested repositories, or select multiple folders to add Git repositories directly")
+
+                // Rescan Button
+                Button {
+                    if let root = model.root { model.scan(root) }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.caption.bold())
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .disabled(model.root == nil)
+                .help("Rescan current workspace folder")
+
+                if !model.excludedPaths.isEmpty {
+                    Button("Restore All (\(model.excludedPaths.count))") {
+                        model.restoreExcludedRepositories()
+                    }
+                    .buttonStyle(.bordered)
+                    .font(.caption)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(AppPalette.surface.opacity(0.7))
+
+            Divider()
+
+            // Browser Body
+            let filtered = model.repositories.filter {
+                search.isEmpty ||
+                $0.path.localizedCaseInsensitiveContains(search) ||
+                $0.branch.localizedCaseInsensitiveContains(search)
+            }
+
+            if model.repositories.isEmpty {
+                VStack(spacing: 12) {
+                    Spacer().frame(height: 60)
+                    Image(systemName: "folder.badge.questionmark")
+                        .font(.system(size: 48))
+                        .foregroundStyle(Color.secondary.opacity(0.6))
+                    Text("No Repositories Discovered")
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                    Text("Click 'Choose Folder(s)…' to select one folder to scan all nested repositories, or select multiple folders to add repositories directly.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 420)
+
+                    Button {
+                        model.chooseFolder()
+                    } label: {
+                        Label("Choose Folder(s) to Scan…", systemImage: "folder.badge.plus")
+                            .font(.callout.bold())
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(AppPalette.blue)
+                    .controlSize(.large)
+                    .padding(.top, 8)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if filtered.isEmpty {
+                VStack(spacing: 10) {
+                    Spacer().frame(height: 60)
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.secondary)
+                    Text("No repositories match '\(search)'")
+                        .font(.callout.bold())
+                        .foregroundStyle(.secondary)
+                    Button("Clear Filter") { search = "" }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 320, maximum: 480), spacing: 14)],
+                        spacing: 14
+                    ) {
+                        ForEach(filtered) { repo in
+                            repoBrowserCard(repo)
+                        }
+                    }
+                    .padding(16)
+                }
+            }
+        }
+    }
+
+    private func repoBrowserCard(_ repo: GitRepository) -> some View {
+        let repoName = URL(fileURLWithPath: repo.path).lastPathComponent
+        let isTabOpen = model.openTabs.contains(repo.path)
+
+        return VStack(alignment: .leading, spacing: 10) {
+            // Header Row: Folder icon, Name, Status Pill
+            HStack(spacing: 8) {
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 16))
+                    .foregroundStyle(AppPalette.blue)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(repoName)
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    Text(relative(repo.path))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                Spacer()
+
+                // Status Badge (Clean vs Modified)
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(repo.dirty ? AppPalette.amber : AppPalette.mint)
+                        .frame(width: 6, height: 6)
+                    Text(repo.dirty ? "Modified" : "Clean")
+                        .font(.system(size: 10, weight: .bold))
+                }
+                .foregroundStyle(repo.dirty ? AppPalette.amber : AppPalette.mint)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(
+                    (repo.dirty ? AppPalette.amber : AppPalette.mint).opacity(0.12),
+                    in: Capsule()
+                )
+            }
+
+            Divider()
+
+            // Branch & Ahead/Behind Info
+            HStack(spacing: 8) {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.caption2)
+                    Text(repo.branch)
+                        .font(.caption.bold())
+                        .lineLimit(1)
+                }
+                .foregroundStyle(AppPalette.blue)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2.5)
+                .background(AppPalette.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 4))
+
+                if repo.ahead > 0 || repo.behind > 0 {
+                    HStack(spacing: 5) {
+                        if repo.ahead > 0 {
+                            Text("↑\(repo.ahead)")
+                                .font(.caption2.bold().monospacedDigit())
+                                .foregroundStyle(AppPalette.mint)
+                        }
+                        if repo.behind > 0 {
+                            Text("↓\(repo.behind)")
+                                .font(.caption2.bold().monospacedDigit())
+                                .foregroundStyle(AppPalette.amber)
+                        }
+                    }
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
+                }
+
+                if isTabOpen {
+                    Text("Tab Open")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(AppPalette.mint)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(AppPalette.mint.opacity(0.14), in: Capsule())
+                }
+
+                Spacer()
+            }
+
+            // Summary of last commit
+            if !repo.summary.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "quote.bubble")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(repo.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            // Action Buttons
+            HStack(spacing: 8) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        model.openTab(repo.path)
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.right.circle.fill")
+                        Text("Open Workspace")
+                            .fontWeight(.bold)
+                    }
+                    .font(.caption)
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(AppPalette.blue)
+                .controlSize(.small)
+
+                Button {
+                    NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: repo.path)
+                } label: {
+                    Image(systemName: "folder")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Show in Finder")
+
+                Button {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                    process.arguments = ["-a", "Terminal", repo.path]
+                    try? process.run()
+                } label: {
+                    Image(systemName: "terminal")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Open Terminal")
+
+                Button {
+                    repoToExclude = repo
+                    confirmExclude = true
+                } label: {
+                    Image(systemName: "eye.slash")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Exclude from list")
+            }
+        }
+        .padding(12)
+        .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(isTabOpen ? AppPalette.blue.opacity(0.5) : Color.secondary.opacity(0.18), lineWidth: isTabOpen ? 1.5 : 1)
+        )
+        .shadow(color: Color.black.opacity(0.04), radius: 3, x: 0, y: 1)
+        .contentShape(RoundedRectangle(cornerRadius: 10))
+        .onTapGesture(count: 2) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                model.openTab(repo.path)
+            }
+        }
+    }
+
+    private var workspaceView: some View {
+        VStack(spacing: 0) {
+            toolbar
+            Divider()
+            HSplitView {
+                if !isRepoListCollapsed && !isDiffMaximized {
+                    repositoryList
+                        .frame(minWidth: 200, idealWidth: 240, maxWidth: 340, maxHeight: .infinity)
+                }
+                if !isDiffMaximized {
+                    centerPanel
+                        .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
+                }
+                if !isDiffCollapsed || isDiffMaximized {
+                    diffView
+                        .frame(minWidth: 280, idealWidth: 460, maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var toolbar: some View {
+        HStack(spacing: 8) {
+            // Panel toggles & Workspace Folder picker
+            HStack(spacing: 4) {
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                        if isDiffMaximized { isDiffMaximized = false }
+                        isRepoListCollapsed.toggle()
+                    }
+                } label: {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 13))
+                        .foregroundStyle(isRepoListCollapsed ? Color.secondary : AppPalette.blue)
+                        .padding(5)
+                        .background(isRepoListCollapsed ? Color.clear : AppPalette.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+                .help(isRepoListCollapsed ? "Show Repositories Sidebar (⌘1)" : "Collapse Repositories Sidebar (⌘1)")
+                .keyboardShortcut("1", modifiers: .command)
+
+                Button {
+                    model.chooseFolder()
+                } label: {
+                    Image(systemName: "folder.badge.plus")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Color.secondary)
+                        .padding(5)
+                }
+                .buttonStyle(.plain)
+                .help("Open Workspace Folder")
+            }
+
+            Divider().frame(height: 24).padding(.horizontal, 2)
+
+            // Primary Git Action Group (SourceTree Style)
+            let stagedCount = model.snapshot?.changes.filter { $0.staged }.count ?? 0
+            let behindCount = model.snapshot?.repository.behind ?? 0
+            let aheadCount = model.snapshot?.repository.ahead ?? 0
+
+            HStack(spacing: 4) {
+                // Commit
+                Button {
+                    mode = 0
+                } label: {
+                    sourceTreeToolbarItem(
+                        label: "Commit",
+                        icon: "plus.circle",
+                        count: stagedCount,
+                        badgeColor: AppPalette.blue
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(model.selectedPath == nil)
+                .help("Review and commit staged changes")
+
+                // Pull - opens SourceTree Pull Dialog
+                Button {
+                    pullBranch = model.snapshot?.repository.branch ?? "main"
+                    pullRemote = model.snapshot?.remotes.first ?? "origin"
+                    activeSheet = .pull
+                } label: {
+                    sourceTreeToolbarItem(
+                        label: "Pull",
+                        icon: "arrow.down.circle",
+                        count: behindCount,
+                        badgeColor: .red
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(model.selectedPath == nil)
+                .help("Pull commits from remote repository")
+
+                // Push - opens SourceTree Push Dialog
+                Button {
+                    pushRemote = model.snapshot?.remotes.first ?? "origin"
+                    activeSheet = .push
+                } label: {
+                    sourceTreeToolbarItem(
+                        label: "Push",
+                        icon: "arrow.up.circle",
+                        count: aheadCount,
+                        badgeColor: AppPalette.blue
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(model.selectedPath == nil)
+                .help("Push local commits to remote")
+
+                // Fetch - opens SourceTree Fetch Dialog
+                Button {
+                    activeSheet = .fetch
+                } label: {
+                    sourceTreeToolbarItem(
+                        label: "Fetch",
+                        icon: "arrow.down.circle.dotted"
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(model.selectedPath == nil)
+                .help("Fetch all remote changes")
+
+                // Branch - opens SourceTree Branch Dialog
+                Button {
+                    branchNameInput = ""
+                    let current = model.snapshot?.repository.branch ?? ""
+                    checkoutTargetBranch = (model.snapshot?.branches ?? []).first(where: { $0 != current }) ?? current
+                    activeSheet = .branch
+                } label: {
+                    sourceTreeToolbarItem(
+                        label: "Branch",
+                        icon: "arrow.triangle.branch"
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(model.selectedPath == nil)
+                .help("Branch management (Create and Checkout)")
+
+                // Merge - opens SourceTree Merge Dialog
+                Button {
+                    let current = model.snapshot?.repository.branch ?? ""
+                    mergeTargetBranch = (model.snapshot?.branches ?? []).first(where: { $0 != current }) ?? ""
+                    activeSheet = .merge
+                } label: {
+                    sourceTreeToolbarItem(
+                        label: "Merge",
+                        icon: "arrow.triangle.merge"
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(model.selectedPath == nil)
+                .help("Merge another branch into current branch")
+
+                // Stash - opens SourceTree Stash Dialog
+                Button {
+                    stashMessageInput = ""
+                    activeSheet = .stash
+                } label: {
+                    sourceTreeToolbarItem(
+                        label: "Stash",
+                        icon: "archivebox"
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(model.selectedPath == nil)
+                .help("Stash management")
+            }
+
+            Spacer()
+
+            // Right Group: Repository & Branch Menu, View Remote, Show in Finder, Terminal, Panel Toggles
+            HStack(spacing: 5) {
+                if let snapshot = model.snapshot {
+                    repositoryBranchMenu(snapshot)
+                    Divider().frame(height: 24).padding(.horizontal, 2)
+                }
+
+                // View Remote
+                Button {
+                    viewRemote()
+                } label: {
+                    sourceTreeToolbarItem(label: "View Remote", icon: "globe")
+                }
+                .buttonStyle(.plain)
+                .disabled(model.selectedPath == nil)
+                .help("Open repository remote in browser")
+
+                // Show in Finder
+                Button {
+                    showInFinder()
+                } label: {
+                    sourceTreeToolbarItem(label: "Show in Finder", icon: "macwindow")
+                }
+                .buttonStyle(.plain)
+                .disabled(model.selectedPath == nil)
+                .help("Reveal repository in macOS Finder")
+
+                // Terminal
+                Button {
+                    openTerminal()
+                } label: {
+                    sourceTreeToolbarItem(label: "Terminal", icon: "terminal")
+                }
+                .buttonStyle(.plain)
+                .disabled(model.selectedPath == nil)
+                .help("Open Terminal in repository path")
+
+                Divider().frame(height: 24).padding(.horizontal, 2)
+
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                        if isDiffMaximized { isDiffMaximized = false }
+                        isDiffCollapsed.toggle()
+                    }
+                } label: {
+                    Image(systemName: "sidebar.right")
+                        .font(.system(size: 13))
+                        .foregroundStyle(isDiffCollapsed ? Color.secondary : AppPalette.blue)
+                        .padding(5)
+                        .background(isDiffCollapsed ? Color.clear : AppPalette.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+                .help("Toggle Diff Panel (⌘3)")
+
+                Button {
+                    model.refresh()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Color.secondary)
+                        .padding(5)
+                }
+                .buttonStyle(.plain)
+                .disabled(model.selectedPath == nil)
+                .help("Refresh repository status")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func sourceTreeToolbarItem(
+        label: String,
+        icon: String,
+        count: Int = 0,
+        badgeColor: Color = AppPalette.blue
+    ) -> some View {
+        VStack(spacing: 2) {
+            ZStack(alignment: .topTrailing) {
+                Image(systemName: icon)
+                    .font(.system(size: 18, weight: .regular))
+                    .frame(width: 24, height: 22)
+                    .foregroundStyle(Color.primary.opacity(0.85))
+
+                if count > 0 {
+                    Text("\(count)")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 3)
+                        .padding(.vertical, 1)
+                        .background(badgeColor, in: Capsule())
+                        .offset(x: 8, y: -4)
+                }
+            }
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Color.secondary)
+        }
+        .frame(minWidth: 46, minHeight: 44)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 2)
+        .background(Color.primary.opacity(0.001))
+        .contentShape(Rectangle())
+    }
+
+    // MARK: - SourceTree Dialog Sheets
+
+    private var pullSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.down.circle")
+                    .font(.title2)
+                    .foregroundStyle(AppPalette.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Pull from repository")
+                        .font(.headline)
+                    Text("Fetch and integrate commits into current branch '\(model.snapshot?.repository.branch ?? "")'")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Pull from remote:")
+                    .font(.caption.bold())
+                Picker("", selection: $pullRemote) {
+                    if let remotes = model.snapshot?.remotes, !remotes.isEmpty {
+                        ForEach(remotes, id: \.self) { r in Text(r).tag(r) }
+                    } else {
+                        Text("origin").tag("origin")
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+
+                Text("Remote branch to pull:")
+                    .font(.caption.bold())
+
+                let current = model.snapshot?.repository.branch ?? "main"
+                let candidates: [String] = (model.snapshot?.remoteBranches ?? []).compactMap { rb in
+                    let prefix = "\(pullRemote)/"
+                    let clean = rb.hasPrefix(prefix) ? String(rb.dropFirst(prefix.count)) : rb
+                    return clean.isEmpty ? nil : clean
+                }
+
+                Picker("", selection: $pullBranch) {
+                    Text("\(current) (Current branch)").tag(current)
+                    ForEach(candidates.filter { $0 != current }, id: \.self) { b in
+                        Text(b).tag(b)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+
+                Toggle("Rebase instead of merge (--rebase)", isOn: $pullRebase)
+                    .font(.caption)
+            }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Cancel") { activeSheet = nil }
+                    .keyboardShortcut(.cancelAction)
+
+                Button("Pull") {
+                    let remote = pullRemote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "origin" : pullRemote
+                    let branch = pullBranch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? (model.snapshot?.repository.branch ?? "main") : pullBranch
+                    var args = ["pull", remote, branch]
+                    if pullRebase { args.append("--rebase") }
+                    model.perform(args)
+                    activeSheet = nil
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 420, minHeight: 270)
+        .onAppear {
+            if let cur = model.snapshot?.repository.branch {
+                pullBranch = cur
+            }
+            if let firstRemote = model.snapshot?.remotes.first {
+                pullRemote = firstRemote
+            }
+        }
+    }
+
+    private var pushSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.up.circle")
+                    .font(.title2)
+                    .foregroundStyle(AppPalette.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Push to repository")
+                        .font(.headline)
+                    Text("Push local commits to remote tracking branch")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Push to remote:")
+                    .font(.caption.bold())
+                Picker("", selection: $pushRemote) {
+                    if let remotes = model.snapshot?.remotes, !remotes.isEmpty {
+                        ForEach(remotes, id: \.self) { r in Text(r).tag(r) }
+                    } else {
+                        Text("origin").tag("origin")
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+
+                Text("Local & Remote branch:")
+                    .font(.caption.bold())
+                let current = model.snapshot?.repository.branch ?? "main"
+                HStack {
+                    Text(current)
+                        .font(.caption.monospaced().bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
+                    Image(systemName: "arrow.right")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text("\(pushRemote)/\(current)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+
+                Toggle("Force push (--force-with-lease)", isOn: $pushForce)
+                    .font(.caption)
+                Toggle("Push all tags (--tags)", isOn: $pushTags)
+                    .font(.caption)
+            }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Cancel") { activeSheet = nil }
+                    .keyboardShortcut(.cancelAction)
+
+                Button("Push") {
+                    let remote = pushRemote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "origin" : pushRemote
+                    let branch = model.snapshot?.repository.branch ?? "main"
+                    var args = ["push", remote, branch]
+                    if pushForce { args.append("--force-with-lease") }
+                    if pushTags { args.append("--tags") }
+                    model.perform(args)
+                    activeSheet = nil
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 420, minHeight: 270)
+        .onAppear {
+            if let firstRemote = model.snapshot?.remotes.first {
+                pushRemote = firstRemote
+            }
+        }
+    }
+
+    private var fetchSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.down.circle.dotted")
+                    .font(.title2)
+                    .foregroundStyle(AppPalette.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Fetch from repository")
+                        .font(.headline)
+                    Text("Download remote references and commits without merging")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle("Fetch from all remotes", isOn: $fetchAllRemotes)
+                    .font(.caption.bold())
+
+                if !fetchAllRemotes {
+                    Text("Select remote:")
+                        .font(.caption.bold())
+                    Picker("", selection: $fetchRemote) {
+                        if let remotes = model.snapshot?.remotes, !remotes.isEmpty {
+                            ForEach(remotes, id: \.self) { r in Text(r).tag(r) }
+                        } else {
+                            Text("origin").tag("origin")
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+
+                Toggle("Prune tracking branches no longer on remote (--prune)", isOn: $fetchPrune)
+                    .font(.caption)
+                Toggle("Fetch all tags (--tags)", isOn: $fetchTags)
+                    .font(.caption)
+            }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Cancel") { activeSheet = nil }
+                    .keyboardShortcut(.cancelAction)
+
+                Button("Fetch") {
+                    var args = ["fetch"]
+                    if fetchAllRemotes {
+                        args.append("--all")
+                    } else {
+                        args.append(fetchRemote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "origin" : fetchRemote)
+                    }
+                    if fetchPrune { args.append("--prune") }
+                    if fetchTags { args.append("--tags") }
+                    model.perform(args)
+                    activeSheet = nil
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 420, minHeight: 260)
+    }
+
+    private var branchSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.title2)
+                    .foregroundStyle(AppPalette.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Branch Management")
+                        .font(.headline)
+                    Text("Current active branch: '\(model.snapshot?.repository.branch ?? "")'")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Picker("", selection: $branchTab) {
+                Text("Create Branch").tag(0)
+                Text("Checkout Branch").tag(1)
+            }
+            .pickerStyle(.segmented)
+
+            Divider()
+
+            if branchTab == 0 {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("New branch name:")
+                        .font(.caption.bold())
+                    TextField("e.g. feature/new-login or bugfix/header-pull", text: $branchNameInput)
+                        .textFieldStyle(.roundedBorder)
+
+                    Toggle("Checkout new branch immediately", isOn: $checkoutNewImmediately)
+                        .font(.caption)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Select branch to checkout:")
+                        .font(.caption.bold())
+                    let allBranches = model.snapshot?.branches ?? []
+                    Picker("", selection: $checkoutTargetBranch) {
+                        ForEach(allBranches, id: \.self) { b in
+                            Text(b).tag(b)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+            }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Cancel") { activeSheet = nil }
+                    .keyboardShortcut(.cancelAction)
+
+                if branchTab == 0 {
+                    Button("Create Branch") {
+                        let trimmed = branchNameInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty && !trimmed.hasPrefix("-") else { return }
+                        var args = ["branch", trimmed]
+                        if checkoutNewImmediately {
+                            args = ["checkout", "-b", trimmed]
+                        }
+                        model.perform(args)
+                        branchNameInput = ""
+                        activeSheet = nil
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(branchNameInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .keyboardShortcut(.defaultAction)
+                } else {
+                    Button("Checkout") {
+                        guard !checkoutTargetBranch.isEmpty else { return }
+                        model.perform(["checkout", checkoutTargetBranch])
+                        activeSheet = nil
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(checkoutTargetBranch.isEmpty || checkoutTargetBranch == model.snapshot?.repository.branch)
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 420, minHeight: 270)
+        .onAppear {
+            let current = model.snapshot?.repository.branch ?? ""
+            if let firstOther = (model.snapshot?.branches ?? []).first(where: { $0 != current }) {
+                checkoutTargetBranch = firstOther
+            }
+        }
+    }
+
+    private var mergeSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.triangle.merge")
+                    .font(.title2)
+                    .foregroundStyle(AppPalette.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Merge Branch")
+                        .font(.headline)
+                    Text("Merge commits into current branch '\(model.snapshot?.repository.branch ?? "")'")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                let current = model.snapshot?.repository.branch ?? ""
+                let otherBranches = (model.snapshot?.branches ?? []).filter { $0 != current }
+
+                Text("Select branch to merge:")
+                    .font(.caption.bold())
+
+                if otherBranches.isEmpty {
+                    Text("No other branches available to merge.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Picker("", selection: $mergeTargetBranch) {
+                        ForEach(otherBranches, id: \.self) { b in
+                            Text(b).tag(b)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+
+                Toggle("Always create a merge commit (--no-ff)", isOn: $mergeNoFf)
+                    .font(.caption)
+            }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Cancel") { activeSheet = nil }
+                    .keyboardShortcut(.cancelAction)
+
+                Button("Merge") {
+                    guard !mergeTargetBranch.isEmpty else { return }
+                    var args = ["merge", mergeTargetBranch]
+                    if mergeNoFf { args.append("--no-ff") }
+                    model.perform(args)
+                    activeSheet = nil
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(mergeTargetBranch.isEmpty)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 420, minHeight: 250)
+        .onAppear {
+            let current = model.snapshot?.repository.branch ?? ""
+            if let firstOther = (model.snapshot?.branches ?? []).first(where: { $0 != current }) {
+                mergeTargetBranch = firstOther
+            }
+        }
+    }
+
+    private var stashSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "archivebox")
+                    .font(.title2)
+                    .foregroundStyle(AppPalette.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Stash Management")
+                        .font(.headline)
+                    Text("Temporarily shelve dirty changes in working copy")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Stash description (optional):")
+                    .font(.caption.bold())
+                TextField("e.g. WIP before pulling main...", text: $stashMessageInput)
+                    .textFieldStyle(.roundedBorder)
+
+                Button {
+                    let msg = stashMessageInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    model.perform(["stash", "push", "-u", "-m", msg.isEmpty ? "Git Manager stash" : msg])
+                    stashMessageInput = ""
+                    activeSheet = nil
+                } label: {
+                    Label("Stash Changes", systemImage: "archivebox")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.snapshot?.changes.isEmpty == true)
+
+                Divider()
+
+                Text("Saved Stashes:")
+                    .font(.caption.bold())
+                if let stashes = model.snapshot?.stashes, !stashes.isEmpty {
+                    ScrollView {
+                        VStack(spacing: 6) {
+                            ForEach(stashes, id: \.self) { s in
+                                HStack {
+                                    Text(s)
+                                        .font(.caption.monospaced())
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Button("Pop / Apply") {
+                                        let idx = String(s.prefix(while: { $0 != ":" }))
+                                        model.perform(["stash", "pop", idx])
+                                        activeSheet = nil
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 120)
+                } else {
+                    Text("No stashes saved.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Close") { activeSheet = nil }
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 440, minHeight: 310)
+    }
+
+    private func checkoutRemoteSheet(_ remoteBranch: String) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.title2)
+                    .foregroundStyle(AppPalette.mint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Checkout Remote Branch")
+                        .font(.headline)
+                    Text("Create local branch tracking '\(remoteBranch)' and pull latest code (SourceTree)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Remote branch to checkout:")
+                    .font(.caption.bold())
+                Text(remoteBranch)
+                    .font(.system(size: 12, design: .monospaced))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+
+                Text("Local branch name:")
+                    .font(.caption.bold())
+                TextField("Local branch name", text: $checkoutRemoteLocalName)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+
+                Toggle("Track remote branch (--track)", isOn: $checkoutRemoteTrack)
+                    .font(.caption)
+
+                Toggle("Pull latest changes from remote after checkout", isOn: $checkoutRemotePull)
+                    .font(.caption)
+            }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Cancel") { activeSheet = nil }
+                    .keyboardShortcut(.cancelAction)
+
+                Button("Checkout & Pull") {
+                    executeCheckoutAndPull(remoteBranch: remoteBranch)
+                    activeSheet = nil
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(AppPalette.blue)
+                .keyboardShortcut(.defaultAction)
+                .disabled(checkoutRemoteLocalName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || checkoutRemoteLocalName.hasPrefix("-"))
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 440, minHeight: 310)
+    }
+
+    private func startCheckoutRemote(_ remoteBranch: String, snapshot: GitSnapshot) {
+        let localCandidate: String
+        if let slashIndex = remoteBranch.firstIndex(of: "/") {
+            localCandidate = String(remoteBranch[remoteBranch.index(after: slashIndex)...])
+        } else {
+            localCandidate = remoteBranch
+        }
+        checkoutRemoteTarget = remoteBranch
+        checkoutRemoteLocalName = localCandidate
+        checkoutRemoteTrack = true
+        checkoutRemotePull = true
+        activeSheet = .checkoutRemote(remoteBranch)
+    }
+
+    private func quickCheckoutAndPull(_ remoteBranch: String, snapshot: GitSnapshot) {
+        let localCandidate: String
+        if let slashIndex = remoteBranch.firstIndex(of: "/") {
+            localCandidate = String(remoteBranch[remoteBranch.index(after: slashIndex)...])
+        } else {
+            localCandidate = remoteBranch
+        }
+        checkoutRemoteTarget = remoteBranch
+        checkoutRemoteLocalName = localCandidate
+        checkoutRemoteTrack = true
+        checkoutRemotePull = true
+        executeCheckoutAndPull(remoteBranch: remoteBranch)
+    }
+
+    private func executeCheckoutAndPull(remoteBranch: String) {
+        let localName = checkoutRemoteLocalName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !localName.isEmpty, let snapshot = model.snapshot else { return }
+
+        var commands: [[String]] = []
+        let exists = snapshot.branches.contains(localName)
+
+        if exists {
+            // Local branch already exists, switch to it
+            commands.append(["checkout", localName])
+        } else {
+            // Create local branch tracking remote branch
+            if checkoutRemoteTrack {
+                commands.append(["checkout", "-b", localName, "--track", remoteBranch])
+            } else {
+                commands.append(["checkout", "-b", localName, remoteBranch])
+            }
+        }
+
+        if checkoutRemotePull {
+            if let slashIndex = remoteBranch.firstIndex(of: "/") {
+                let remoteName = String(remoteBranch[..<slashIndex])
+                let remoteBranchName = String(remoteBranch[remoteBranch.index(after: slashIndex)...])
+                commands.append(["pull", remoteName, remoteBranchName])
+            } else {
+                commands.append(["pull"])
+            }
+        }
+
+        model.performSequence(commands)
+    }
+
+    private func checkoutRemoteBranch(_ remoteBranch: String, snapshot: GitSnapshot) {
+        let localName: String
+        if let slashIndex = remoteBranch.firstIndex(of: "/") {
+            localName = String(remoteBranch[remoteBranch.index(after: slashIndex)...])
+        } else {
+            localName = remoteBranch
+        }
+
+        if snapshot.branches.contains(localName) {
+            model.perform(["checkout", localName])
+        } else {
+            model.perform(["checkout", "--track", remoteBranch])
+        }
+    }
+
+    private func repositoryBranchMenu(_ snapshot: GitSnapshot) -> some View {
+        let repoName = URL(fileURLWithPath: snapshot.repository.path).lastPathComponent
+        let remoteBranches = snapshot.remoteBranches.filter { !$0.hasSuffix("/HEAD") }
+
+        return Menu {
+            Text("Repository: \(repoName)")
+                .font(.caption.bold())
+            Text("Current: \(snapshot.repository.branch)")
+                .font(.caption)
+
+            Divider()
+
+            Menu("Local Branches (\(snapshot.branches.count))") {
+                ForEach(snapshot.branches, id: \.self) { branch in
+                    let isCurrent = branch == snapshot.repository.branch
+                    Button {
+                        if !isCurrent { model.perform(["checkout", branch]) }
+                    } label: {
+                        if isCurrent {
+                            Label(branch, systemImage: "checkmark")
+                        } else {
+                            Text(branch)
+                        }
+                    }
+                    .disabled(isCurrent)
+                }
+            }
+
+            Menu("Remote Branches (\(remoteBranches.count))") {
+                if remoteBranches.isEmpty {
+                    Text("No remote branches found")
+                } else {
+                    ForEach(remoteBranches, id: \.self) { rb in
+                        Button {
+                            startCheckoutRemote(rb, snapshot: snapshot)
+                        } label: {
+                            Label(rb, systemImage: "cloud")
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            Button {
+                model.perform(["fetch", "--all", "--prune"])
+            } label: {
+                Label("Fetch All Remotes", systemImage: "arrow.down.circle")
+            }
+
+            Menu("New Branch…") {
+                TextField("New branch name", text: $branchName)
+                Button("Create and Checkout") {
+                    let trimmed = branchName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty && !trimmed.hasPrefix("-") {
+                        model.perform(["checkout", "-b", trimmed])
+                        branchName = ""
+                    }
+                }
+                .disabled(branchName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || branchName.hasPrefix("-"))
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.caption2.bold())
+                    .foregroundStyle(AppPalette.mint)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(repoName)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Color.primary)
+                        .lineLimit(1)
+                    Text(snapshot.repository.branch)
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundStyle(AppPalette.mint)
+                        .lineLimit(1)
+                }
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(Color.secondary.opacity(0.8))
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(AppPalette.mint.opacity(0.4), lineWidth: 1))
+        }
+        .menuStyle(.borderlessButton)
+        .help("Repository: \(repoName) | Branch: \(snapshot.repository.branch)")
+    }
+
+    private func branchMenu(_ snapshot: GitSnapshot) -> some View {
+        let remoteBranches = snapshot.remoteBranches.filter { !$0.hasSuffix("/HEAD") }
+
+        return Menu {
+            Menu("Local Branches (\(snapshot.branches.count))") {
+                ForEach(snapshot.branches, id: \.self) { branch in
+                    let isCurrent = branch == snapshot.repository.branch
+                    Button {
+                        if !isCurrent { model.perform(["checkout", branch]) }
+                    } label: {
+                        if isCurrent {
+                            Label(branch, systemImage: "checkmark")
+                        } else {
+                            Text(branch)
+                        }
+                    }
+                    .disabled(isCurrent)
+                }
+            }
+
+            Menu("Remote Branches (\(remoteBranches.count))") {
+                if remoteBranches.isEmpty {
+                    Text("No remote branches found")
+                } else {
+                    ForEach(remoteBranches, id: \.self) { rb in
+                        Button {
+                            startCheckoutRemote(rb, snapshot: snapshot)
+                        } label: {
+                            Label(rb, systemImage: "cloud")
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            TextField("New branch name", text: $branchName)
+            Button("Create and Checkout") {
+                let trimmed = branchName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty && !trimmed.hasPrefix("-") {
+                    model.perform(["checkout", "-b", trimmed])
+                    branchName = ""
+                }
+            }
+            .disabled(branchName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || branchName.hasPrefix("-"))
+        } label: {
+            sourceTreeToolbarItem(label: "Branch", icon: "arrow.triangle.branch")
+        }
+        .menuStyle(.borderlessButton)
+        .help("Branch management")
+    }
+
+    private func mergeMenu(_ snapshot: GitSnapshot) -> some View {
+        Menu {
+            let otherBranches = snapshot.branches.filter { $0 != snapshot.repository.branch }
+            if otherBranches.isEmpty {
+                Text("No other branches to merge")
+            } else {
+                ForEach(otherBranches, id: \.self) { branch in
+                    Button("Merge '\(branch)' into \(snapshot.repository.branch)") {
+                        model.perform(["merge", branch])
+                    }
+                }
+            }
+        } label: {
+            sourceTreeToolbarItem(label: "Merge", icon: "arrow.triangle.merge")
+        }
+        .menuStyle(.borderlessButton)
+        .help("Merge another branch into current branch")
+    }
+
+    private func stashMenu(_ snapshot: GitSnapshot) -> some View {
+        Menu {
+            TextField("Stash message", text: $stashMessage)
+            Button("Stash Changes (include untracked)") {
+                let msg = stashMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                model.perform(["stash", "push", "-u", "-m", msg.isEmpty ? "Git Manager stash" : msg])
+                stashMessage = ""
+            }
+            .disabled(snapshot.changes.isEmpty || snapshot.changes.contains(where: { $0.conflicted }))
+            Divider()
+            if snapshot.stashes.isEmpty {
+                Text("No stashes saved")
+            } else {
+                ForEach(snapshot.stashes, id: \.self) { stash in
+                    Button("Pop \(stash)") {
+                        let idx = String(stash.prefix(while: { $0 != ":" }))
+                        model.perform(["stash", "pop", idx])
+                    }
+                }
+            }
+        } label: {
+            sourceTreeToolbarItem(label: "Stash", icon: "archivebox")
+        }
+        .menuStyle(.borderlessButton)
+        .help("Stash management")
+    }
+
+    private func viewRemote() {
+        guard let path = model.selectedPath else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            if let raw = try? GitProcessService.run(path, ["remote", "get-url", "origin"]).trimmingCharacters(in: .whitespacesAndNewlines),
+               !raw.isEmpty {
+                var web = raw
+                if web.hasPrefix("git@") {
+                    web = web.replacingOccurrences(of: ":", with: "/")
+                    web = web.replacingOccurrences(of: "git@", with: "https://")
+                }
+                if web.hasSuffix(".git") {
+                    web = String(web.dropLast(4))
+                }
+                if let url = URL(string: web) {
+                    DispatchQueue.main.async {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            }
+        }
+    }
+
+    private func showInFinder() {
+        guard let path = model.selectedPath else { return }
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
+    }
+
+    private func openTerminal() {
+        guard let path = model.selectedPath else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", "Terminal", path]
+        try? process.run()
+    }
+
+    private var repositoryList: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let snapshot = model.snapshot {
+                // Active repository header with back arrow to return to all repositories
+                HStack(spacing: 6) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            model.showBrowser()
+                        }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "chevron.left")
+                                .font(.caption.bold())
+                            Text("All Repos")
+                                .font(.caption.bold())
+                        }
+                        .foregroundStyle(AppPalette.blue)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(AppPalette.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Back to repositories list")
+
+                    Text(URL(fileURLWithPath: snapshot.repository.path).lastPathComponent)
+                        .font(.caption.bold())
+                        .lineLimit(1)
+
+                    Spacer()
+
+                    Button {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                            isRepoListCollapsed = true
+                        }
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Collapse sidebar (⌘1)")
+                }
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        // WORKSPACE
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("WORKSPACE")
+                                .font(.system(size: 10, weight: .bold))
+                                .tracking(1)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 4)
+
+                            Button {
+                                mode = 0
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "doc.text")
+                                        .font(.caption)
+                                    Text("File status")
+                                        .font(.caption)
+                                    Spacer()
+                                    let dirty = snapshot.changes.count
+                                    if dirty > 0 {
+                                        Text("\(dirty)")
+                                            .font(.caption2.bold())
+                                            .foregroundStyle(.white)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(AppPalette.blue, in: Capsule())
+                                    }
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .background(mode == 0 ? AppPalette.blue.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                                .foregroundStyle(mode == 0 ? AppPalette.blue : Color.primary)
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                mode = 1
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "clock")
+                                        .font(.caption)
+                                    Text("History")
+                                        .font(.caption)
+                                    Spacer()
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .background(mode == 1 ? AppPalette.blue.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                                .foregroundStyle(mode == 1 ? AppPalette.blue : Color.primary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        // BRANCHES
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("BRANCHES")
+                                .font(.system(size: 10, weight: .bold))
+                                .tracking(1)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 4)
+
+                            ForEach(snapshot.branches.filter { search.isEmpty || $0.localizedCaseInsensitiveContains(search) }, id: \.self) { branch in
+                                let isCurrent = branch == snapshot.repository.branch
+                                Button {
+                                    if !isCurrent {
+                                        model.perform(["checkout", branch])
+                                    }
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        if isCurrent {
+                                            Circle()
+                                                .fill(AppPalette.blue)
+                                                .frame(width: 7, height: 7)
+                                        } else {
+                                            Circle()
+                                                .fill(Color.clear)
+                                                .frame(width: 7, height: 7)
+                                        }
+                                        Text(branch)
+                                            .font(.caption)
+                                            .fontWeight(isCurrent ? .bold : .regular)
+                                            .lineLimit(1)
+                                        Spacer()
+                                        if isCurrent {
+                                            Image(systemName: "checkmark")
+                                                .font(.system(size: 9, weight: .bold))
+                                                .foregroundStyle(AppPalette.blue)
+                                        }
+                                    }
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 4)
+                                    .background(isCurrent ? AppPalette.blue.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                                    .foregroundStyle(isCurrent ? AppPalette.blue : Color.primary)
+                                }
+                                .buttonStyle(.plain)
+                                .contextMenu {
+                                    if !isCurrent {
+                                        Button {
+                                            model.perform(["checkout", branch])
+                                        } label: {
+                                            Label("Checkout '\(branch)'", systemImage: "arrow.triangle.branch")
+                                        }
+                                    }
+                                    Button {
+                                        model.perform(["pull"])
+                                    } label: {
+                                        Label("Pull latest into current branch", systemImage: "arrow.down.circle")
+                                    }
+                                }
+                                .help(isCurrent ? "Current branch: \(branch)" : "Click to checkout \(branch)")
+                            }
+                        }
+
+                        // REMOTES
+                        if !snapshot.remotes.isEmpty {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("REMOTES")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .tracking(1)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 4)
+
+                                ForEach(snapshot.remotes, id: \.self) { remote in
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "cloud")
+                                                .font(.caption2)
+                                                .foregroundStyle(AppPalette.blue)
+                                            Text(remote)
+                                                .font(.caption.bold())
+                                            Spacer()
+                                            Button {
+                                                model.perform(["fetch", remote])
+                                            } label: {
+                                                Image(systemName: "arrow.clockwise")
+                                                    .font(.system(size: 9))
+                                            }
+                                            .buttonStyle(.plain)
+                                            .help("Fetch \(remote)")
+                                        }
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 3)
+
+                                        let remotePrefix = "\(remote)/"
+                                        let matched = snapshot.remoteBranches.filter { $0.hasPrefix(remotePrefix) && !$0.hasSuffix("/HEAD") }
+                                        ForEach(matched, id: \.self) { rb in
+                                            let short = String(rb.dropFirst(remotePrefix.count))
+                                            let isCheckedOut = snapshot.branches.contains(short) && snapshot.repository.branch == short
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "arrow.triangle.branch")
+                                                    .font(.system(size: 8))
+                                                    .foregroundStyle(isCheckedOut ? AppPalette.mint : Color.secondary)
+                                                Text(short)
+                                                    .font(.caption2)
+                                                    .fontWeight(isCheckedOut ? .bold : .regular)
+                                                    .foregroundStyle(isCheckedOut ? AppPalette.mint : Color.secondary)
+                                                    .lineLimit(1)
+                                                Spacer()
+                                                if isCheckedOut {
+                                                    Image(systemName: "checkmark")
+                                                        .font(.system(size: 8, weight: .bold))
+                                                        .foregroundStyle(AppPalette.mint)
+                                                }
+                                            }
+                                            .padding(.leading, 18)
+                                            .padding(.trailing, 6)
+                                            .padding(.vertical, 3)
+                                            .background(isCheckedOut ? AppPalette.mint.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 4))
+                                            .contentShape(Rectangle())
+                                            .onTapGesture(count: 2) {
+                                                startCheckoutRemote(rb, snapshot: snapshot)
+                                            }
+                                            .contextMenu {
+                                                Button {
+                                                    startCheckoutRemote(rb, snapshot: snapshot)
+                                                } label: {
+                                                    Label("Checkout & Pull '\(short)' (SourceTree)…", systemImage: "arrow.triangle.branch")
+                                                }
+                                                Button {
+                                                    quickCheckoutAndPull(rb, snapshot: snapshot)
+                                                } label: {
+                                                    Label("Quick Checkout & Pull", systemImage: "arrow.down.circle")
+                                                }
+                                                Divider()
+                                                Button {
+                                                    checkoutRemoteBranch(rb, snapshot: snapshot)
+                                                } label: {
+                                                    Label("Checkout Only", systemImage: "arrow.right.circle")
+                                                }
+                                            }
+                                            .help(isCheckedOut ? "Current branch (\(short))" : "Double-click to Checkout & Pull '\(short)' to local (SourceTree)")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // TAGS
+                        if !snapshot.tags.isEmpty {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("TAGS")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .tracking(1)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 4)
+
+                                ForEach(snapshot.tags, id: \.self) { tag in
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "tag")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                        Text(tag)
+                                            .font(.caption2)
+                                            .lineLimit(1)
+                                    }
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+
+                // Filter Bar at bottom of sidebar
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    TextField("Filter", text: $search)
+                        .textFieldStyle(.plain)
+                        .font(.caption)
+                    if !search.isEmpty {
+                        Button { search = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2), lineWidth: 0.8))
+            } else {
+                HStack {
+                    Text("REPOSITORIES")
+                        .font(.caption.bold())
+                        .tracking(1.2)
+                        .foregroundStyle(AppPalette.blue)
+
+                    let count = model.repositories.count
+                    Text("\(count)")
+                        .font(.caption2.bold().monospacedDigit())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(AppPalette.blue.opacity(0.12), in: Capsule())
+                        .foregroundStyle(AppPalette.blue)
+
+                    Spacer()
+
+                    Button {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                            isRepoListCollapsed = true
+                        }
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Collapse sidebar (⌘1)")
+                }
+
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField("Filter repositories…", text: $search)
+                        .textFieldStyle(.plain)
+                        .font(.caption)
+                    if !search.isEmpty {
+                        Button { search = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Clear search")
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2), lineWidth: 0.8))
+
+                if let root = model.root {
+                    HStack(spacing: 4) {
+                        Image(systemName: "folder")
+                            .font(.caption2)
+                        Text(root.path)
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                }
+
+                if !model.excludedPaths.isEmpty {
+                    HStack(spacing: 6) {
+                        Image(systemName: "eye.slash")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text("\(model.excludedPaths.count) excluded")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Restore All") {
+                            model.restoreExcludedRepositories()
+                        }
+                        .buttonStyle(.plain)
+                        .font(.caption2.bold())
+                        .foregroundStyle(AppPalette.blue)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                }
+
+                ScrollView {
+                    let filtered = model.repositories.filter {
+                        search.isEmpty ||
+                        $0.path.localizedCaseInsensitiveContains(search) ||
+                        $0.branch.localizedCaseInsensitiveContains(search)
+                    }
+                    if filtered.isEmpty {
+                        VStack(spacing: 6) {
+                            Spacer().frame(height: 20)
+                            Image(systemName: search.isEmpty ? "folder.badge.minus" : "magnifyingglass")
+                                .font(.title2)
+                                .foregroundStyle(.secondary)
+                            Text(search.isEmpty ? "No repositories" : "No matching repositories")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                    } else {
+                        LazyVStack(alignment: .leading, spacing: 6) {
+                            ForEach(filtered) { repo in
+                                repoRow(repo)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(10)
+    }
+
+    private func repoRow(_ repo: GitRepository) -> some View {
+        let isSelected = model.selectedPath == repo.path
+        let repoName = URL(fileURLWithPath: repo.path).lastPathComponent
+
+        return HStack(spacing: 6) {
+            Button {
+                model.select(repo.path)
+            } label: {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "folder.fill")
+                            .font(.callout)
+                            .foregroundStyle(isSelected ? AppPalette.blue : .secondary)
+                        Text(repoName)
+                            .font(.callout.bold())
+                            .foregroundStyle(isSelected ? AppPalette.blue : .primary)
+                            .lineLimit(1)
+                        Spacer()
+                    }
+
+                    Text(relative(repo.path))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+
+                    HStack(spacing: 6) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.triangle.branch")
+                                .font(.system(size: 9))
+                            Text(repo.branch)
+                                .font(.caption2.bold())
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(AppPalette.blue)
+
+                        Text("·").font(.caption2).foregroundStyle(.secondary)
+
+                        HStack(spacing: 3) {
+                            Circle()
+                                .fill(repo.dirty ? AppPalette.amber : AppPalette.mint)
+                                .frame(width: 5, height: 5)
+                            Text(repo.dirty ? "Modified" : "Clean")
+                                .font(.caption2)
+                        }
+                        .foregroundStyle(repo.dirty ? AppPalette.amber : AppPalette.mint)
+
+                        if repo.ahead > 0 || repo.behind > 0 {
+                            Spacer()
+                            HStack(spacing: 4) {
+                                if repo.ahead > 0 {
+                                    Text("↑\(repo.ahead)")
+                                        .font(.caption2.bold().monospacedDigit())
+                                        .foregroundStyle(AppPalette.mint)
+                                }
+                                if repo.behind > 0 {
+                                    Text("↓\(repo.behind)")
+                                        .font(.caption2.bold().monospacedDigit())
+                                        .foregroundStyle(AppPalette.amber)
+                                }
+                            }
+                        }
+                    }
+
+                    if !repo.summary.isEmpty {
+                        Text(repo.summary)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                repoToExclude = repo
+                confirmExclude = true
+            } label: {
+                Image(systemName: "minus.circle")
+                    .font(.caption)
+                    .foregroundStyle(Color.secondary.opacity(0.7))
+            }
+            .buttonStyle(.plain)
+            .help("Exclude '\(repoName)' from list")
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            isSelected
+                ? AppPalette.blue.opacity(0.12)
+                : Color.secondary.opacity(0.04)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(isSelected ? AppPalette.blue.opacity(0.4) : Color.clear, lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .contextMenu {
+            Button(role: .destructive) {
+                repoToExclude = repo
+                confirmExclude = true
+            } label: {
+                Label("Exclude from List", systemImage: "minus.circle")
+            }
+
+            Divider()
+
+            Button {
+                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: repo.path)
+            } label: {
+                Label("Reveal in Finder", systemImage: "folder")
+            }
+
+            Button {
+                let url = URL(fileURLWithPath: repo.path)
+                NSWorkspace.shared.open(url)
+            } label: {
+                Label("Open in Terminal", systemImage: "terminal")
+            }
+
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(repo.path, forType: .string)
+            } label: {
+                Label("Copy Path", systemImage: "doc.on.doc")
+            }
+        }
+    }
+
+    private func relative(_ path: String) -> String {
+        guard let root = model.root?.path, path.hasPrefix(root + "/") else { return path }
+        return String(path.dropFirst(root.count + 1))
+    }
+
+    private var centerPanel: some View {
+        VStack(spacing: 0) {
+            let changeCount = model.snapshot?.changes.count ?? 0
+            Picker("Repository panel", selection: $mode) {
+                Text(changeCount > 0 ? "Working Copy (\(changeCount))" : "Working Copy").tag(0)
+                Text("History").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+
+            if model.snapshot == nil {
+                Spacer()
+                VStack(spacing: 8) {
+                    Image(systemName: "folder.badge.questionmark")
+                        .font(.system(size: 32))
+                        .foregroundStyle(.secondary)
+                    Text(model.busy ? "Loading repository…" : "Select a repository to inspect")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            } else if mode == 0 {
+                workingCopy
+            } else {
+                history
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var workingCopy: some View {
+        VStack(spacing: 0) {
+            fileSection(staged: true)
+                .frame(maxHeight: .infinity)
+            Divider()
+            fileSection(staged: false)
+                .frame(maxHeight: .infinity)
+            Divider()
+            commitBox
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var commitBox: some View {
+        let stagedCount = (model.snapshot?.changes ?? []).filter { $0.staged }.count
+        let hasConflicts = (model.snapshot?.changes ?? []).contains(where: { $0.conflicted })
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Commit Message", systemImage: "quote.bubble")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if amend {
+                    Text("Amending latest commit")
+                        .font(.caption2.bold())
+                        .foregroundStyle(AppPalette.amber)
+                }
+                if stagedCount > 0 {
+                    Text("\(stagedCount) staged")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(AppPalette.mint)
+                }
+            }
+
+            TextEditor(text: $commitMessage)
+                .font(.system(size: 12))
+                .frame(minHeight: 65, maxHeight: 110)
+                .accessibilityLabel("Commit message")
+                .padding(4)
+                .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.25), lineWidth: 1))
+
+            HStack {
+                Toggle("Amend latest", isOn: $amend)
+                    .font(.caption)
+                    .disabled(model.snapshot?.commits.isEmpty != false)
+
+                Spacer()
+
+                Button {
+                    if amend { confirmAmend = true } else { commit() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: amend ? "arrow.triangle.2.circlepath" : "checkmark")
+                        Text(amend ? "Amend Commit" : "Commit")
+                            .bold()
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(AppPalette.blue)
+                .controlSize(.regular)
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(
+                    commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                    (!amend && stagedCount == 0) ||
+                    hasConflicts
+                )
+                .help("Commit staged changes (⌘⏎)")
+            }
+        }
+        .padding(10)
+        .background(AppPalette.surface.opacity(0.5))
+    }
+
+    private func commit() {
+        model.perform(["commit"] + (amend ? ["--amend"] : []) + ["-m", commitMessage])
+    }
+
+    private func fileSection(staged: Bool) -> some View {
+        let files = (model.snapshot?.changes ?? []).filter { staged ? $0.staged : $0.unstaged }
+
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Label(staged ? "STAGED CHANGES" : "UNSTAGED CHANGES",
+                      systemImage: staged ? "tray.and.arrow.down.fill" : "pencil.and.outline")
+                    .font(.caption.bold())
+                    .tracking(1.0)
+                    .foregroundStyle(.secondary)
+
+                Text("\(files.count)")
+                    .font(.caption2.bold().monospacedDigit())
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        files.isEmpty
+                            ? Color.secondary.opacity(0.12)
+                            : (staged ? AppPalette.mint.opacity(0.18) : AppPalette.amber.opacity(0.18)),
+                        in: Capsule()
+                    )
+                    .foregroundStyle(
+                        files.isEmpty
+                            ? Color.secondary
+                            : (staged ? AppPalette.mint : AppPalette.amber)
+                    )
+
+                Spacer()
+
+                if staged {
+                    Button {
+                        model.unstage(nil)
+                    } label: {
+                        Label("Unstage All", systemImage: "minus.circle")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(files.isEmpty)
+                } else {
+                    Button {
+                        model.perform(["add", "--all"])
+                    } label: {
+                        Label("Stage All", systemImage: "plus.circle.fill")
+                            .font(.caption.bold())
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(AppPalette.blue)
+                    .controlSize(.small)
+                    .disabled(files.isEmpty)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.secondary.opacity(0.04))
+
+            if files.isEmpty {
+                VStack(spacing: 4) {
+                    Spacer().frame(height: 18)
+                    Text(staged ? "No staged changes" : "Working tree clean")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer().frame(height: 18)
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(files) { file in
+                            fileRow(file: file, staged: staged)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .frame(minHeight: 80, maxHeight: .infinity)
+            }
+        }
+    }
+
+    private func fileRow(file: GitFileChange, staged: Bool) -> some View {
+        let isSelected = model.selectedFile?.path == file.path && model.fileIsStaged == staged
+
+        return HStack(spacing: 6) {
+            Button {
+                if isDiffCollapsed {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                        isDiffCollapsed = false
+                    }
+                }
+                model.inspect(file: file, staged: staged)
+            } label: {
+                HStack(spacing: 7) {
+                    GitStatusBadge(status: file.statusType(staged: staged))
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(file.filename)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        if !file.directory.isEmpty {
+                            Text(file.directory)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 3)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("View \(staged ? "staged" : "unstaged") diff for \(file.path)")
+
+            Button {
+                if staged {
+                    model.unstage(file)
+                } else {
+                    model.perform(["add", "--", file.path])
+                }
+            } label: {
+                Image(systemName: staged ? "minus.circle" : "plus.circle.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(staged ? Color.secondary : AppPalette.mint)
+            }
+            .buttonStyle(.plain)
+            .help(staged ? "Unstage \(file.filename)" : "Stage \(file.filename)")
+            .accessibilityLabel("\(staged ? "Unstage" : "Stage") \(file.path)")
+
+            if !staged && !file.untracked && !file.conflicted {
+                Button {
+                    discard = file
+                    confirmDiscard = true
+                } label: {
+                    Image(systemName: "arrow.uturn.backward.circle")
+                        .font(.system(size: 13))
+                        .foregroundStyle(AppPalette.red.opacity(0.85))
+                }
+                .buttonStyle(.plain)
+                .help("Discard unstaged changes in \(file.filename)")
+                .accessibilityLabel("Discard unstaged changes to \(file.path)")
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 2)
+        .background(isSelected ? AppPalette.blue.opacity(0.12) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    private var history: some View {
+        let commits = model.snapshot?.commits ?? []
+        let filteredCommits = commits.filter { commit in
+            historySearch.isEmpty ||
+            commit.message.localizedCaseInsensitiveContains(historySearch) ||
+            commit.author.localizedCaseInsensitiveContains(historySearch) ||
+            commit.id.localizedCaseInsensitiveContains(historySearch) ||
+            commit.refs.localizedCaseInsensitiveContains(historySearch)
+        }
+        let rows = GitGraphLayout.rows(filteredCommits)
+
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Text("COMMIT HISTORY")
+                    .font(.caption.bold())
+                    .tracking(1.0)
+                    .foregroundStyle(.secondary)
+
+                Text("\(commits.count)")
+                    .font(.caption2.bold().monospacedDigit())
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(AppPalette.blue.opacity(0.12), in: Capsule())
+                    .foregroundStyle(AppPalette.blue)
+
+                Spacer()
+
+                HStack(spacing: 4) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    TextField("Filter commits…", text: $historySearch)
+                        .textFieldStyle(.plain)
+                        .font(.caption)
+                    if !historySearch.isEmpty {
+                        Button { historySearch = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2), lineWidth: 0.8))
+                .frame(width: 170)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.secondary.opacity(0.04))
+
+            Divider()
+
+            if filteredCommits.isEmpty {
+                VStack(spacing: 6) {
+                    Spacer().frame(height: 30)
+                    Image(systemName: "clock")
+                        .font(.title2)
+                        .foregroundStyle(.secondary)
+                    Text("No commits found")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                ScrollView([.vertical, .horizontal]) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(filteredCommits.enumerated()), id: \.element.id) { index, commit in
+                            commitRow(commit: commit, row: rows[index])
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func commitRow(commit: GitCommit, row: GitGraphRow) -> some View {
+        let isSelected = model.selectedCommit?.id == commit.id
+
+        return Button {
+            if isDiffCollapsed {
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                    isDiffCollapsed = false
+                }
+            }
+            model.inspect(commit: commit)
+        } label: {
+            HStack(spacing: 8) {
+                GitGraphCell(row: row)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(String(commit.id.prefix(7)))
+                            .font(.system(size: 11, design: .monospaced).bold())
+                            .foregroundStyle(AppPalette.blue)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1.5)
+                            .background(AppPalette.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
+
+                        if !commit.refs.isEmpty {
+                            Text(commit.refs)
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(AppPalette.mint)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1.5)
+                                .background(AppPalette.mint.opacity(0.15), in: Capsule())
+                                .lineLimit(1)
+                        }
+
+                        Spacer()
+                    }
+
+                    Text(commit.message)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    HStack(spacing: 4) {
+                        Image(systemName: "person.crop.circle")
+                            .font(.system(size: 10))
+                        Text(commit.author)
+                        Text("·")
+                        Text(commit.date)
+                    }
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                }
+                .frame(width: 360, alignment: .leading)
+            }
+            .frame(height: 50)
+            .padding(.horizontal, 6)
+            .background(isSelected ? AppPalette.blue.opacity(0.12) : Color.clear)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Commit \(commit.id.prefix(7)), \(commit.message), \(commit.author)")
+    }
+
+    private var diffView: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                if let file = model.selectedFile {
+                    GitStatusBadge(status: file.statusType(staged: model.fileIsStaged))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(file.filename)
+                            .font(.system(size: 12, weight: .bold))
+                            .lineLimit(1)
+                        if !file.directory.isEmpty {
+                            Text(file.directory)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                } else if let commit = model.selectedCommit {
+                    Image(systemName: "checkmark.seal.fill")
+                        .foregroundStyle(AppPalette.blue)
+                    Text("Commit \(commit.id.prefix(7))")
+                        .font(.system(size: 12, weight: .bold))
+                } else {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    Text("Diff Inspector")
+                        .font(.system(size: 12, weight: .bold))
+                }
+
+                Spacer()
+
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(model.diff, forType: .string)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .buttonStyle(.plain)
+                .help("Copy diff to clipboard")
+
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                        isDiffMaximized.toggle()
+                    }
+                } label: {
+                    Image(systemName: isDiffMaximized ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                        .foregroundStyle(isDiffMaximized ? AppPalette.mint : Color.primary)
+                }
+                .buttonStyle(.plain)
+                .help(isDiffMaximized ? "Restore split view (⌘M)" : "Maximize diff viewer (⌘M)")
+
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                        if isDiffMaximized { isDiffMaximized = false }
+                        isDiffCollapsed = true
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Close diff panel (⌘3)")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(AppPalette.surface)
+
+            if let commit = model.selectedCommit {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(commit.message)
+                        .font(.callout.bold())
+                    HStack(spacing: 6) {
+                        Text(commit.author)
+                        Text("·")
+                        Text(commit.date)
+                        Spacer()
+                        Button("Copy SHA") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(commit.id, forType: .string)
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption2)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                    if !commit.parents.isEmpty {
+                        Text("Parents: \(commit.parents.joined(separator: ", "))")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(10)
+                .background(Color.secondary.opacity(0.04))
+            }
+
+            Divider()
+
+            ScrollView([.horizontal, .vertical]) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    let lines = model.diff.components(separatedBy: "\n")
+                    ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                        diffLineView(line)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func diffLineView(_ line: String) -> some View {
+        let isHunk = line.hasPrefix("@@")
+        let isAdd = line.hasPrefix("+") && !line.hasPrefix("+++")
+        let isDel = line.hasPrefix("-") && !line.hasPrefix("---")
+
+        return Text(line.isEmpty ? " " : line)
+            .font(.system(size: 11, design: .monospaced))
+            .textSelection(.enabled)
+            .foregroundStyle(isHunk ? AppPalette.blue : (isAdd ? AppPalette.mint : (isDel ? AppPalette.red : .primary)))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 1.5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                isHunk
+                    ? AppPalette.blue.opacity(0.10)
+                    : (isAdd ? AppPalette.mint.opacity(0.14) : (isDel ? AppPalette.red.opacity(0.14) : Color.clear))
+            )
+    }
+
+    private var statusBar: some View {
+        HStack(spacing: 8) {
+            if model.busy {
+                ProgressView().controlSize(.small)
+            }
+            Text(model.message)
+                .font(.caption)
+                .textSelection(.enabled)
+                .lineLimit(2)
+            Spacer()
+            HStack(spacing: 8) {
+                Text("⌘1 Sidebar").font(.caption2).foregroundStyle(.secondary)
+                Text("⌘3 Diff").font(.caption2).foregroundStyle(.secondary)
+                Text("⌘M Maximize").font(.caption2).foregroundStyle(.secondary)
+                Text("⌘⏎ Commit").font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(AppPalette.surface.opacity(0.6))
+    }
+}
+
 private struct APIError: Decodable { let code: String?; let message: String? }
 private struct Envelope<T: Decodable>: Decodable { let success: Bool; let data: T?; let error: APIError? }
 private struct SessionData: Decodable { let csrfToken: String }
@@ -398,7 +3885,8 @@ private let kAvailableServices: [String] = [
                   envelope.success, let manifest = envelope.data,
                   manifest.version.range(of: #"^\d+\.\d+\.\d+$"#, options: .regularExpression) != nil,
                   manifest.version.compare(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0", options: .numeric) == .orderedDescending,
-                  manifest.downloadUrl == "/downloads/Bitbucket-PR-Approver-\(manifest.version)-macOS.zip",
+                  (manifest.downloadUrl == "/downloads/Bitbucket-PR-Approver-\(manifest.version)-macOS.zip" ||
+                   manifest.downloadUrl == "/downloads/GitPulse-\(manifest.version)-macOS.zip"),
                   manifest.sha256.range(of: #"^[a-fA-F0-9]{64}$"#, options: .regularExpression) != nil,
                   (100_000...100_000_000).contains(manifest.sizeBytes) else { return }
             availableUpdate = manifest
@@ -428,7 +3916,9 @@ private let kAvailableServices: [String] = [
             let unpacked = stage.appendingPathComponent("unpacked", isDirectory: true)
             try FileManager.default.createDirectory(at: unpacked, withIntermediateDirectories: false)
             try runTool("/usr/bin/ditto", ["-xk", archive.path, unpacked.path])
-            let candidate = unpacked.appendingPathComponent("Bitbucket PR Approver.app", isDirectory: true)
+            let candidatePulse = unpacked.appendingPathComponent("GitPulse.app", isDirectory: true)
+            let candidateLegacy = unpacked.appendingPathComponent("Bitbucket PR Approver.app", isDirectory: true)
+            let candidate = FileManager.default.fileExists(atPath: candidatePulse.path) ? candidatePulse : candidateLegacy
             guard let bundle = Bundle(url: candidate),
                   bundle.bundleIdentifier == "com.hungnv.bitbucket-pr-approver.mac",
                   bundle.infoDictionary?["CFBundleShortVersionString"] as? String == manifest.version else {
@@ -440,8 +3930,13 @@ private let kAvailableServices: [String] = [
             }
             let helper = stage.appendingPathComponent("update-app.sh")
             try FileManager.default.copyItem(at: bundledHelper, to: helper)
-            let target = FileManager.default.homeDirectoryForCurrentUser
+            let targetPulse = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Applications/GitPulse.app", isDirectory: true)
+            let targetLegacy = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Applications/Bitbucket PR Approver.app", isDirectory: true)
+            let currentBundleURL = Bundle.main.bundleURL
+            let target = currentBundleURL.lastPathComponent == "GitPulse.app" || FileManager.default.fileExists(atPath: targetPulse.path)
+                ? targetPulse : targetLegacy
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = [helper.path, candidate.path, target.path, String(ProcessInfo.processInfo.processIdentifier), manifest.version]
@@ -1748,7 +5243,11 @@ private extension URL {
 private enum AppPalette {
     static let navy = Color(red: 0.055, green: 0.105, blue: 0.205)
     static let blue = Color(red: 0.20, green: 0.45, blue: 0.91)
-    static let mint = Color(red: 0.18, green: 0.68, blue: 0.53)
+    static let mint = Color(red: 0.18, green: 0.68, blue: 0.53) // Added/New - Sourcetree Green
+    static let amber = Color(red: 0.96, green: 0.62, blue: 0.12) // Modified - Sourcetree Amber/Yellow
+    static let red = Color(red: 0.92, green: 0.26, blue: 0.26) // Deleted/Conflicted - Sourcetree Red
+    static let purple = Color(red: 0.58, green: 0.36, blue: 0.92) // Untracked - Sourcetree Purple/Blue
+    static let teal = Color(red: 0.12, green: 0.70, blue: 0.78) // Renamed - Sourcetree Cyan/Teal
     static let surface = Color(nsColor: .controlBackgroundColor)
     static let canvas = Color(nsColor: .windowBackgroundColor)
 }
@@ -2060,6 +5559,7 @@ private struct BitbucketLoginSheet: View {
 
 private struct AppView: View {
     @StateObject private var model = AppModel()
+    @StateObject private var gitModel = GitManagerModel()
     @State private var draftAccount = AccountDraft()
     @State private var draftJob = JobDraft()
     @State private var showingAccount = false
@@ -2327,8 +5827,8 @@ private struct AppView: View {
                 HStack(spacing: 10) {
                     AppLogo(size: 42)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("PR Approver").font(.headline).foregroundStyle(.white)
-                        Text("MAC CONTROL").font(.caption2.bold()).tracking(1.2).foregroundStyle(Color.white.opacity(0.58))
+                        Text("GitPulse").font(.headline).foregroundStyle(.white)
+                        Text("GIT & DEVOPS SUITE").font(.caption2.bold()).tracking(1.2).foregroundStyle(Color.white.opacity(0.58))
                     }
                 }.padding(.bottom, 20)
                 sidebarButton("Tổng quan", "square.grid.2x2", 0)
@@ -2338,6 +5838,7 @@ private struct AppView: View {
                 sidebarButton("Lịch sử chạy", "clock.arrow.circlepath", 4)
                 sidebarButton("Town Board 2D", "map.fill", 5)
                 sidebarButton("Bật/Tắt Server", "server.rack", 6)
+                sidebarButton("Git Manager", "arrow.triangle.branch", 7)
                 Spacer()
                 if let local = model.workers.first(where: { $0.id == model.localWorkerId }) {
                     Label(local.state == "ONLINE" ? "Worker online" : "Worker: \(local.state)",
@@ -2353,20 +5854,25 @@ private struct AppView: View {
             .padding(18).frame(width: 218)
             .background(AppPalette.navy)
             VStack(spacing: 0) {
-                HStack {
-                    Circle().fill(AppPalette.mint).frame(width: 8, height: 8).accessibilityHidden(true)
-                    Text("Control Plane").font(.caption.bold())
-                    Text(model.server).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    Spacer()
-                    Button { Task { await model.refresh() } } label: { Label("Làm mới", systemImage: "arrow.clockwise") }
-                }.padding(.horizontal, 28).padding(.vertical, 14)
-                Divider()
+                if selectedTab != 7 {
+                    HStack {
+                        Circle().fill(AppPalette.mint).frame(width: 8, height: 8).accessibilityHidden(true)
+                        Text("Control Plane").font(.caption.bold())
+                        Text(model.server).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Spacer()
+                        Button { Task { await model.refresh() } } label: { Label("Làm mới", systemImage: "arrow.clockwise") }
+                    }.padding(.horizontal, 28).padding(.vertical, 14)
+                    Divider()
+                }
                 selectedPage
-                if !model.message.isEmpty {
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if selectedTab != 7 && !model.message.isEmpty {
                     Text(model.message).font(.caption).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading).padding(12)
                 }
-            }.background(AppPalette.canvas)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(AppPalette.canvas)
         }
     }
 
@@ -2378,6 +5884,7 @@ private struct AppView: View {
         case 4: logs
         case 5: generativeBoard
         case 6: serverControl
+        case 7: GitManagerView(model: gitModel)
         default: overview
         }
     }

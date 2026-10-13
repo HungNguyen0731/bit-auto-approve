@@ -59,14 +59,14 @@ export const Header: React.FC<HeaderProps> = ({
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <h1 className="text-sm sm:text-base font-bold tracking-tight text-white flex items-center gap-1.5 whitespace-nowrap">
-                <span><span className="hidden sm:inline">Bitbucket </span>PR Approver</span>
+                <span>GitPulse</span>
                 <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-md bg-white/10 text-blue-100 border border-white/15">
                   Local
                 </span>
               </h1>
             </div>
             <p className="text-xs text-blue-100/75 hidden sm:block">
-              Bitbucket Cloud approval automation
+              Git Workspace & PR Automation
             </p>
           </div>
         </div>
