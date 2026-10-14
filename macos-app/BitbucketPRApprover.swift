@@ -820,6 +820,28 @@ private enum GitManagerSheet: Identifiable {
     }
 }
 
+private struct BitbucketReviewer: Identifiable, Hashable {
+    var id: String { uuid }
+    let uuid: String
+    let displayName: String
+    let nickname: String
+    let accountId: String
+    let avatarUrl: String?
+
+    static func parseArray(_ jsonList: [[String: Any]]) -> [BitbucketReviewer] {
+        return jsonList.compactMap { dict in
+            guard let uuid = dict["uuid"] as? String else { return nil }
+            let name = dict["display_name"] as? String ?? dict["nickname"] as? String ?? "Reviewer"
+            let nick = dict["nickname"] as? String ?? name
+            let accId = dict["account_id"] as? String ?? ""
+            let links = dict["links"] as? [String: Any]
+            let avatar = links?["avatar"] as? [String: Any]
+            let avatarUrl = avatar?["href"] as? String
+            return BitbucketReviewer(uuid: uuid, displayName: name, nickname: nick, accountId: accId, avatarUrl: avatarUrl)
+        }
+    }
+}
+
 private struct GitManagerView: View {
     @ObservedObject var model: GitManagerModel
     @ObservedObject var appModel: AppModel
@@ -831,6 +853,9 @@ private struct GitManagerView: View {
     @State private var pushImmediately = true
     @State private var inputAuthPassword = ""
     @State private var rememberAuthInKeychain = true
+    @State private var availableReviewers: [BitbucketReviewer] = []
+    @State private var selectedReviewerUUIDs: Set<String> = []
+    @State private var isLoadingReviewers = false
     @State private var branchName = ""
     @State private var stashMessage = ""
     @State private var discard: GitFileChange?
@@ -2548,6 +2573,92 @@ private struct GitManagerView: View {
                         .disabled(isCreatingPR)
                 }
 
+                // Reviewers Section
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Image(systemName: "person.2.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(AppPalette.blue)
+                        Text("Người Review (Reviewers):")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+
+                        if isLoadingReviewers {
+                            ProgressView().controlSize(.mini)
+                            Text("Đang tải đề xuất...")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        } else if !availableReviewers.isEmpty {
+                            Text("(\(selectedReviewerUUIDs.count)/\(availableReviewers.count) đã chọn)")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(selectedReviewerUUIDs.isEmpty ? Color.secondary : AppPalette.blue)
+                        }
+
+                        Spacer()
+
+                        if !availableReviewers.isEmpty {
+                            Button("Chọn tất cả") {
+                                selectedReviewerUUIDs = Set(availableReviewers.map { $0.uuid })
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(AppPalette.blue)
+
+                            Text("·").font(.caption).foregroundStyle(.secondary)
+
+                            Button("Bỏ chọn") {
+                                selectedReviewerUUIDs.removeAll()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if availableReviewers.isEmpty && !isLoadingReviewers {
+                        Text("Chưa có danh sách reviewer đề xuất từ Bitbucket.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 4)
+                    } else {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(availableReviewers) { r in
+                                    let isSelected = selectedReviewerUUIDs.contains(r.uuid)
+                                    Button {
+                                        if isSelected {
+                                            selectedReviewerUUIDs.remove(r.uuid)
+                                        } else {
+                                            selectedReviewerUUIDs.insert(r.uuid)
+                                        }
+                                    } label: {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                                                .font(.system(size: 12))
+                                                .foregroundStyle(isSelected ? AppPalette.mint : Color.secondary)
+
+                                            Text(r.displayName.isEmpty ? r.nickname : r.displayName)
+                                                .font(.system(size: 11, weight: isSelected ? .bold : .regular))
+                                                .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                                        }
+                                        .padding(.horizontal, 10).padding(.vertical, 6)
+                                        .background(isSelected ? AppPalette.blue.opacity(0.12) : AppPalette.surface, in: RoundedRectangle(cornerRadius: 8))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8)
+                                                .stroke(isSelected ? AppPalette.blue.opacity(0.4) : Color.primary.opacity(0.08), lineWidth: 1)
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+                .padding(10)
+                .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.06), lineWidth: 1))
+
                 // Status info or spinner
                 if isCreatingPR {
                     HStack(spacing: 8) {
@@ -2588,7 +2699,7 @@ private struct GitManagerView: View {
                 Spacer()
 
                 Button {
-                    executeCreatePR(targetBranch: prTargetBranch, title: prTitle, description: prDescription)
+                    executeCreatePR(targetBranch: prTargetBranch, title: prTitle, description: prDescription, reviewerUUIDs: selectedReviewerUUIDs)
                 } label: {
                     HStack(spacing: 6) {
                         if isCreatingPR {
@@ -2608,7 +2719,7 @@ private struct GitManagerView: View {
             .padding(.vertical, 12)
             .background(Color(nsColor: .windowBackgroundColor))
         }
-        .frame(minWidth: 480, minHeight: 460)
+        .frame(minWidth: 500, minHeight: 520)
     }
 
     private func prTargetPill(label: String, subtitle: String, target: String) -> some View {
@@ -2686,7 +2797,7 @@ private struct GitManagerView: View {
         }
     }
 
-    private func executeCreatePR(targetBranch: String, title: String? = nil, description: String? = nil) {
+    private func executeCreatePR(targetBranch: String, title: String? = nil, description: String? = nil, reviewerUUIDs: Set<String>? = nil) {
         guard let path = model.selectedPath else { return }
         let currentBranch = model.snapshot?.repository.branch ?? "main"
         let trimmedTarget = targetBranch.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2736,6 +2847,21 @@ private struct GitManagerView: View {
             _ = try? GitProcessService.run(path, ["push", "-u", "origin", currentBranch])
 
             DispatchQueue.main.async {
+                self.prStatusMessage = "Đang chuẩn bị reviewers đề xuất…"
+            }
+
+            var reviewerUUIDsToAttach = reviewerUUIDs ?? self.selectedReviewerUUIDs
+            if reviewerUUIDsToAttach.isEmpty {
+                let sema = DispatchSemaphore(value: 0)
+                Task {
+                    let recommended = await self.fetchRecommendedReviewers(workspace: workspace, repoSlug: repoSlug)
+                    reviewerUUIDsToAttach = Set(recommended.map { $0.uuid })
+                    sema.signal()
+                }
+                _ = sema.wait(timeout: .now() + 2.5)
+            }
+
+            DispatchQueue.main.async {
                 self.prStatusMessage = "Đang gọi Bitbucket API tạo Pull Request vào '\(trimmedTarget)'…"
             }
 
@@ -2755,13 +2881,17 @@ private struct GitManagerView: View {
 
             self.applyPRAuth(to: &req, config: prConfig, accounts: prAccounts, workspace: workspace, repoSlug: repoSlug, sourceBranch: currentBranch, destBranch: trimmedTarget)
 
-            let bodyJson: [String: Any] = [
+            var bodyJson: [String: Any] = [
                 "title": resolvedTitle,
                 "description": resolvedDescription,
                 "source": ["branch": ["name": currentBranch]],
                 "destination": ["branch": ["name": trimmedTarget]],
                 "close_source_branch": false
             ]
+
+            if !reviewerUUIDsToAttach.isEmpty {
+                bodyJson["reviewers"] = reviewerUUIDsToAttach.map { ["uuid": $0] }
+            }
 
             guard let bodyData = try? JSONSerialization.data(withJSONObject: bodyJson) else {
                 DispatchQueue.main.async {
@@ -2812,7 +2942,7 @@ private struct GitManagerView: View {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(prHref, forType: .string)
 
-                        self.appModel.logConsole("🎉 Đã tạo thành công Pull Request \(formattedNum) vào '\(trimmedTarget)': \(prHref)")
+                        self.appModel.logConsole("🎉 Đã tạo thành công Pull Request \(formattedNum) vào '\(trimmedTarget)' (với \(reviewerUUIDsToAttach.count) reviewers): \(prHref)")
                     } else {
                         let resData = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
                         var errDetail = ""
@@ -2835,6 +2965,69 @@ private struct GitManagerView: View {
         }
     }
 
+    private func fetchRecommendedReviewers(workspace: String, repoSlug: String) async -> [BitbucketReviewer] {
+        let prConfig = self.appModel.pipelineConfig
+        let prAccounts = self.appModel.accounts
+
+        // 1. Try internal recommended-reviewers endpoint first
+        let internalUrlStr = "https://bitbucket.org/!api/internal/repositories/\(workspace)/\(repoSlug)/recommended-reviewers"
+        if let url = URL(string: internalUrlStr) {
+            var req = URLRequest(url: url)
+            req.httpMethod = "GET"
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            self.applyPRAuth(to: &req, config: prConfig, accounts: prAccounts, workspace: workspace, repoSlug: repoSlug, sourceBranch: "", destBranch: "")
+            if let (data, response) = try? await URLSession.shared.data(for: req),
+               let http = response as? HTTPURLResponse, http.statusCode >= 200 && http.statusCode < 300,
+               let jsonList = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                let reviewers = BitbucketReviewer.parseArray(jsonList)
+                if !reviewers.isEmpty {
+                    Task { @MainActor in
+                        self.appModel.logConsole("👥 [Bitbucket] Đã tải \(reviewers.count) reviewer đề xuất từ recommended-reviewers")
+                    }
+                    return reviewers
+                }
+            }
+        }
+
+        // 2. Fallback to 2.0 default-reviewers endpoint
+        let defaultUrlStr = "https://bitbucket.org/!api/2.0/repositories/\(workspace)/\(repoSlug)/default-reviewers"
+        if let url = URL(string: defaultUrlStr) {
+            var req = URLRequest(url: url)
+            req.httpMethod = "GET"
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            self.applyPRAuth(to: &req, config: prConfig, accounts: prAccounts, workspace: workspace, repoSlug: repoSlug, sourceBranch: "", destBranch: "")
+            if let (data, response) = try? await URLSession.shared.data(for: req),
+               let http = response as? HTTPURLResponse, http.statusCode >= 200 && http.statusCode < 300 {
+                if let jsonList = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                    let reviewers = BitbucketReviewer.parseArray(jsonList)
+                    if !reviewers.isEmpty { return reviewers }
+                } else if let jsonDict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let values = jsonDict["values"] as? [[String: Any]] {
+                    let reviewers = BitbucketReviewer.parseArray(values)
+                    if !reviewers.isEmpty { return reviewers }
+                }
+            }
+        }
+
+        return []
+    }
+
+    private func loadRecommendedReviewersForCurrentRepo() {
+        guard let path = model.selectedPath,
+              let rawRemote = try? GitProcessService.run(path, ["remote", "get-url", "origin"]).trimmingCharacters(in: .whitespacesAndNewlines),
+              let (workspace, repoSlug) = parseWorkspaceAndSlug(remoteUrl: rawRemote) else { return }
+
+        isLoadingReviewers = true
+        Task {
+            let reviewers = await fetchRecommendedReviewers(workspace: workspace, repoSlug: repoSlug)
+            await MainActor.run {
+                self.availableReviewers = reviewers
+                self.selectedReviewerUUIDs = Set(reviewers.map { $0.uuid })
+                self.isLoadingReviewers = false
+            }
+        }
+    }
+
     private func openCreatePRDialog(defaultTarget: String = "dev") {
         prTargetBranch = defaultTarget
         prErrorMessage = ""
@@ -2846,6 +3039,8 @@ private struct GitManagerView: View {
             prTitle = model.snapshot?.repository.branch ?? ""
         }
         activeSheet = .createPR
+
+        loadRecommendedReviewersForCurrentRepo()
     }
 
     private func quickOpenPRWeb(target: String) {
