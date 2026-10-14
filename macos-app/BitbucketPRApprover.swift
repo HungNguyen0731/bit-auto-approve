@@ -669,7 +669,7 @@ private struct GitGraphCell: View {
 }
 
 private enum GitManagerSheet: Identifiable {
-    case pull, push, fetch, branch, merge, stash, checkoutRemote(String)
+    case pull, push, fetch, branch, merge, stash, checkoutRemote(String), createPR
     var id: String {
         switch self {
         case .pull: return "pull"
@@ -679,17 +679,20 @@ private enum GitManagerSheet: Identifiable {
         case .merge: return "merge"
         case .stash: return "stash"
         case .checkoutRemote(let b): return "checkoutRemote_\(b)"
+        case .createPR: return "createPR"
         }
     }
 }
 
 private struct GitManagerView: View {
     @ObservedObject var model: GitManagerModel
+    @ObservedObject var appModel: AppModel
     @State private var search = ""
     @State private var historySearch = ""
     @State private var mode = 0
     @State private var commitMessage = ""
     @State private var amend = false
+    @State private var pushImmediately = true
     @State private var branchName = ""
     @State private var stashMessage = ""
     @State private var discard: GitFileChange?
@@ -731,6 +734,17 @@ private struct GitManagerView: View {
     @State private var checkoutRemoteLocalName = ""
     @State private var checkoutRemoteTrack = true
     @State private var checkoutRemotePull = true
+
+    // Create PR state (Direct Bitbucket API Creation)
+    @State private var prTargetBranch = "dev"
+    @State private var prTitle = ""
+    @State private var prDescription = ""
+    @State private var isCreatingPR = false
+    @State private var prStatusMessage = ""
+    @State private var prErrorMessage = ""
+    @State private var createdPRUrl: String? = nil
+    @State private var createdPRNumber: String? = nil
+    @State private var showingPRSuccessAlert = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -777,7 +791,18 @@ private struct GitManagerView: View {
             case .merge: mergeSheet
             case .stash: stashSheet
             case .checkoutRemote(let rb): checkoutRemoteSheet(rb)
+            case .createPR: createPRSheet
             }
+        }
+        .alert("Đã tạo Pull Request thành công! 🎉", isPresented: $showingPRSuccessAlert) {
+            if let urlStr = createdPRUrl, let url = URL(string: urlStr) {
+                Button("Mở PR trên Bitbucket") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            Button("Đóng", role: .cancel) {}
+        } message: {
+            Text("Pull Request \(createdPRNumber ?? "") đã được tạo trực tiếp qua Bitbucket API thành công!\n\nĐường dẫn:\n\(createdPRUrl ?? "")\n\n(Đã tự động sao chép link vào Clipboard)")
         }
     }
 
@@ -1445,6 +1470,43 @@ private struct GitManagerView: View {
                 .buttonStyle(.plain)
                 .disabled(model.selectedPath == nil)
                 .help("Stash management")
+
+                // Tạo PR (Create Pull Request to dev, qc, uat directly via Bitbucket API)
+                Menu {
+                    Section("Tạo PR trực tiếp vào:") {
+                        Button {
+                            executeCreatePR(targetBranch: "dev")
+                        } label: {
+                            Label("Tạo PR vào 'dev' (Development)", systemImage: "plus.circle.fill")
+                        }
+                        Button {
+                            executeCreatePR(targetBranch: "qc")
+                        } label: {
+                            Label("Tạo PR vào 'qc' (Testing/QA)", systemImage: "plus.circle.fill")
+                        }
+                        Button {
+                            executeCreatePR(targetBranch: "uat")
+                        } label: {
+                            Label("Tạo PR vào 'uat' (Staging/UAT)", systemImage: "plus.circle.fill")
+                        }
+                    }
+                    Divider()
+                    Button {
+                        openCreatePRDialog(defaultTarget: "dev")
+                    } label: {
+                        Label("Tùy chỉnh tiêu đề & nhánh khác…", systemImage: "slider.horizontal.3")
+                    }
+                } label: {
+                    sourceTreeToolbarItem(
+                        label: isCreatingPR ? "Đang tạo…" : "Tạo PR",
+                        icon: isCreatingPR ? "arrow.triangle.2.circlepath" : "arrow.triangle.pull"
+                    )
+                } primaryAction: {
+                    openCreatePRDialog(defaultTarget: "dev")
+                }
+                .menuStyle(.borderlessButton)
+                .disabled(model.selectedPath == nil || isCreatingPR)
+                .help("Tạo Pull Request trực tiếp qua Bitbucket API vào dev, qc hoặc uat")
             }
 
             Spacer()
@@ -2103,6 +2165,481 @@ private struct GitManagerView: View {
         .frame(minWidth: 440, minHeight: 310)
     }
 
+    private var createPRSheet: some View {
+        let currentBranch = model.snapshot?.repository.branch ?? "main"
+        let repoName = model.snapshot.map { URL(fileURLWithPath: $0.repository.path).lastPathComponent } ?? "Repository"
+
+        return VStack(spacing: 0) {
+            // Header
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle().fill(AppPalette.blue.opacity(0.15)).frame(width: 36, height: 36)
+                    Image(systemName: "arrow.triangle.pull")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(AppPalette.blue)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Tạo Pull Request Trực Tiếp (Bitbucket API)")
+                        .font(.system(size: 14, weight: .bold))
+                    Text("Tạo PR trực tiếp từ nhánh '\(currentBranch)' vào dev, qc hoặc uat")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    activeSheet = nil
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .disabled(isCreatingPR)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+            .background(Color(nsColor: .windowBackgroundColor))
+
+            Divider()
+
+            // Form Body
+            VStack(alignment: .leading, spacing: 14) {
+                // Error banner if any
+                if !prErrorMessage.isEmpty {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
+                            .padding(.top, 2)
+                        Text(prErrorMessage)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.red)
+                        Spacer()
+                    }
+                    .padding(10)
+                    .background(Color.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                }
+
+                // Repository & Source Branch
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Repository:")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Text(repoName)
+                            .font(.system(size: 12, weight: .bold))
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Nhánh nguồn (Source):")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.triangle.branch")
+                                .font(.system(size: 11))
+                                .foregroundStyle(AppPalette.blue)
+                            Text(currentBranch)
+                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                .foregroundStyle(AppPalette.blue)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(10)
+                .background(AppPalette.blue.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+
+                // Target Branch Selection
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Nhánh đích (Destination Branch):")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("Chọn nhanh:")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    // 3 Quick Pill Buttons
+                    HStack(spacing: 8) {
+                        prTargetPill(label: "dev", subtitle: "Development", target: "dev")
+                        prTargetPill(label: "qc", subtitle: "Testing / QA", target: "qc")
+                        prTargetPill(label: "uat", subtitle: "Staging / UAT", target: "uat")
+                    }
+
+                    // Custom Branch Input
+                    HStack(spacing: 8) {
+                        Text("Hoặc nhánh khác:")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        TextField("dev, qc, uat, main...", text: $prTargetBranch)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 12, design: .monospaced))
+                            .disabled(isCreatingPR)
+                    }
+                }
+
+                // Title Input
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Tiêu đề PR (Title):")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    TextField("Tiêu đề Pull Request...", text: $prTitle)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12))
+                        .disabled(isCreatingPR)
+                }
+
+                // Description Input
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Mô tả PR (Description - tùy chọn):")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    TextField("Mô tả tóm tắt nội dung thay đổi...", text: $prDescription)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12))
+                        .disabled(isCreatingPR)
+                }
+
+                // Status info or spinner
+                if isCreatingPR {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(prStatusMessage)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(AppPalette.blue)
+                        Spacer()
+                    }
+                    .padding(8)
+                    .background(AppPalette.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                }
+            }
+            .padding(18)
+
+            Spacer()
+
+            Divider()
+
+            // Footer Actions
+            HStack(spacing: 10) {
+                Button("Đóng") {
+                    activeSheet = nil
+                }
+                .keyboardShortcut(.cancelAction)
+                .disabled(isCreatingPR)
+
+                Button {
+                    quickOpenPRWeb(target: prTargetBranch.trimmingCharacters(in: .whitespacesAndNewlines))
+                } label: {
+                    Label("Mở trang web", systemImage: "arrow.up.right.square")
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11))
+                .foregroundStyle(AppPalette.blue)
+                .disabled(isCreatingPR || prTargetBranch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                Spacer()
+
+                Button {
+                    executeCreatePR(targetBranch: prTargetBranch, title: prTitle, description: prDescription)
+                } label: {
+                    HStack(spacing: 6) {
+                        if isCreatingPR {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "plus.circle.fill")
+                        }
+                        Text("Tạo PR vào '\(prTargetBranch)'")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(AppPalette.blue)
+                .keyboardShortcut(.defaultAction)
+                .disabled(isCreatingPR || prTargetBranch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+            .background(Color(nsColor: .windowBackgroundColor))
+        }
+        .frame(minWidth: 480, minHeight: 460)
+    }
+
+    private func prTargetPill(label: String, subtitle: String, target: String) -> some View {
+        let isSelected = prTargetBranch == target
+        return Button {
+            prTargetBranch = target
+        } label: {
+            VStack(spacing: 2) {
+                Text(label)
+                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    .foregroundStyle(isSelected ? Color.white : AppPalette.blue)
+                Text(subtitle)
+                    .font(.system(size: 9))
+                    .foregroundStyle(isSelected ? Color.white.opacity(0.8) : .secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(isSelected ? AppPalette.blue : AppPalette.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isSelected ? AppPalette.blue : Color.clear, lineWidth: 1.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isCreatingPR)
+    }
+
+    private func parseWorkspaceAndSlug(remoteUrl: String) -> (String, String)? {
+        var raw = remoteUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.hasSuffix(".git") {
+            raw = String(raw.dropLast(4))
+        }
+        if raw.hasPrefix("git@") {
+            if let colonIndex = raw.firstIndex(of: ":") {
+                raw = String(raw[raw.index(after: colonIndex)...])
+            }
+        } else if let schemeIndex = raw.range(of: "://") {
+            let afterScheme = String(raw[schemeIndex.upperBound...])
+            if let firstSlash = afterScheme.firstIndex(of: "/") {
+                raw = String(afterScheme[afterScheme.index(after: firstSlash)...])
+            }
+        }
+        let parts = raw.split(separator: "/").map(String.init)
+        if parts.count >= 2 {
+            return (parts[parts.count - 2], parts[parts.count - 1])
+        }
+        return nil
+    }
+
+    private func applyPRAuth(to req: inout URLRequest, config: PipelineConfig, accounts: [Account], workspace: String, repoSlug: String, sourceBranch: String, destBranch: String) {
+        req.httpShouldHandleCookies = false
+        let cleanCookie = appModel.sanitizeCookie(config.cookie)
+        let cleanCsrf = appModel.sanitizeCsrf(config.csrfToken)
+
+        if !cleanCookie.isEmpty {
+            req.setValue(cleanCookie, forHTTPHeaderField: "Cookie")
+        }
+        if !cleanCsrf.isEmpty {
+            req.setValue(cleanCsrf, forHTTPHeaderField: "x-csrftoken")
+        }
+        req.setValue("XMLHttpRequest", forHTTPHeaderField: "x-requested-with")
+        req.setValue("frontbucket", forHTTPHeaderField: "x-bitbucket-frontend")
+        req.setValue("https://bitbucket.org", forHTTPHeaderField: "origin")
+        req.setValue("https://bitbucket.org/\(workspace)/\(repoSlug)/pull-requests/new?source=\(sourceBranch)&dest=\(destBranch)", forHTTPHeaderField: "referer")
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36", forHTTPHeaderField: "user-agent")
+
+        if !config.token.isEmpty {
+            let user = config.username.isEmpty ? (accounts.first(where: { $0.id == config.selectedAccountId })?.username ?? "") : config.username
+            if !user.isEmpty {
+                let auth = Data("\(user):\(config.token)".utf8).base64EncodedString()
+                req.setValue("Basic \(auth)", forHTTPHeaderField: "Authorization")
+            } else {
+                req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
+            }
+        }
+    }
+
+    private func executeCreatePR(targetBranch: String, title: String? = nil, description: String? = nil) {
+        guard let path = model.selectedPath else { return }
+        let currentBranch = model.snapshot?.repository.branch ?? "main"
+        let trimmedTarget = targetBranch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTarget.isEmpty else { return }
+
+        let resolvedTitle: String
+        if let t = title?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+            resolvedTitle = t
+        } else if let lastCommit = model.snapshot?.commits.first?.message {
+            resolvedTitle = lastCommit.components(separatedBy: "\n").first ?? currentBranch
+        } else {
+            resolvedTitle = currentBranch
+        }
+
+        let resolvedDescription = description?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        isCreatingPR = true
+        prStatusMessage = "Đang kiểm tra remote origin…"
+        prErrorMessage = ""
+        createdPRUrl = nil
+        createdPRNumber = nil
+
+        let prConfig = self.appModel.pipelineConfig
+        let prAccounts = self.appModel.accounts
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let rawRemote = try? GitProcessService.run(path, ["remote", "get-url", "origin"]).trimmingCharacters(in: .whitespacesAndNewlines),
+                  !rawRemote.isEmpty else {
+                DispatchQueue.main.async {
+                    self.isCreatingPR = false
+                    self.prErrorMessage = "Không tìm thấy remote 'origin' trong repository này."
+                }
+                return
+            }
+
+            guard let (workspace, repoSlug) = self.parseWorkspaceAndSlug(remoteUrl: rawRemote) else {
+                DispatchQueue.main.async {
+                    self.isCreatingPR = false
+                    self.prErrorMessage = "Không phân tích được workspace và repository slug từ: \(rawRemote)"
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.prStatusMessage = "Đang push nhánh '\(currentBranch)' lên remote origin…"
+            }
+            _ = try? GitProcessService.run(path, ["push", "-u", "origin", currentBranch])
+
+            DispatchQueue.main.async {
+                self.prStatusMessage = "Đang gọi Bitbucket API tạo Pull Request vào '\(trimmedTarget)'…"
+            }
+
+            let endpoint = "https://bitbucket.org/!api/2.0/repositories/\(workspace)/\(repoSlug)/pullrequests/?fields=links.html.href"
+            guard let url = URL(string: endpoint) else {
+                DispatchQueue.main.async {
+                    self.isCreatingPR = false
+                    self.prErrorMessage = "URL endpoint không hợp lệ: \(endpoint)"
+                }
+                return
+            }
+
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+
+            self.applyPRAuth(to: &req, config: prConfig, accounts: prAccounts, workspace: workspace, repoSlug: repoSlug, sourceBranch: currentBranch, destBranch: trimmedTarget)
+
+            let bodyJson: [String: Any] = [
+                "title": resolvedTitle,
+                "description": resolvedDescription,
+                "source": ["branch": ["name": currentBranch]],
+                "destination": ["branch": ["name": trimmedTarget]],
+                "close_source_branch": false
+            ]
+
+            guard let bodyData = try? JSONSerialization.data(withJSONObject: bodyJson) else {
+                DispatchQueue.main.async {
+                    self.isCreatingPR = false
+                    self.prErrorMessage = "Không thể mã hóa dữ liệu JSON cho PR."
+                }
+                return
+            }
+            req.httpBody = bodyData
+
+            let session = URLSession(configuration: .default)
+            let task = session.dataTask(with: req) { data, response, error in
+                DispatchQueue.main.async {
+                    self.isCreatingPR = false
+                    if let error = error {
+                        self.prErrorMessage = "Lỗi kết nối: \(error.localizedDescription)"
+                        return
+                    }
+                    guard let httpRes = response as? HTTPURLResponse else {
+                        self.prErrorMessage = "Không nhận được phản hồi từ Bitbucket."
+                        return
+                    }
+
+                    if httpRes.statusCode == 201 || httpRes.statusCode == 200 {
+                        var prHref = ""
+                        if let data = data,
+                           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                           let links = json["links"] as? [String: Any],
+                           let html = links["html"] as? [String: Any],
+                           let href = html["href"] as? String {
+                            prHref = href
+                        } else if let loc = httpRes.allHeaderFields["Location"] as? String ?? httpRes.allHeaderFields["location"] as? String {
+                            prHref = loc.replacingOccurrences(of: "/!api/2.0/", with: "/").replacingOccurrences(of: "/pullrequests/", with: "/pull-requests/")
+                        }
+
+                        if prHref.isEmpty {
+                            prHref = "https://bitbucket.org/\(workspace)/\(repoSlug)/pull-requests"
+                        }
+
+                        let prNum = prHref.components(separatedBy: "/").last ?? ""
+                        let formattedNum = prNum.isEmpty ? "" : "#\(prNum)"
+
+                        self.createdPRUrl = prHref
+                        self.createdPRNumber = formattedNum
+                        self.showingPRSuccessAlert = true
+                        self.activeSheet = nil
+
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(prHref, forType: .string)
+
+                        self.appModel.logConsole("🎉 Đã tạo thành công Pull Request \(formattedNum) vào '\(trimmedTarget)': \(prHref)")
+                    } else {
+                        let resData = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                        var errDetail = ""
+                        if let data = data,
+                           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                           let errObj = json["error"] as? [String: Any] {
+                            let m = errObj["message"] as? String ?? ""
+                            let d = errObj["detail"] as? String ?? ""
+                            errDetail = d.isEmpty ? m : "\(m): \(d)"
+                        }
+                        if errDetail.isEmpty {
+                            errDetail = resData.prefix(180).description
+                        }
+                        self.prErrorMessage = "Bitbucket báo lỗi (HTTP \(httpRes.statusCode)): \(errDetail)"
+                        self.appModel.logConsole("❌ Lỗi tạo PR (HTTP \(httpRes.statusCode)): \(errDetail)")
+                    }
+                }
+            }
+            task.resume()
+        }
+    }
+
+    private func openCreatePRDialog(defaultTarget: String = "dev") {
+        prTargetBranch = defaultTarget
+        prErrorMessage = ""
+        isCreatingPR = false
+        if let lastCommit = model.snapshot?.commits.first?.message {
+            let firstLine = lastCommit.components(separatedBy: "\n").first ?? ""
+            prTitle = firstLine
+        } else {
+            prTitle = model.snapshot?.repository.branch ?? ""
+        }
+        activeSheet = .createPR
+    }
+
+    private func quickOpenPRWeb(target: String) {
+        if let url = getBitbucketPRUrl(targetBranch: target) {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func getBitbucketPRUrl(targetBranch: String) -> URL? {
+        guard let path = model.selectedPath,
+              let currentBranch = model.snapshot?.repository.branch,
+              let raw = try? GitProcessService.run(path, ["remote", "get-url", "origin"]).trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return nil }
+
+        var web = raw
+        if web.hasPrefix("git@") {
+            web = web.replacingOccurrences(of: ":", with: "/")
+            web = web.replacingOccurrences(of: "git@", with: "https://")
+        }
+        if web.hasSuffix(".git") {
+            web = String(web.dropLast(4))
+        }
+        if let atIndex = web.range(of: "@"), let schemeIndex = web.range(of: "://") {
+            if atIndex.lowerBound > schemeIndex.upperBound {
+                web = "https://" + String(web[atIndex.upperBound...])
+            }
+        }
+
+        guard let encodedSource = currentBranch.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let encodedDest = targetBranch.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { return nil }
+
+        if web.contains("bitbucket.org") {
+            return URL(string: "\(web)/pull-requests/new?source=\(encodedSource)&dest=\(encodedDest)")
+        } else if web.contains("github.com") {
+            return URL(string: "\(web)/compare/\(encodedDest)...\(encodedSource)?expand=1")
+        } else {
+            return URL(string: "\(web)/pull-requests?create&sourceBranch=\(encodedSource)&targetBranch=\(encodedDest)")
+        }
+    }
+
     private func startCheckoutRemote(_ remoteBranch: String, snapshot: GitSnapshot) {
         let localCandidate: String
         if let slashIndex = remoteBranch.firstIndex(of: "/") {
@@ -2238,6 +2775,32 @@ private struct GitManagerView: View {
                     }
                 }
                 .disabled(branchName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || branchName.hasPrefix("-"))
+            }
+
+            Divider()
+
+            Menu("Tạo PR trực tiếp (Bitbucket)…") {
+                Button {
+                    executeCreatePR(targetBranch: "dev")
+                } label: {
+                    Label("Tạo PR vào 'dev'", systemImage: "plus.circle.fill")
+                }
+                Button {
+                    executeCreatePR(targetBranch: "qc")
+                } label: {
+                    Label("Tạo PR vào 'qc'", systemImage: "plus.circle.fill")
+                }
+                Button {
+                    executeCreatePR(targetBranch: "uat")
+                } label: {
+                    Label("Tạo PR vào 'uat'", systemImage: "plus.circle.fill")
+                }
+                Divider()
+                Button {
+                    openCreatePRDialog(defaultTarget: "dev")
+                } label: {
+                    Label("Tùy chỉnh PR (Mở Dialog)…", systemImage: "slider.horizontal.3")
+                }
             }
         } label: {
             HStack(spacing: 5) {
@@ -3014,32 +3577,48 @@ private struct GitManagerView: View {
                 .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 6))
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.25), lineWidth: 1))
 
-            HStack {
-                Toggle("Amend latest", isOn: $amend)
-                    .font(.caption)
-                    .disabled(model.snapshot?.commits.isEmpty != false)
-
-                Spacer()
-
-                Button {
-                    if amend { confirmAmend = true } else { commit() }
-                } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle(isOn: $pushImmediately) {
                     HStack(spacing: 4) {
-                        Image(systemName: amend ? "arrow.triangle.2.circlepath" : "checkmark")
-                        Text(amend ? "Amend Commit" : "Commit")
-                            .bold()
+                        Image(systemName: "arrow.up.circle.fill")
+                            .foregroundStyle(AppPalette.blue)
+                        Text("Push changes immediately to")
+                            .font(.caption)
+                        Text(model.snapshot?.repository.branch ?? "current branch")
+                            .font(.caption.monospaced().bold())
+                            .foregroundStyle(AppPalette.blue)
                     }
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(AppPalette.blue)
-                .controlSize(.regular)
-                .keyboardShortcut(.return, modifiers: .command)
-                .disabled(
-                    commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                    (!amend && stagedCount == 0) ||
-                    hasConflicts
-                )
-                .help("Commit staged changes (⌘⏎)")
+                .toggleStyle(.checkbox)
+                .help("Tự động push commit lên remote branch sau khi commit thành công")
+
+                HStack {
+                    Toggle("Amend latest", isOn: $amend)
+                        .font(.caption)
+                        .disabled(model.snapshot?.commits.isEmpty != false)
+
+                    Spacer()
+
+                    Button {
+                        if amend { confirmAmend = true } else { commit() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: amend ? "arrow.triangle.2.circlepath" : (pushImmediately ? "arrow.up.circle.fill" : "checkmark"))
+                            Text(amend ? (pushImmediately ? "Amend & Push" : "Amend Commit") : (pushImmediately ? "Commit & Push" : "Commit"))
+                                .bold()
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(AppPalette.blue)
+                    .controlSize(.regular)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(
+                        commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                        (!amend && stagedCount == 0) ||
+                        hasConflicts
+                    )
+                    .help("Commit staged changes (⌘⏎)")
+                }
             }
         }
         .padding(10)
@@ -3047,7 +3626,18 @@ private struct GitManagerView: View {
     }
 
     private func commit() {
-        model.perform(["commit"] + (amend ? ["--amend"] : []) + ["-m", commitMessage])
+        let msg = commitMessage
+        commitMessage = "" // Xoá comment/commit message ngay khi bấm OK/Commit
+        let branch = model.snapshot?.repository.branch ?? "main"
+        let remote = model.snapshot?.remotes.first ?? "origin"
+        let commitArgs = ["commit"] + (amend ? ["--amend"] : []) + ["-m", msg]
+        if pushImmediately {
+            var pushArgs = ["push", remote, branch]
+            if amend { pushArgs.append("--force-with-lease") }
+            model.performSequence([commitArgs, pushArgs])
+        } else {
+            model.perform(commitArgs)
+        }
     }
 
     private func fileSection(staged: Bool) -> some View {
@@ -3759,6 +4349,86 @@ private let kAvailableServices: [String] = [
     "kong-gateway-int"
 ]
 
+// MARK: - Unsuccessful PRs & Build Status Models
+
+private struct PRBuildStatusItem: Identifiable, Codable {
+    var id: String { uuid ?? (key + "-" + name) }
+    var key: String = ""
+    var name: String = ""
+    var state: String = "" // "FAILED", "STOPPED", "INPROGRESS", "SUCCESSFUL", "PAUSED"
+    var description: String?
+    var url: String?
+    var uuid: String?
+    var created_on: String?
+    var updated_on: String?
+    var type: String?
+
+    var isFailed: Bool {
+        let s = state.uppercased()
+        let desc = (description ?? "").lowercased()
+        return s == "FAILED" || s == "ERROR" || desc.contains("fail") || desc.contains("error")
+    }
+
+    var isPaused: Bool {
+        let s = state.uppercased()
+        let desc = (description ?? "").lowercased()
+        let n = name.lowercased()
+        return s == "STOPPED" || s == "PAUSED" || desc.contains("pause") || desc.contains("manual") || desc.contains("waiting") || n.contains("pause")
+    }
+
+    var isInProgress: Bool {
+        let s = state.uppercased()
+        return (s == "INPROGRESS" || s == "PENDING" || s == "RUNNING") && !isPaused
+    }
+
+    var isSuccess: Bool {
+        let s = state.uppercased()
+        return s == "SUCCESSFUL" || s == "SUCCESS"
+    }
+}
+
+private struct UnsuccessfulPullRequest: Identifiable, Codable {
+    let id: Int
+    let title: String
+    let description: String?
+    let repository: String
+    let sourceBranch: String
+    let targetBranch: String
+    let commitHash: String?
+    let authorName: String
+    let authorAvatar: String?
+    let htmlUrl: String
+    let createdDate: String
+    let updatedDate: String
+    var builds: [PRBuildStatusItem] = []
+    var summaryState: String = "FAILED" // "FAILED", "PAUSED", "INPROGRESS"
+    var statusReason: String = ""
+
+    var isFailed: Bool {
+        builds.contains { $0.isFailed } || summaryState == "FAILED"
+    }
+
+    var isPaused: Bool {
+        builds.contains { $0.isPaused } || summaryState == "PAUSED"
+    }
+
+    var isInProgress: Bool {
+        builds.contains { $0.isInProgress } || summaryState == "INPROGRESS"
+    }
+
+    var failedCount: Int { builds.filter { $0.isFailed }.count }
+    var pausedCount: Int { builds.filter { $0.isPaused }.count }
+    var inProgressCount: Int { builds.filter { $0.isInProgress }.count }
+    var successCount: Int { builds.filter { $0.isSuccess }.count }
+}
+
+enum VpnConnectionStatus: String {
+    case connected = "CONNECTED"
+    case reconnecting = "RECONNECTING"
+    case disconnected = "DISCONNECTED"
+    case checking = "CHECKING"
+}
+
 @MainActor private final class AppModel: ObservableObject {
     @Published var server = UserDefaults.standard.string(forKey: "controlPlaneOrigin") ?? "https://bot.approve.mymind.bond"
     @Published var password = ""
@@ -3790,6 +4460,12 @@ private let kAvailableServices: [String] = [
     @Published var pipelineTesting = false
     @Published var pipelineConsoleLogs: [String] = []
     @Published var executionAlertResult: AlertInfo? = nil
+    // MARK: - Unsuccessful PRs & Build States
+    @Published var unsuccessfulPRs: [UnsuccessfulPullRequest] = []
+    @Published var prsLoading = false
+    @Published var prsError = ""
+    @Published var selectedPRId: Int? = nil
+    @Published var selectedPRRepo: String? = nil
     // MARK: - FortiClient VPN & Reconnect State
     @Published var vpnGatewayIp: String = UserDefaults.standard.string(forKey: "vpnGatewayIp") ?? "115.78.233.162"
     @Published var vpnAutoReconnect: Bool = UserDefaults.standard.object(forKey: "vpnAutoReconnect") as? Bool ?? true
@@ -4455,6 +5131,9 @@ private let kAvailableServices: [String] = [
             cfg.csrfToken = dict["csrfToken"] ?? "1rfIZh8UmWS7a162UeggG2niaPCrYM7z"
         } else {
             cfg.csrfToken = "1rfIZh8UmWS7a162UeggG2niaPCrYM7z"
+        }
+        if cfg.cookie.isEmpty {
+            cfg.cookie = "_otPreferencesSynced=; OptanonConsent=isGpcEnabled=0&datestamp=Thu+Feb+05+2026+14%3A14%3A01+GMT%2B0700+(Indochina+Time)&version=202503.2.0&browserGpcFlag=0&isIABGlobal=false&identifierType=null&hosts=&landingPath=https%3A%2F%2Fbitbucket.org%2Fproduct%2Fcomparison%2Fbitbucket-vs-github&groups=1%3A1%2C2%3A1%2C3%3A1%2C4%3A1; atlCohort={\"bucketAll\":{\"bucketedAtUTC\":\"2026-02-05T07:14:01.992Z\",\"version\":\"2\",\"index\":85,\"bucketId\":0}}; atl_xid.ts=1770275642119; atl_xid.current=%5B%7B%22type%22%3A%22xc%22%2C%22value%22%3A%222c9621ad-ec9e-470e-941e-df8693af72cd%22%2C%22createdAt%22%3A%222025-12-28T05%3A26%3A22.524Z%22%7D%5D; atlUserHash=1393648612; csrftoken=1rfIZh8UmWS7a162UeggG2niaPCrYM7z; default_workspace=508ddaa4-7e55-415d-bde0-f7221eaa4d9d; ajs_anonymous_id=%2204cb9c92-4555-48eb-b58e-507c0b408b2a%22; bb_session=zzd3xvapx13reys44omcc5hvl8mxa2v7; atl-bsc-consent-token-fallback=0031111010; atl-bsc-consent-token=0030000010; atl-bsc-show-banner=0; cloud.session.token=eyJraWQiOiJnZW5lcmljLWtleXBhaXIvc2Vzc2lvbi1zZXJ2aWNlL3NpZ25pbmcta2V5LS05NmxpaGI1aG9vNWdrMG9iIiwiYWxnIjoiUlMyNTYifQ.eyJhc3NvY2lhdGlvbnMiOltdLCJzdWIiOiI2M2IzZjJhZmYzZTcwMDRmNzdmZTExM2EiLCJlbWFpbERvbWFpbiI6Im1zbS5jb20udm4iLCJpbXBlcnNvbmF0aW9uIjpbXSwiY3JlYXRlZCI6MTc4MzM5MzcyNCwicmVmcmVzaFRpbWVvdXQiOjE3OTE5NDk0OTAsInZlcmlmaWVkIjp0cnVlLCJpc3MiOiJnZW5lcmljLWtleXBhaXIvc2Vzc2lvbi1zZXJ2aWNlIiwiZG9tYWlucyI6WyJiaXRidWNrZXQub3JnIl0sInNlc3Npb25JZCI6ImE5YTA0ZTIzLWQ3ZjItNDAzOC05ZGRmLThjNzMwOWNmOTFmZSIsInN0ZXBVcHMiOltdLCJvcmdJZCI6ImIxa2QxNDI4LWE3OGQtMTI5OS1qMDAzLWMzN2JqODNqampiNSIsImF1ZCI6ImlkZW50aXR5IiwibmJmIjoxNzkxOTQ4ODkwLCJleHAiOjE3OTQ1NDA4OTAsImlhdCI6MTc5MTk0ODg5MCwiZW1haWwiOiJodW5nbnZAbXNtLmNvbS52biIsImp0aSI6ImE5YTA0ZTIzLWQ3ZjItNDAzOC05ZGRmLThjNzMwOWNmOTFmZSJ9.fjwhwDLATsF1BQGRU5_7II5z09WeHLW4JetRsNruIkQ_mrDozLZM9laah1mXA-uaya4RoRt4UVLvGcI7JjpRJ4lU4gbrXu8hDU1j3PmaVVSmZkQ6IWOIMIkl1o2u2EsZ5mMOyrMuZGvSw7HgIMdrsThcQlTd-KRVkLsteQ9_8LikDrtA1Mhcgb8jKZ_TMMHwvrUKknYnIU4qzxoaCeOxwHDZfZoApOw2_Siiv7qciM7VvDQvuMx45WwZ5IcGz8lrbdUBfiTagbBkYiaDYIol3-PcSM1bhk_trF5MUAQSLd_UapoiFYlH7-7RNE3R3NKg-LR5KsOWMHyGvbwa2xVDA"
         }
         pipelineConfig = cfg
         loadPipelineLogs()
@@ -5133,70 +5812,337 @@ private let kAvailableServices: [String] = [
         p.waitUntilExit()
         return p.terminationStatus == 0
     }
-}
 
-enum VpnConnectionStatus: String {
-    case connected = "CONNECTED"
-    case reconnecting = "RECONNECTING"
-    case disconnected = "DISCONNECTED"
-    case checking = "CHECKING"
-}
+    private func probeVpnGateway(host: String, port: Int32 = 443, timeoutSeconds: TimeInterval = 1.5) async -> (reachable: Bool, latencyMs: Double) {
+        await withCheckedContinuation { (continuation: CheckedContinuation<(Bool, Double), Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let start = CFAbsoluteTimeGetCurrent()
+                var hints = addrinfo(
+                    ai_flags: AI_NUMERICHOST,
+                    ai_family: AF_INET,
+                    ai_socktype: SOCK_STREAM,
+                    ai_protocol: IPPROTO_TCP,
+                    ai_addrlen: 0,
+                    ai_canonname: nil,
+                    ai_addr: nil,
+                    ai_next: nil
+                )
+                var res: UnsafeMutablePointer<addrinfo>?
+                guard getaddrinfo(host, "\(port)", &hints, &res) == 0, let info = res else {
+                    continuation.resume(returning: (false, 0.0))
+                    return
+                }
+                defer { freeaddrinfo(res) }
 
-private func probeVpnGateway(host: String, port: Int32 = 443, timeoutSeconds: TimeInterval = 1.5) async -> (reachable: Bool, latencyMs: Double) {
-    await withCheckedContinuation { continuation in
-        DispatchQueue.global(qos: .userInitiated).async {
-            let start = CFAbsoluteTimeGetCurrent()
-            var hints = addrinfo(
-                ai_flags: AI_NUMERICHOST,
-                ai_family: AF_INET,
-                ai_socktype: SOCK_STREAM,
-                ai_protocol: IPPROTO_TCP,
-                ai_addrlen: 0,
-                ai_canonname: nil,
-                ai_addr: nil,
-                ai_next: nil
-            )
-            var res: UnsafeMutablePointer<addrinfo>?
-            guard getaddrinfo(host, "\(port)", &hints, &res) == 0, let info = res else {
-                continuation.resume(returning: (false, 0))
-                return
-            }
-            defer { freeaddrinfo(res) }
+                let sock = socket(info.pointee.ai_family, info.pointee.ai_socktype, info.pointee.ai_protocol)
+                guard sock >= 0 else {
+                    continuation.resume(returning: (false, 0.0))
+                    return
+                }
+                defer { close(sock) }
 
-            let sock = socket(info.pointee.ai_family, info.pointee.ai_socktype, info.pointee.ai_protocol)
-            guard sock >= 0 else {
-                continuation.resume(returning: (false, 0))
-                return
-            }
-            defer { close(sock) }
+                let flags = fcntl(sock, F_GETFL, 0)
+                _ = fcntl(sock, F_SETFL, flags | O_NONBLOCK)
 
-            let flags = fcntl(sock, F_GETFL, 0)
-            _ = fcntl(sock, F_SETFL, flags | O_NONBLOCK)
-
-            let connectRes = connect(sock, info.pointee.ai_addr, info.pointee.ai_addrlen)
-            if connectRes == 0 {
-                let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
-                continuation.resume(returning: (true, elapsed))
-                return
-            }
-            if errno != EINPROGRESS {
-                continuation.resume(returning: (false, 0))
-                return
-            }
-
-            var pollFd = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
-            let pollRes = poll(&pollFd, 1, Int32(timeoutSeconds * 1000))
-            if pollRes > 0 && (pollFd.revents & Int16(POLLOUT)) != 0 {
-                var err: Int32 = 0
-                var len = socklen_t(MemoryLayout<Int32>.size)
-                getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len)
-                if err == 0 {
+                let connectRes = connect(sock, info.pointee.ai_addr, info.pointee.ai_addrlen)
+                if connectRes == 0 {
                     let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
                     continuation.resume(returning: (true, elapsed))
                     return
                 }
+                if errno != EINPROGRESS {
+                    continuation.resume(returning: (false, 0.0))
+                    return
+                }
+
+                var pollFd = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
+                let pollRes = poll(&pollFd, 1, Int32(timeoutSeconds * 1000))
+                if pollRes > 0 && (pollFd.revents & Int16(POLLOUT)) != 0 {
+                    var err: Int32 = 0
+                    var len = socklen_t(MemoryLayout<Int32>.size)
+                    getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len)
+                    if err == 0 {
+                        let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
+                        continuation.resume(returning: (true, elapsed))
+                        return
+                    }
+                }
+                continuation.resume(returning: (false, 0.0))
             }
-            continuation.resume(returning: (false, 0))
+        }
+    }
+
+    // MARK: - Unsuccessful PRs & Build Details Scanner
+
+    func fetchUnsuccessfulPRs() async {
+        prsLoading = true
+        prsError = ""
+        defer { prsLoading = false }
+
+        // Auto-load credentials if needed
+        if pipelineConfig.cookie.isEmpty && pipelineConfig.token.isEmpty {
+            for acc in accounts {
+                if let creds = loadCredentialsForAccount(acc.id) {
+                    if let c = creds["cookie"], !c.isEmpty { pipelineConfig.cookie = c }
+                    if let csrf = creds["csrfToken"], !csrf.isEmpty { pipelineConfig.csrfToken = csrf }
+                    if let t = creds["token"], !t.isEmpty { pipelineConfig.token = t }
+                    if !pipelineConfig.cookie.isEmpty || !pipelineConfig.token.isEmpty {
+                        pipelineConfig.selectedAccountId = acc.id
+                        break
+                    }
+                }
+            }
+        }
+
+        var reposToScan = Set<String>()
+        for job in jobs {
+            for repo in job.rules.repositories {
+                let trimmed = repo.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty && !trimmed.contains("*") && trimmed.contains("/") {
+                    reposToScan.insert(trimmed)
+                }
+            }
+        }
+        let cfgRepo = pipelineConfig.repository.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cfgRepo.isEmpty && cfgRepo.contains("/") {
+            reposToScan.insert(cfgRepo)
+        }
+        for log in logs {
+            if let r = log.repository, r.contains("/") {
+                reposToScan.insert(r)
+            }
+        }
+
+        if reposToScan.isEmpty {
+            reposToScan.insert("msm-software/digifact-utilities")
+        }
+
+        var fetchedPRs: [UnsuccessfulPullRequest] = []
+
+        for repo in reposToScan {
+            await scanRepoForUnsuccessfulPRs(repo: repo, into: &fetchedPRs)
+        }
+
+        // Merge from worker logs to ensure every PR that failed during runs is included
+        for log in logs where log.status == "SKIPPED" || log.status == "CHECKING_CI" || (log.failureReason != nil && !log.failureReason!.isEmpty) {
+            guard let repo = log.repository, let title = log.prTitle else { continue }
+            let reason = log.failureReason ?? ""
+            let lowerReason = reason.lowercased()
+            let isCiFail = lowerReason.contains("fail") || lowerReason.contains("error")
+            let isCiPause = lowerReason.contains("pause") || lowerReason.contains("stopped") || lowerReason.contains("manual")
+            if isCiFail || isCiPause {
+                if !fetchedPRs.contains(where: { $0.repository == repo && $0.title == title }) {
+                    var buildsList: [PRBuildStatusItem] = []
+                    if isCiFail {
+                        buildsList.append(PRBuildStatusItem(
+                            key: "worker-ci",
+                            name: "CI Pipeline (Worker)",
+                            state: "FAILED",
+                            description: reason,
+                            url: "https://bitbucket.org/\(repo)/pull-requests",
+                            uuid: UUID().uuidString,
+                            created_on: log.timestamp,
+                            updated_on: log.timestamp,
+                            type: "commit_status"
+                        ))
+                    } else {
+                        buildsList.append(PRBuildStatusItem(
+                            key: "worker-ci",
+                            name: "CI Pipeline (Worker)",
+                            state: "STOPPED",
+                            description: reason,
+                            url: "https://bitbucket.org/\(repo)/pull-requests",
+                            uuid: UUID().uuidString,
+                            created_on: log.timestamp,
+                            updated_on: log.timestamp,
+                            type: "commit_status"
+                        ))
+                    }
+                    fetchedPRs.append(UnsuccessfulPullRequest(
+                        id: abs(log.id.hashValue) % 10000,
+                        title: title,
+                        description: log.failureReason,
+                        repository: repo,
+                        sourceBranch: "source",
+                        targetBranch: "target",
+                        commitHash: nil,
+                        authorName: "Worker",
+                        authorAvatar: nil,
+                        htmlUrl: "https://bitbucket.org/\(repo)/pull-requests",
+                        createdDate: log.timestamp,
+                        updatedDate: log.timestamp,
+                        builds: buildsList,
+                        summaryState: isCiFail ? "FAILED" : "PAUSED",
+                        statusReason: reason
+                    ))
+                }
+            }
+        }
+
+        self.unsuccessfulPRs = fetchedPRs.sorted { $0.updatedDate > $1.updatedDate }
+        if self.selectedPRId == nil, let first = self.unsuccessfulPRs.first {
+            self.selectedPRId = first.id
+            self.selectedPRRepo = first.repository
+        }
+    }
+
+    private func scanRepoForUnsuccessfulPRs(repo: String, into list: inout [UnsuccessfulPullRequest]) async {
+        let cleanCookie = sanitizeCookie(pipelineConfig.cookie)
+        let isSession = pipelineConfig.authType == "session" || (!cleanCookie.isEmpty && pipelineConfig.authType != "token")
+        let endpoint = isSession
+            ? "https://bitbucket.org/!api/2.0/repositories/\(repo)/pullrequests?state=OPEN&pagelen=30"
+            : "https://api.bitbucket.org/2.0/repositories/\(repo)/pullrequests?state=OPEN&pagelen=30"
+
+        guard let url = URL(string: endpoint) else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyAuth(to: &req, config: pipelineConfig, repo: repo)
+
+        do {
+            let (data, response) = try await pipelineSession.data(for: req)
+            guard let http = response as? HTTPURLResponse, http.statusCode >= 200 && http.statusCode < 300 else {
+                return
+            }
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let values = json["values"] as? [[String: Any]] else {
+                return
+            }
+
+            for item in values {
+                guard let prId = item["id"] as? Int,
+                      let title = item["title"] as? String else { continue }
+
+                let sourceObj = item["source"] as? [String: Any]
+                let sourceBranchObj = sourceObj?["branch"] as? [String: Any]
+                let sourceBranch = sourceBranchObj?["name"] as? String ?? "unknown"
+                let sourceCommitObj = sourceObj?["commit"] as? [String: Any]
+                let commitHash = sourceCommitObj?["hash"] as? String
+
+                let destObj = item["destination"] as? [String: Any]
+                let destBranchObj = destObj?["branch"] as? [String: Any]
+                let destBranch = destBranchObj?["name"] as? String ?? "unknown"
+
+                let authorObj = item["author"] as? [String: Any]
+                let authorName = authorObj?["display_name"] as? String ?? authorObj?["nickname"] as? String ?? "unknown"
+                let authorLinks = authorObj?["links"] as? [String: Any]
+                let avatarLink = authorLinks?["avatar"] as? [String: Any]
+                let authorAvatar = avatarLink?["href"] as? String
+
+                let linksObj = item["links"] as? [String: Any]
+                let htmlLinkObj = linksObj?["html"] as? [String: Any]
+                let htmlUrl = htmlLinkObj?["href"] as? String ?? "https://bitbucket.org/\(repo)/pull-requests/\(prId)"
+
+                let createdDate = item["created_on"] as? String ?? ""
+                let updatedDate = item["updated_on"] as? String ?? ""
+                let summaryObj = item["summary"] as? [String: Any]
+                let description = summaryObj?["raw"] as? String ?? item["description"] as? String
+
+                let builds = await fetchStatusesForPR(repo: repo, prId: prId, commitHash: commitHash)
+
+                let hasFailed = builds.contains { $0.isFailed }
+                let hasPaused = builds.contains { $0.isPaused }
+                let hasInProgress = builds.contains { $0.isInProgress }
+                let allSuccess = !builds.isEmpty && builds.allSatisfy { $0.isSuccess }
+
+                if hasFailed || hasPaused || (hasInProgress && !allSuccess) {
+                    let summary = hasFailed ? "FAILED" : (hasPaused ? "PAUSED" : "INPROGRESS")
+                    let statusReason = hasFailed
+                        ? "Có \(builds.filter { $0.isFailed }.count) build bị thất bại"
+                        : (hasPaused ? "Có \(builds.filter { $0.isPaused }.count) build bị tạm dừng/chờ duyệt" : "Đang chạy build")
+
+                    list.append(UnsuccessfulPullRequest(
+                        id: prId,
+                        title: title,
+                        description: description,
+                        repository: repo,
+                        sourceBranch: sourceBranch,
+                        targetBranch: destBranch,
+                        commitHash: commitHash,
+                        authorName: authorName,
+                        authorAvatar: authorAvatar,
+                        htmlUrl: htmlUrl,
+                        createdDate: createdDate,
+                        updatedDate: updatedDate,
+                        builds: builds,
+                        summaryState: summary,
+                        statusReason: statusReason
+                    ))
+                }
+            }
+        } catch {
+            logConsole("⚠️ Lỗi quét PR cho repo \(repo): \(error.localizedDescription)")
+        }
+    }
+
+    private func fetchStatusesForPR(repo: String, prId: Int, commitHash: String?) async -> [PRBuildStatusItem] {
+        let cleanCookie = sanitizeCookie(pipelineConfig.cookie)
+        let isSession = pipelineConfig.authType == "session" || (!cleanCookie.isEmpty && pipelineConfig.authType != "token")
+
+        var endpoint = isSession
+            ? "https://bitbucket.org/!api/2.0/repositories/\(repo)/pullrequests/\(prId)/statuses"
+            : "https://api.bitbucket.org/2.0/repositories/\(repo)/pullrequests/\(prId)/statuses"
+
+        if let url = URL(string: endpoint) {
+            var req = URLRequest(url: url)
+            req.httpMethod = "GET"
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            applyAuth(to: &req, config: pipelineConfig, repo: repo)
+
+            if let (data, response) = try? await pipelineSession.data(for: req),
+               let http = response as? HTTPURLResponse, http.statusCode >= 200 && http.statusCode < 300,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let values = json["values"] as? [[String: Any]], !values.isEmpty {
+                return parseBuildStatusItems(values)
+            }
+        }
+
+        if let hash = commitHash, !hash.isEmpty {
+            endpoint = isSession
+                ? "https://bitbucket.org/!api/2.0/repositories/\(repo)/commit/\(hash)/statuses"
+                : "https://api.bitbucket.org/2.0/repositories/\(repo)/commit/\(hash)/statuses"
+
+            if let url = URL(string: endpoint) {
+                var req2 = URLRequest(url: url)
+                req2.httpMethod = "GET"
+                req2.setValue("application/json", forHTTPHeaderField: "Accept")
+                applyAuth(to: &req2, config: pipelineConfig, repo: repo)
+
+                if let (data, response) = try? await pipelineSession.data(for: req2),
+                   let http = response as? HTTPURLResponse, http.statusCode >= 200 && http.statusCode < 300,
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let values = json["values"] as? [[String: Any]], !values.isEmpty {
+                    return parseBuildStatusItems(values)
+                }
+            }
+        }
+
+        return []
+    }
+
+    private func parseBuildStatusItems(_ values: [[String: Any]]) -> [PRBuildStatusItem] {
+        return values.map { dict in
+            PRBuildStatusItem(
+                key: dict["key"] as? String ?? "",
+                name: dict["name"] as? String ?? dict["key"] as? String ?? "Build Check",
+                state: (dict["state"] as? String ?? "").uppercased(),
+                description: dict["description"] as? String,
+                url: dict["url"] as? String,
+                uuid: dict["uuid"] as? String,
+                created_on: dict["created_on"] as? String,
+                updated_on: dict["updated_on"] as? String,
+                type: dict["type"] as? String
+            )
+        }
+    }
+
+    func refreshBuildsForPR(_ pr: UnsuccessfulPullRequest) async {
+        let newBuilds = await fetchStatusesForPR(repo: pr.repository, prId: pr.id, commitHash: pr.commitHash)
+        if let idx = unsuccessfulPRs.firstIndex(where: { $0.id == pr.id && $0.repository == pr.repository }) {
+            unsuccessfulPRs[idx].builds = newBuilds
+            let hasFailed = newBuilds.contains { $0.isFailed }
+            let hasPaused = newBuilds.contains { $0.isPaused }
+            unsuccessfulPRs[idx].summaryState = hasFailed ? "FAILED" : (hasPaused ? "PAUSED" : "INPROGRESS")
         }
     }
 }
@@ -5557,6 +6503,564 @@ private struct BitbucketLoginSheet: View {
     }
 }
 
+private func formatDisplayDate(_ value: String) -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    guard let date = formatter.date(from: value) ?? ISO8601DateFormatter().date(from: value) else { return value }
+    return date.formatted(date: .abbreviated, time: .standard)
+}
+
+private struct UnsuccessfulPRsView: View {
+    @ObservedObject var model: AppModel
+    @State private var search = ""
+    @State private var statusFilter = "Tất cả"
+    @State private var selectedRepo = "Tất cả"
+    @State private var selectedPRId: Int? = nil
+
+    private var availableRepos: [String] {
+        let set = Set(model.unsuccessfulPRs.map { $0.repository })
+        return ["Tất cả"] + Array(set).sorted()
+    }
+
+    private var filteredPRs: [UnsuccessfulPullRequest] {
+        model.unsuccessfulPRs.filter { pr in
+            if selectedRepo != "Tất cả" && pr.repository != selectedRepo { return false }
+            if statusFilter == "Build Fail" && !pr.isFailed { return false }
+            if statusFilter == "Build Pause" && !pr.isPaused { return false }
+            if statusFilter == "Đang build" && !pr.isInProgress { return false }
+            if !search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let q = search.lowercased()
+                let titleMatch = pr.title.lowercased().contains(q)
+                let repoMatch = pr.repository.lowercased().contains(q)
+                let authorMatch = pr.authorName.lowercased().contains(q)
+                let branchMatch = pr.sourceBranch.lowercased().contains(q) || pr.targetBranch.lowercased().contains(q)
+                let idMatch = "\(pr.id)".contains(q)
+                return titleMatch || repoMatch || authorMatch || branchMatch || idMatch
+            }
+            return true
+        }
+    }
+
+    private var currentPR: UnsuccessfulPullRequest? {
+        if let id = selectedPRId {
+            return model.unsuccessfulPRs.first(where: { $0.id == id })
+        }
+        return filteredPRs.first
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            headerBar
+            kpiBar
+            filterToolbar
+            masterDetailView
+        }
+        .padding(20)
+        .onAppear {
+            if model.unsuccessfulPRs.isEmpty && !model.prsLoading {
+                Task { await model.fetchUnsuccessfulPRs() }
+            }
+        }
+    }
+
+    private var headerBar: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text("PR Chưa Thành Công").font(.largeTitle.bold())
+                    if !model.unsuccessfulPRs.isEmpty {
+                        Text("\(model.unsuccessfulPRs.count)")
+                            .font(.headline.bold())
+                            .padding(.horizontal, 10).padding(.vertical, 3)
+                            .background(Color.red.opacity(0.18), in: Capsule())
+                            .foregroundStyle(.red)
+                    }
+                }
+                Text("Theo dõi các PR có build bị fail hoặc bị pause/stopped. Nhấn vào chi tiết để xem từng build.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if model.prsLoading {
+                ProgressView().controlSize(.small)
+                Text("Đang quét...").font(.caption).foregroundStyle(.secondary)
+            }
+            Button {
+                Task { await model.fetchUnsuccessfulPRs() }
+            } label: {
+                Label("Làm mới", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.bordered)
+            .disabled(model.prsLoading)
+        }
+    }
+
+    private var kpiBar: some View {
+        HStack(spacing: 12) {
+            kpiCard("Tổng PR chưa đạt", model.unsuccessfulPRs.count, "exclamationmark.triangle.fill", Color.orange)
+            kpiCard("Build bị Fail", model.unsuccessfulPRs.filter { $0.isFailed }.count, "xmark.circle.fill", Color.red)
+            kpiCard("Build bị Pause / Chờ", model.unsuccessfulPRs.filter { $0.isPaused }.count, "pause.circle.fill", Color.orange)
+            kpiCard("Đang build / Pending", model.unsuccessfulPRs.filter { $0.isInProgress }.count, "arrow.triangle.2.circlepath", Color.blue)
+        }
+    }
+
+    private func kpiCard(_ title: String, _ count: Int, _ icon: String, _ color: Color) -> some View {
+        HStack(spacing: 12) {
+            ZStack {
+                Circle().fill(color.opacity(0.15)).frame(width: 36, height: 36)
+                Image(systemName: icon).font(.system(size: 16, weight: .bold)).foregroundStyle(color)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(count)").font(.title3.bold()).monospacedDigit()
+                Text(title).font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity)
+        .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.06), lineWidth: 1))
+    }
+
+    private var filterToolbar: some View {
+        HStack(spacing: 12) {
+            HStack {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Tìm PR theo tên, nhánh, tác giả, id...", text: $search)
+                    .textFieldStyle(.plain)
+                if !search.isEmpty {
+                    Button { search = "" } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.12), lineWidth: 1))
+            .frame(maxWidth: 380)
+
+            Picker("Trạng thái", selection: $statusFilter) {
+                Text("Tất cả").tag("Tất cả")
+                Text("🔴 Build Fail").tag("Build Fail")
+                Text("🟡 Build Pause").tag("Build Pause")
+                Text("🔵 Đang build").tag("Đang build")
+            }
+            .pickerStyle(.segmented)
+            .frame(maxWidth: 340)
+
+            Spacer()
+
+            if availableRepos.count > 2 {
+                Picker("Repo:", selection: $selectedRepo) {
+                    ForEach(availableRepos, id: \.self) { r in Text(r).tag(r) }
+                }
+                .frame(maxWidth: 220)
+            }
+        }
+    }
+
+    private var masterDetailView: some View {
+        HStack(spacing: 14) {
+            // Left Column: PR List
+            VStack(spacing: 0) {
+                if filteredPRs.isEmpty {
+                    VStack(spacing: 12) {
+                        Spacer()
+                        Image(systemName: model.prsLoading ? "arrow.triangle.2.circlepath" : "checkmark.seal.fill")
+                            .font(.system(size: 38))
+                            .foregroundStyle(model.prsLoading ? AppPalette.blue : AppPalette.mint)
+                        Text(model.prsLoading ? "Đang quét các PR..." : "Không có PR nào gặp lỗi build")
+                            .font(.headline)
+                        Text(model.prsLoading ? "Vui lòng đợi giây lát" : "Tất cả các PR trong phạm vi quét đều thành công hoặc không có PR mở.")
+                            .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding()
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 8) {
+                            ForEach(filteredPRs) { pr in
+                                prCard(pr)
+                            }
+                        }
+                        .padding(8)
+                    }
+                }
+            }
+            .frame(minWidth: 360, maxWidth: 440)
+            .background(AppPalette.surface.opacity(0.6), in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.08), lineWidth: 1))
+
+            // Right Column: PR Details & Build Inspector
+            VStack(spacing: 0) {
+                if let pr = currentPR {
+                    prDetailInspector(pr)
+                } else {
+                    VStack(spacing: 14) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.system(size: 40))
+                            .foregroundStyle(.secondary)
+                        Text("Chọn một Pull Request").font(.title3.bold())
+                        Text("Nhấn vào một PR ở cột bên trái để xem chi tiết build nào bị pause hoặc fail.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 320)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(AppPalette.surface.opacity(0.6), in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.08), lineWidth: 1))
+        }
+        .frame(maxHeight: .infinity)
+    }
+
+    private func prCard(_ pr: UnsuccessfulPullRequest) -> some View {
+        let isSelected = (selectedPRId == pr.id) || (selectedPRId == nil && filteredPRs.first?.id == pr.id)
+
+        return Button {
+            selectedPRId = pr.id
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text("#\(pr.id)")
+                        .font(.caption.monospaced().bold())
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 4))
+                    Text(pr.repository)
+                        .font(.caption.bold())
+                        .foregroundStyle(AppPalette.blue)
+                        .lineLimit(1)
+                    Spacer()
+                    if !pr.updatedDate.isEmpty {
+                        Text(formatDisplayDate(pr.updatedDate))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Text(pr.title)
+                    .font(.subheadline.bold())
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(pr.sourceBranch)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.secondary)
+                    Text(pr.targetBranch)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 6) {
+                    Image(systemName: "person.circle")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(pr.authorName)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    if pr.failedCount > 0 {
+                        HStack(spacing: 3) {
+                            Circle().fill(.red).frame(width: 6, height: 6)
+                            Text("\(pr.failedCount) fail").font(.caption2.bold()).foregroundStyle(.red)
+                        }
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.red.opacity(0.12), in: Capsule())
+                    }
+                    if pr.pausedCount > 0 {
+                        HStack(spacing: 3) {
+                            Circle().fill(.orange).frame(width: 6, height: 6)
+                            Text("\(pr.pausedCount) pause").font(.caption2.bold()).foregroundStyle(.orange)
+                        }
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.12), in: Capsule())
+                    }
+                    if pr.inProgressCount > 0 && pr.failedCount == 0 && pr.pausedCount == 0 {
+                        HStack(spacing: 3) {
+                            ProgressView().controlSize(.mini)
+                            Text("running").font(.caption2.bold()).foregroundStyle(.blue)
+                        }
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.blue.opacity(0.12), in: Capsule())
+                    }
+                }
+            }
+            .padding(12)
+            .background(isSelected ? AppPalette.blue.opacity(0.12) : AppPalette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(isSelected ? AppPalette.blue : Color.primary.opacity(0.06), lineWidth: isSelected ? 1.5 : 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func prDetailInspector(_ pr: UnsuccessfulPullRequest) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                // PR Overview Banner
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(alignment: .top) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 8) {
+                                Text("#\(pr.id)")
+                                    .font(.title2.monospaced().bold())
+                                    .padding(.horizontal, 8).padding(.vertical, 2)
+                                    .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
+                                Text(pr.repository)
+                                    .font(.headline)
+                                    .foregroundStyle(AppPalette.blue)
+                            }
+                            Text(pr.title)
+                                .font(.title3.bold())
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        Spacer()
+
+                        HStack(spacing: 8) {
+                            if let url = URL(string: pr.htmlUrl) {
+                                Button {
+                                    NSWorkspace.shared.open(url)
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "safari")
+                                        Text("Mở PR Bitbucket")
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(AppPalette.blue)
+                            }
+
+                            Button {
+                                Task { await model.refreshBuildsForPR(pr) }
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            .buttonStyle(.bordered)
+                            .help("Kiểm tra lại trạng thái build của PR này")
+                        }
+                    }
+
+                    Divider()
+
+                    // Metadata grid
+                    HStack(spacing: 24) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Tác giả:").font(.caption2).foregroundStyle(.secondary)
+                            HStack(spacing: 4) {
+                                Image(systemName: "person.circle.fill").foregroundStyle(AppPalette.blue)
+                                Text(pr.authorName).font(.subheadline.bold())
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Nhánh nguồn → đích:").font(.caption2).foregroundStyle(.secondary)
+                            HStack(spacing: 4) {
+                                Text(pr.sourceBranch).font(.subheadline.monospaced().bold())
+                                Image(systemName: "arrow.right").font(.caption2).foregroundStyle(.secondary)
+                                Text(pr.targetBranch).font(.subheadline.monospaced().bold())
+                            }
+                        }
+
+                        if let commit = pr.commitHash, !commit.isEmpty {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Commit CI:").font(.caption2).foregroundStyle(.secondary)
+                                Text(String(commit.prefix(10))).font(.subheadline.monospaced().bold())
+                            }
+                        }
+
+                        Spacer()
+
+                        if !pr.updatedDate.isEmpty {
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text("Cập nhật:").font(.caption2).foregroundStyle(.secondary)
+                                Text(formatDisplayDate(pr.updatedDate)).font(.subheadline)
+                            }
+                        }
+                    }
+                }
+                .padding(16)
+                .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.08), lineWidth: 1))
+
+                // Build Checks Section
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Image(systemName: "gearshape.2.fill")
+                            .foregroundStyle(AppPalette.blue)
+                        Text("CHI TIẾT TỪNG BUILD & PIPELINE CHECKS")
+                            .font(.headline.bold())
+                        Spacer()
+                        Text("\(pr.builds.count) checks")
+                            .font(.caption.bold())
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .background(Color.secondary.opacity(0.12), in: Capsule())
+                    }
+
+                    if pr.builds.isEmpty {
+                        VStack(spacing: 10) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.system(size: 28))
+                                .foregroundStyle(.orange)
+                            Text("Chưa có danh sách build riêng lẻ được ghi nhận").font(.headline)
+                            Text("Có thể commit chưa kích hoạt CI Pipelines trên Bitbucket, hoặc cần nạp credentials của tài khoản có quyền đọc build status.")
+                                .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                            if !pr.statusReason.isEmpty {
+                                Text("Lý do từ Worker: \(pr.statusReason)")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.red)
+                                    .padding(8)
+                                    .background(Color.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(24)
+                        .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 10))
+                    } else {
+                        VStack(spacing: 10) {
+                            ForEach(pr.builds) { item in
+                                buildCard(item)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(18)
+        }
+    }
+
+    private func buildCard(_ item: PRBuildStatusItem) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: item.isFailed ? "xmark.circle.fill" : (item.isPaused ? "pause.circle.fill" : (item.isInProgress ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill")))
+                    .font(.system(size: 22))
+                    .foregroundStyle(item.isFailed ? Color.red : (item.isPaused ? Color.orange : (item.isInProgress ? Color.blue : AppPalette.mint)))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 8) {
+                        Text(item.name.isEmpty ? item.key : item.name)
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+
+                        statusBadge(item)
+                    }
+                    Text("Check Key: \(item.key)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                if let u = item.url, let url = URL(string: u) {
+                    Button {
+                        NSWorkspace.shared.open(url)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("Mở Build")
+                            Image(systemName: "arrow.up.right.square")
+                        }
+                        .font(.caption.bold())
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
+            if let desc = item.description, !desc.isEmpty {
+                Text(desc)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 2)
+            }
+
+            if item.isPaused {
+                HStack(spacing: 6) {
+                    Image(systemName: "pause.fill")
+                        .foregroundStyle(.orange)
+                    Text("Build đang bị Pause hoặc chờ bước xác nhận thủ công (Manual Step). Bạn có thể bấm 'Mở Build' để resume hoặc phê duyệt.")
+                        .font(.caption.bold())
+                        .foregroundStyle(.orange)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+            } else if item.isFailed {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                    Text("Build bị thất bại (Failed). Hãy kiểm tra log chi tiết bằng cách bấm 'Mở Build'.")
+                        .font(.caption.bold())
+                        .foregroundStyle(.red)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+            }
+
+            if let time = item.updated_on ?? item.created_on, !time.isEmpty {
+                HStack {
+                    Spacer()
+                    Text("Cập nhật: \(formatDisplayDate(time))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(14)
+        .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(item.isFailed ? Color.red.opacity(0.4) : (item.isPaused ? Color.orange.opacity(0.4) : Color.primary.opacity(0.08)), lineWidth: 1)
+        )
+    }
+
+    private func statusBadge(_ item: PRBuildStatusItem) -> some View {
+        Group {
+            if item.isFailed {
+                Text("BỊ FAIL")
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 8).padding(.vertical, 2)
+                    .background(Color.red.opacity(0.18), in: Capsule())
+                    .foregroundStyle(.red)
+            } else if item.isPaused {
+                Text("BỊ PAUSE / TẠM DỪNG")
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 8).padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.18), in: Capsule())
+                    .foregroundStyle(.orange)
+            } else if item.isInProgress {
+                Text("ĐANG CHẠY")
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 8).padding(.vertical, 2)
+                    .background(Color.blue.opacity(0.18), in: Capsule())
+                    .foregroundStyle(.blue)
+            } else {
+                Text("THÀNH CÔNG")
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 8).padding(.vertical, 2)
+                    .background(AppPalette.mint.opacity(0.18), in: Capsule())
+                    .foregroundStyle(AppPalette.mint)
+            }
+        }
+    }
+}
+
 private struct AppView: View {
     @StateObject private var model = AppModel()
     @StateObject private var gitModel = GitManagerModel()
@@ -5630,6 +7134,9 @@ private struct AppView: View {
             await model.checkForUpdate()
             await model.restoreLogin()
             await model.checkVpnHealth()
+            if model.authenticated {
+                await model.fetchUnsuccessfulPRs()
+            }
         }
         .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
             Task { await model.checkVpnHealth() }
@@ -5839,6 +7346,7 @@ private struct AppView: View {
                 sidebarButton("Town Board 2D", "map.fill", 5)
                 sidebarButton("Bật/Tắt Server", "server.rack", 6)
                 sidebarButton("Git Manager", "arrow.triangle.branch", 7)
+                sidebarButton("PR chưa xong", "exclamationmark.triangle", 8)
                 Spacer()
                 if let local = model.workers.first(where: { $0.id == model.localWorkerId }) {
                     Label(local.state == "ONLINE" ? "Worker online" : "Worker: \(local.state)",
@@ -5854,7 +7362,7 @@ private struct AppView: View {
             .padding(18).frame(width: 218)
             .background(AppPalette.navy)
             VStack(spacing: 0) {
-                if selectedTab != 7 {
+                if selectedTab != 7 && selectedTab != 8 {
                     HStack {
                         Circle().fill(AppPalette.mint).frame(width: 8, height: 8).accessibilityHidden(true)
                         Text("Control Plane").font(.caption.bold())
@@ -5866,7 +7374,7 @@ private struct AppView: View {
                 }
                 selectedPage
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                if selectedTab != 7 && !model.message.isEmpty {
+                if selectedTab != 7 && selectedTab != 8 && !model.message.isEmpty {
                     Text(model.message).font(.caption).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading).padding(12)
                 }
@@ -5884,7 +7392,8 @@ private struct AppView: View {
         case 4: logs
         case 5: generativeBoard
         case 6: serverControl
-        case 7: GitManagerView(model: gitModel)
+        case 7: GitManagerView(model: gitModel, appModel: model)
+        case 8: UnsuccessfulPRsView(model: model)
         default: overview
         }
     }
@@ -5900,6 +7409,19 @@ private struct AppView: View {
                 }
                 if tab == 6 && model.pipelineBusy {
                     ProgressView().controlSize(.mini)
+                }
+                if tab == 8 && !model.unsuccessfulPRs.isEmpty {
+                    let failCount = model.unsuccessfulPRs.filter { $0.isFailed }.count
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(failCount > 0 ? Color.red : Color.orange)
+                            .frame(width: 7, height: 7)
+                        Text("\(model.unsuccessfulPRs.count)")
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(failCount > 0 ? Color.red.opacity(0.85) : Color.orange.opacity(0.85), in: Capsule())
+                            .foregroundStyle(.white)
+                    }
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 12)
@@ -5922,6 +7444,7 @@ private struct AppView: View {
                     stat("Jobs", model.jobs.count, "list.bullet.rectangle", "Quy tắc đã tạo")
                     stat("Workers", model.workers.filter { $0.revokedAt == nil }.count,
                          "desktopcomputer", "Máy đã ghép")
+                    stat("PR Chưa Xong", model.unsuccessfulPRs.count, "exclamationmark.triangle", "Build fail / pause")
                 }
 
                 HStack(alignment: .center, spacing: 18) {
@@ -5947,6 +7470,27 @@ private struct AppView: View {
                 }
                 .padding(18)
                 .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 16))
+
+                if !model.unsuccessfulPRs.isEmpty {
+                    HStack(spacing: 16) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 26))
+                            .foregroundStyle(.red)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Phát hiện \(model.unsuccessfulPRs.count) Pull Request chưa thành công")
+                                .font(.headline.bold())
+                            Text("Có các PR có build bị fail hoặc đang bị pause cần kiểm tra.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Xem chi tiết build lỗi") { selectedTab = 8 }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.red)
+                    }
+                    .padding(18)
+                    .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.red.opacity(0.25), lineWidth: 1))
+                }
 
                 HStack(spacing: 16) {
                     Image(systemName: "server.rack")

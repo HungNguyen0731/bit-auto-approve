@@ -11,6 +11,7 @@ import {
   Terminal,
   Settings,
   Search,
+  GitPullRequest,
 } from 'lucide-react';
 
 interface GitToolbarProps {
@@ -23,6 +24,7 @@ interface GitToolbarProps {
   isRefreshing?: boolean;
   onCommit?: () => void;
   onOpenMergeModal?: () => void;
+  onOpenCreatePRModal?: () => void;
   onViewRemote?: () => void;
   onOpenFinder?: () => void;
   onOpenTerminal?: () => void;
@@ -98,6 +100,12 @@ export const GitToolbar: React.FC<GitToolbarProps> = (props) => {
       icon: <Archive aria-hidden="true" className="w-6 h-6 text-slate-700 stroke-[1.5]" />,
       onClick: props.onOpenStashModal,
       title: 'Stash management',
+    },
+    {
+      label: 'Tạo PR',
+      icon: <GitPullRequest aria-hidden="true" className="w-6 h-6 text-brand-600 stroke-[1.75]" />,
+      onClick: props.onOpenCreatePRModal,
+      title: 'Tạo Pull Request từ nhánh hiện tại vào dev, qc hoặc uat',
     },
   ];
 

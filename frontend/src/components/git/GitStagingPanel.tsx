@@ -16,7 +16,7 @@ interface GitStagingPanelProps {
   onStage: (paths?: string[], all?: boolean) => void;
   onUnstage: (paths?: string[], all?: boolean) => void;
   onDiscard: (paths?: string[], all?: boolean) => void;
-  onCommit: (payload: { message: string; amend?: boolean }) => void;
+  onCommit: (payload: { message: string; amend?: boolean; pushImmediately?: boolean }) => void;
   isStaging?: boolean;
   isCommitting?: boolean;
   lastCommitMessage?: string;
@@ -36,6 +36,7 @@ export const GitStagingPanel: React.FC<GitStagingPanelProps> = ({
 }) => {
   const [commitMessage, setCommitMessage] = useState('');
   const [isAmend, setIsAmend] = useState(false);
+  const [pushImmediately, setPushImmediately] = useState(true);
   const [discardConfirmPath, setDiscardConfirmPath] = useState<string | null>(null);
 
   const unstagedFiles: GitStatusFile[] = [
@@ -59,6 +60,7 @@ export const GitStagingPanel: React.FC<GitStagingPanelProps> = ({
     onCommit({
       message: commitMessage.trim(),
       amend: isAmend,
+      pushImmediately,
     });
     setCommitMessage('');
     setIsAmend(false);
@@ -295,40 +297,52 @@ export const GitStagingPanel: React.FC<GitStagingPanelProps> = ({
           />
         </div>
 
-        <div className="flex items-center justify-between">
-          <label className="flex items-center gap-1.5 text-xs text-app-ink cursor-pointer select-none">
+        <div className="flex flex-col gap-2">
+          <label className="flex items-center gap-1.5 text-xs text-brand-700 cursor-pointer select-none font-medium">
             <input
               type="checkbox"
-              checked={isAmend}
-              onChange={(e) => handleAmendToggle(e.target.checked)}
+              checked={pushImmediately}
+              onChange={(e) => setPushImmediately(e.target.checked)}
               className="rounded border-app-line text-brand-600 focus:ring-brand-500 w-3.5 h-3.5"
             />
-            <span>Amend previous commit</span>
+            <span>Push changes immediately to branch <strong className="font-mono">{status?.branch || 'current'}</strong></span>
           </label>
 
-          <button
-            type="submit"
-            disabled={
-              isCommitting ||
-              !commitMessage.trim() ||
-              (stagedFiles.length === 0 && !isAmend)
-            }
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50 transition-colors shadow-sm"
-          >
-            {isCommitting ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                <span>Committing...</span>
-              </>
-            ) : (
-              <>
-                <Send className="w-3.5 h-3.5" />
-                <span>
-                  Commit {stagedFiles.length > 0 ? `(${stagedFiles.length} files)` : isAmend ? '(Amend)' : ''}
-                </span>
-              </>
-            )}
-          </button>
+          <div className="flex items-center justify-between">
+            <label className="flex items-center gap-1.5 text-xs text-app-muted cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={isAmend}
+                onChange={(e) => handleAmendToggle(e.target.checked)}
+                className="rounded border-app-line text-brand-600 focus:ring-brand-500 w-3.5 h-3.5"
+              />
+              <span>Amend previous commit</span>
+            </label>
+
+            <button
+              type="submit"
+              disabled={
+                isCommitting ||
+                !commitMessage.trim() ||
+                (stagedFiles.length === 0 && !isAmend)
+              }
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50 transition-colors shadow-sm"
+            >
+              {isCommitting ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>Committing...</span>
+                </>
+              ) : (
+                <>
+                  <Send className="w-3.5 h-3.5" />
+                  <span>
+                    {isAmend ? (pushImmediately ? 'Amend & Push' : 'Amend Commit') : (pushImmediately ? 'Commit & Push' : 'Commit')} {stagedFiles.length > 0 ? `(${stagedFiles.length})` : ''}
+                  </span>
+                </>
+              )}
+            </button>
+          </div>
         </div>
       </form>
 

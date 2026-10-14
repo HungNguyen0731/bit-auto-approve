@@ -15,7 +15,7 @@ import { GitCommitGraph } from './GitCommitGraph';
 import { GitSourceTreeFileStatus } from './GitSourceTreeFileStatus';
 import { GitRepoBrowser } from './GitRepoBrowser';
 import { GitToolbar } from './GitToolbar';
-import { BranchModal, StashModal, RemoteOpsModal, MergeModal } from './GitModals';
+import { BranchModal, StashModal, RemoteOpsModal, MergeModal, CreatePRModal } from './GitModals';
 import { ArrowLeft, FolderGit2, Plus, X } from 'lucide-react';
 
 interface GitManagerProps {
@@ -134,6 +134,8 @@ export const GitManager: React.FC<GitManagerProps> = ({
   const [remotes, setRemotes] = useState<GitRemote[]>([]);
   const [workspaceView, setWorkspaceView] = useState<'status' | 'history' | 'search'>('status');
   const [isMergeModalOpen, setIsMergeModalOpen] = useState(false);
+  const [isCreatePRModalOpen, setIsCreatePRModalOpen] = useState(false);
+  const [repoWebUrl, setRepoWebUrl] = useState('');
   const [toolbarSearch, setToolbarSearch] = useState('');
 
   const activePath = useRef<string | null>(null);
@@ -413,7 +415,7 @@ export const GitManager: React.FC<GitManagerProps> = ({
     }
   };
 
-  const handleCommit = async ({ message, amend }: { message: string; amend?: boolean }) => {
+  const handleCommit = async ({ message, amend, pushImmediately }: { message: string; amend?: boolean; pushImmediately?: boolean }) => {
     if (!selectedRepo) return;
     setIsCommitting(true);
     try {
@@ -422,10 +424,22 @@ export const GitManager: React.FC<GitManagerProps> = ({
         message,
         amend,
       });
+      if (pushImmediately) {
+        await gitApi.pushRepo({
+          repoPath: selectedRepo.path,
+          remote: 'origin',
+          branch: selectedRepo.branch,
+          force: amend,
+        });
+      }
       await loadRepoData(selectedRepo.path);
-      toast('success', amend ? 'Commit Amended' : 'Commit Created', `Hash: ${res.commitHash || 'done'}`);
+      toast(
+        'success',
+        amend ? (pushImmediately ? 'Commit Amended & Pushed' : 'Commit Amended') : (pushImmediately ? 'Commit & Pushed' : 'Commit Created'),
+        `Branch: ${selectedRepo.branch}${res.commitHash ? ` (${res.commitHash.slice(0, 7)})` : ''}`
+      );
     } catch (err: any) {
-      toast('error', 'Commit Failed', err.message);
+      toast('error', 'Commit/Push Failed', err.message);
     } finally {
       setIsCommitting(false);
     }
@@ -543,6 +557,17 @@ export const GitManager: React.FC<GitManagerProps> = ({
       popup?.close();
       throw error;
     }
+  };
+
+  const handleOpenCreatePR = async () => {
+    if (!selectedRepo) return;
+    try {
+      const result = await gitApi.getRemoteWebUrl(selectedRepo.path);
+      setRepoWebUrl(result.url);
+    } catch {
+      setRepoWebUrl('');
+    }
+    setIsCreatePRModalOpen(true);
   };
 
   return (
@@ -678,6 +703,7 @@ export const GitManager: React.FC<GitManagerProps> = ({
             isRefreshing={isRefreshing}
             onCommit={handleSelectWorkingTree}
             onOpenMergeModal={() => setIsMergeModalOpen(true)}
+            onOpenCreatePRModal={handleOpenCreatePR}
             onViewRemote={() => void runSidebarAction(handleViewRemote)}
             onOpenFinder={() => selectedRepo && void runSidebarAction(() => gitApi.openInFinder(selectedRepo.path))}
             onOpenTerminal={() => selectedRepo && void runSidebarAction(() => gitApi.openTerminal(selectedRepo.path))}
@@ -782,6 +808,13 @@ export const GitManager: React.FC<GitManagerProps> = ({
             stashes={stashes}
             onPushStash={handlePushStash}
             onPopStash={handlePopStash}
+          />
+          <CreatePRModal
+            isOpen={isCreatePRModalOpen}
+            onClose={() => setIsCreatePRModalOpen(false)}
+            currentBranch={status?.branch || selectedRepo.currentBranch}
+            repoWebUrl={repoWebUrl}
+            repoName={selectedRepo.name}
           />
           <RemoteOpsModal
             isOpen={remoteModalType !== null}

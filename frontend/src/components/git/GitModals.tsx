@@ -11,6 +11,8 @@ import {
   Loader2,
   AlertCircle,
   Clock,
+  GitPullRequest,
+  ExternalLink,
 } from 'lucide-react';
 
 interface MergeModalProps {
@@ -677,6 +679,198 @@ export const RemoteOpsModal: React.FC<RemoteOpsModalProps> = ({
             </button>
           </div>
         </form>
+      </div>
+    </div>
+  );
+};
+
+export interface CreatePRModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  currentBranch: string;
+  repoWebUrl: string;
+  repoName: string;
+}
+
+export const CreatePRModal: React.FC<CreatePRModalProps> = ({
+  isOpen,
+  onClose,
+  currentBranch,
+  repoWebUrl,
+  repoName,
+}) => {
+  const [targetBranch, setTargetBranch] = useState('dev');
+  const [prTitle, setPrTitle] = useState('');
+
+  useEffect(() => {
+    if (isOpen) {
+      setTargetBranch('dev');
+      setPrTitle(`PR: ${currentBranch} -> dev`);
+    }
+  }, [isOpen, currentBranch]);
+
+  if (!isOpen) return null;
+
+  const handleSelectTarget = (target: string) => {
+    setTargetBranch(target);
+    setPrTitle(`PR: ${currentBranch} -> ${target}`);
+  };
+
+  const buildUrl = (target: string) => {
+    const encodedSource = encodeURIComponent(currentBranch);
+    const encodedDest = encodeURIComponent(target);
+    if (repoWebUrl.includes('bitbucket.org')) {
+      return `${repoWebUrl}/pull-requests/new?source=${encodedSource}&dest=${encodedDest}`;
+    } else if (repoWebUrl.includes('github.com')) {
+      return `${repoWebUrl}/compare/${encodedDest}...${encodedSource}?expand=1`;
+    } else {
+      return `${repoWebUrl}/pull-requests?create&sourceBranch=${encodedSource}&targetBranch=${encodedDest}`;
+    }
+  };
+
+  const handleOpenPR = (target: string) => {
+    const url = buildUrl(target);
+    window.open(url, '_blank', 'noopener,noreferrer');
+    onClose();
+  };
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="create-pr-title"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs animate-fade-in"
+    >
+      <div className="w-full max-w-lg bg-white rounded-2xl border border-app-line shadow-float overflow-hidden animate-scale-in">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-app-line bg-slate-50/75">
+          <div className="flex items-center gap-2.5">
+            <span className="p-2 rounded-xl bg-brand-50 text-brand-700 border border-brand-100">
+              <GitPullRequest className="w-5 h-5" />
+            </span>
+            <div>
+              <h3 id="create-pr-title" className="text-sm font-bold text-app-ink">
+                Tạo Pull Request (Bitbucket)
+              </h3>
+              <p className="text-[11px] text-app-muted">
+                Tạo PR từ nhánh <span className="font-mono font-semibold text-brand-700">{currentBranch}</span> vào dev, qc hoặc uat
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Đóng"
+            className="p-1 rounded-lg text-app-muted hover:text-app-ink hover:bg-slate-100 transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="p-5 space-y-4 text-xs">
+          {/* Repo & Source Info */}
+          <div className="grid grid-cols-2 gap-3 p-3 rounded-xl bg-slate-50 border border-app-line">
+            <div>
+              <span className="text-[10px] font-semibold text-app-muted uppercase tracking-wider">Repository</span>
+              <p className="font-bold text-app-ink truncate mt-0.5">{repoName || 'Current Repository'}</p>
+            </div>
+            <div>
+              <span className="text-[10px] font-semibold text-app-muted uppercase tracking-wider">Nhánh nguồn (Source)</span>
+              <p className="font-mono font-bold text-brand-700 truncate mt-0.5">{currentBranch}</p>
+            </div>
+          </div>
+
+          {/* Quick Target Branch Selection */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <label className="font-bold text-app-ink">Nhánh đích (Destination Branch):</label>
+              <span className="text-[11px] text-app-muted">Chọn nhanh 1 trong 3 nhánh chuẩn</span>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {[
+                { id: 'dev', name: 'dev', desc: 'Development' },
+                { id: 'qc', name: 'qc', desc: 'Testing / QA' },
+                { id: 'uat', name: 'uat', desc: 'Staging / UAT' },
+              ].map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => handleSelectTarget(item.id)}
+                  className={`p-3 rounded-xl border text-center transition-all ${
+                    targetBranch === item.id
+                      ? 'border-brand-600 bg-brand-50 text-brand-900 shadow-xs ring-1 ring-brand-500'
+                      : 'border-app-line bg-white text-app-ink hover:bg-slate-50'
+                  }`}
+                >
+                  <p className="font-mono font-bold text-sm">{item.name}</p>
+                  <p className="text-[10px] text-app-muted mt-0.5">{item.desc}</p>
+                </button>
+              ))}
+            </div>
+
+            {/* Custom Branch input */}
+            <div className="pt-1">
+              <label className="text-[11px] text-app-muted block mb-1">Hoặc nhập tên nhánh khác:</label>
+              <input
+                type="text"
+                value={targetBranch}
+                onChange={(e) => handleSelectTarget(e.target.value.trim())}
+                placeholder="dev, qc, uat, main..."
+                className="w-full h-9 px-3 rounded-lg border border-app-line bg-white font-mono text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
+              />
+            </div>
+          </div>
+
+          {/* Title Input */}
+          <div className="space-y-1">
+            <label className="font-bold text-app-ink">Tiêu đề PR (Title):</label>
+            <input
+              type="text"
+              value={prTitle}
+              onChange={(e) => setPrTitle(e.target.value)}
+              placeholder="Nhập tiêu đề PR..."
+              className="w-full h-9 px-3 rounded-lg border border-app-line bg-white text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
+            />
+          </div>
+
+          {/* Helper notice */}
+          <div className="flex items-start gap-2 p-3 rounded-xl bg-blue-50/80 border border-blue-100 text-blue-900 text-[11px]">
+            <ExternalLink className="w-4 h-4 shrink-0 mt-0.5 text-blue-600" />
+            <p>
+              Khi bấm tạo, trình duyệt sẽ tự động mở trang tạo PR trên Bitbucket với nhánh nguồn <strong>{currentBranch}</strong> và nhánh đích <strong>{targetBranch}</strong> đã được chọn sẵn.
+            </p>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-between px-5 py-3.5 border-t border-app-line bg-slate-50/75">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-3.5 py-2 rounded-xl text-xs font-semibold text-app-muted hover:text-app-ink hover:bg-slate-200/60 transition-colors"
+          >
+            Đóng
+          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => handleOpenPR('dev')}
+              className="px-3 py-2 rounded-xl text-xs font-semibold text-brand-700 bg-brand-50 border border-brand-200 hover:bg-brand-100 transition-colors"
+            >
+              PR vào dev
+            </button>
+            <button
+              type="button"
+              disabled={!targetBranch}
+              onClick={() => handleOpenPR(targetBranch)}
+              className="px-4 py-2 rounded-xl text-xs font-bold text-white bg-brand-600 hover:bg-brand-700 disabled:opacity-50 transition-colors shadow-xs flex items-center gap-1.5"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              <span>Tạo PR vào '{targetBranch}'</span>
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );

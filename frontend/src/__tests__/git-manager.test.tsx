@@ -5,7 +5,7 @@ import { GitCommitGraph } from '../components/git/GitCommitGraph';
 import { GitStagingPanel } from '../components/git/GitStagingPanel';
 import { GitDiffViewer } from '../components/git/GitDiffViewer';
 import { GitToolbar } from '../components/git/GitToolbar';
-import { BranchModal, StashModal, MergeModal } from '../components/git/GitModals';
+import { BranchModal, StashModal, MergeModal, CreatePRModal } from '../components/git/GitModals';
 import { GitManager } from '../components/git/GitManager';
 import { gitApi } from '../api/gitClient';
 import type {
@@ -319,12 +319,14 @@ describe('Git Manager Frontend Components', () => {
       const commitInput = screen.getByPlaceholderText(/write a clear commit message/i);
       fireEvent.change(commitInput, { target: { value: 'feat: ready to ship' } });
 
-      const commitBtn = screen.getByRole('button', { name: /commit \(2 files\)/i });
+      const commitBtn = screen.getByRole('button', { name: /commit/i });
       fireEvent.click(commitBtn);
-      expect(onCommit).toHaveBeenCalledWith({
-        message: 'feat: ready to ship',
-        amend: false,
-      });
+      expect(onCommit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: 'feat: ready to ship',
+          amend: false,
+        })
+      );
     });
 
     it('supports amend commit option', () => {
@@ -389,6 +391,7 @@ describe('Git Manager Frontend Components', () => {
       const onOpenStash = vi.fn();
       const onOpenRemote = vi.fn();
       const onRefresh = vi.fn();
+      const onOpenCreatePR = vi.fn();
 
       render(
         <GitToolbar
@@ -398,14 +401,19 @@ describe('Git Manager Frontend Components', () => {
           onOpenStashModal={onOpenStash}
           onOpenRemoteModal={onOpenRemote}
           onRefresh={onRefresh}
+          onOpenCreatePRModal={onOpenCreatePR}
         />
       );
 
       expect(screen.getByRole('button', { name: 'Commit' })).toHaveTextContent('2');
       expect(screen.getByRole('button', { name: 'Merge' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Tạo PR' })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'View Remote' })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Show in Finder' })).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Terminal' })).toBeInTheDocument();
+
+      fireEvent.click(screen.getByTitle('Tạo Pull Request từ nhánh hiện tại vào dev, qc hoặc uat'));
+      expect(onOpenCreatePR).toHaveBeenCalled();
 
       fireEvent.click(screen.getByTitle('Branch management'));
       expect(onOpenBranch).toHaveBeenCalled();
@@ -488,6 +496,40 @@ describe('Git Manager Frontend Components', () => {
       await waitFor(() => {
         expect(onPopStash).toHaveBeenCalledWith(0);
       });
+    });
+
+    it('renders CreatePRModal with dev/qc/uat quick targets and opens Bitbucket PR URL', async () => {
+      const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
+      const onClose = vi.fn();
+
+      render(
+        <CreatePRModal
+          isOpen={true}
+          onClose={onClose}
+          currentBranch="feature/new-header-pr"
+          repoWebUrl="https://bitbucket.org/digifactory/my-service"
+          repoName="my-service"
+        />
+      );
+
+      expect(screen.getByText('Tạo Pull Request (Bitbucket)')).toBeInTheDocument();
+      expect(screen.getAllByText('feature/new-header-pr').length).toBeGreaterThanOrEqual(1);
+
+      // Click qc target
+      const qcButton = screen.getByRole('button', { name: /qc Testing \/ QA/i });
+      fireEvent.click(qcButton);
+
+      // Click open PR button
+      const submitBtn = screen.getByRole('button', { name: /Tạo PR vào 'qc'/i });
+      fireEvent.click(submitBtn);
+
+      expect(openSpy).toHaveBeenCalledWith(
+        'https://bitbucket.org/digifactory/my-service/pull-requests/new?source=feature%2Fnew-header-pr&dest=qc',
+        '_blank',
+        'noopener,noreferrer'
+      );
+      expect(onClose).toHaveBeenCalled();
+      openSpy.mockRestore();
     });
   });
 
