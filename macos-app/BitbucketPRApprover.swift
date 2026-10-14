@@ -161,9 +161,51 @@ private struct GitCommandError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+private enum GitKeychainHelper {
+    static func saveInternetPassword(server: String, account: String, password: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassInternetPassword,
+            kSecAttrServer as String: server,
+            kSecAttrAccount as String: account,
+            kSecAttrProtocol as String: kSecAttrProtocolHTTPS
+        ]
+        SecItemDelete(query as CFDictionary)
+        var item = query
+        item[kSecValueData as String] = password.data(using: .utf8) ?? Data()
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemAdd(item as CFDictionary, nil)
+    }
+
+    static func loadInternetPassword(server: String, account: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassInternetPassword,
+            kSecAttrServer as String: server,
+            kSecAttrAccount as String: account,
+            kSecAttrProtocol as String: kSecAttrProtocolHTTPS,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+           let data = result as? Data,
+           let pass = String(data: data, encoding: .utf8) {
+            return pass
+        }
+        return nil
+    }
+}
+
+private struct GitAuthError: Identifiable {
+    let id = UUID()
+    let host: String
+    let username: String
+    let remoteUrl: String
+    let pendingCommands: [[String]]
+}
+
 /// Invoked only on GitManagerModel's serial worker queue. No shell interpolation.
 private enum GitProcessService {
-    static func run(_ path: String, _ arguments: [String], allowed: Set<Int32> = [0]) throws -> String {
+    static func run(_ path: String, _ arguments: [String], allowed: Set<Int32> = [0], askpassPassword: String? = nil) throws -> String {
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
@@ -176,7 +218,11 @@ private enum GitProcessService {
         defer { try? output.close(); try? errors.close() }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = ["--literal-pathspecs", "-C", path] + arguments
+        process.arguments = [
+            "--literal-pathspecs",
+            "-c", "credential.helper=osxkeychain",
+            "-C", path
+        ] + arguments
         process.standardOutput = output
         process.standardError = errors
         process.standardInput = FileHandle.nullDevice
@@ -185,6 +231,30 @@ private enum GitProcessService {
         environment["GIT_PAGER"] = "cat"
         environment["LC_ALL"] = "C"
         environment["GIT_OPTIONAL_LOCKS"] = "0"
+
+        var pathEnv = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        let extraPaths = [
+            "/Library/Developer/CommandLineTools/usr/libexec/git-core",
+            "/Applications/Xcode.app/Contents/Developer/usr/libexec/git-core",
+            "/opt/homebrew/bin",
+            "/usr/local/bin"
+        ]
+        for p in extraPaths {
+            if FileManager.default.fileExists(atPath: p) && !pathEnv.contains(p) {
+                pathEnv = "\(p):\(pathEnv)"
+            }
+        }
+        environment["PATH"] = pathEnv
+
+        if let pass = askpassPassword {
+            let script = temporary.appendingPathComponent("git-askpass.sh")
+            let content = "#!/bin/sh\ncat << 'EOF_PASS'\n\(pass)\nEOF_PASS\n"
+            try? content.write(to: script, atomically: true, encoding: .utf8)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+            environment["GIT_ASKPASS"] = script.path
+            environment["SSH_ASKPASS"] = script.path
+        }
+
         process.environment = environment
         try process.run()
         let deadline = Date().addingTimeInterval(90)
@@ -336,6 +406,7 @@ private final class GitManagerModel: ObservableObject {
     @Published var fileIsStaged = false
     @Published var busy = false
     @Published var message = "Choose a folder to discover Git repositories, including nested repositories."
+    @Published var authErrorDetails: GitAuthError? = nil
     private let queue = DispatchQueue(label: "app.git-manager", qos: .userInitiated)
     private let excludedKey = "BitbucketPRApprover.GitManager.excludedPaths"
     private let reposKey = "BitbucketPRApprover.GitManager.repositories"
@@ -540,12 +611,12 @@ private final class GitManagerModel: ObservableObject {
 
     func refresh() { perform(nil) }
 
-    func perform(_ arguments: [String]?) {
+    func perform(_ arguments: [String]?, askpassPassword: String? = nil) {
         guard !busy, let path = selectedPath else { return }
         busy = true
         queue.async {
             do {
-                if let arguments = arguments { _ = try GitProcessService.run(path, arguments) }
+                if let arguments = arguments { _ = try GitProcessService.run(path, arguments, askpassPassword: askpassPassword) }
                 let state = try GitProcessService.snapshot(path)
                 DispatchQueue.main.async {
                     self.snapshotCache[path] = state
@@ -560,17 +631,20 @@ private final class GitManagerModel: ObservableObject {
                     self.busy = false
                     self.message = arguments == nil ? "Repository refreshed." : "Git operation completed."
                 }
-            } catch { self.finish(error.localizedDescription) }
+            } catch {
+                let errText = error.localizedDescription
+                self.finish(errText, failedCommands: arguments.map { [$0] } ?? [])
+            }
         }
     }
 
-    func performSequence(_ commands: [[String]]) {
+    func performSequence(_ commands: [[String]], askpassPassword: String? = nil) {
         guard !busy, let path = selectedPath else { return }
         busy = true
         queue.async {
             do {
                 for args in commands {
-                    _ = try GitProcessService.run(path, args)
+                    _ = try GitProcessService.run(path, args, askpassPassword: askpassPassword)
                 }
                 let state = try GitProcessService.snapshot(path)
                 DispatchQueue.main.async {
@@ -580,9 +654,12 @@ private final class GitManagerModel: ObservableObject {
                     self.selectedCommit = nil
                     self.diff = "Select a file or commit to inspect its diff."
                     self.busy = false
-                    self.message = "Branch checked out and updated from remote."
+                    self.message = "Git operations completed successfully."
                 }
-            } catch { self.finish(error.localizedDescription) }
+            } catch {
+                let errText = error.localizedDescription
+                self.finish(errText, failedCommands: commands)
+            }
         }
     }
 
@@ -611,8 +688,67 @@ private final class GitManagerModel: ObservableObject {
         } else { perform(["reset", "HEAD", "--"] + paths) }
     }
 
-    private func finish(_ text: String) {
-        DispatchQueue.main.async { self.message = text; self.busy = false }
+    private func finish(_ text: String, failedCommands: [[String]] = []) {
+        DispatchQueue.main.async {
+            self.message = text
+            self.busy = false
+            let lower = text.lowercased()
+            if lower.contains("could not read password") ||
+               lower.contains("terminal prompts disabled") ||
+               lower.contains("authentication failed") ||
+               lower.contains("invalid credentials") {
+                self.handleAuthFailure(message: text, pendingCommands: failedCommands)
+            }
+        }
+    }
+
+    private func handleAuthFailure(message: String, pendingCommands: [[String]]) {
+        var parsedUser = ""
+        var parsedHost = "bitbucket.org"
+        var parsedUrl = ""
+
+        let pattern = "https?://([^@]+)@([^'/:]+)"
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           let match = regex.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)) {
+            if let userRange = Range(match.range(at: 1), in: message) {
+                parsedUser = String(message[userRange])
+            }
+            if let hostRange = Range(match.range(at: 2), in: message) {
+                parsedHost = String(message[hostRange])
+            }
+        }
+
+        if parsedUser.isEmpty, let path = selectedPath {
+            if let remoteUrl = try? GitProcessService.run(path, ["remote", "get-url", "origin"]).trimmingCharacters(in: .whitespacesAndNewlines) {
+                parsedUrl = remoteUrl
+                if let regex = try? NSRegularExpression(pattern: pattern),
+                   let match = regex.firstMatch(in: remoteUrl, range: NSRange(remoteUrl.startIndex..., in: remoteUrl)) {
+                    if let userRange = Range(match.range(at: 1), in: remoteUrl) {
+                        parsedUser = String(remoteUrl[userRange])
+                    }
+                    if let hostRange = Range(match.range(at: 2), in: remoteUrl) {
+                        parsedHost = String(remoteUrl[hostRange])
+                    }
+                }
+            }
+        }
+
+        if parsedUser.isEmpty { parsedUser = "phuongnn1" }
+
+        self.authErrorDetails = GitAuthError(
+            host: parsedHost,
+            username: parsedUser,
+            remoteUrl: parsedUrl,
+            pendingCommands: pendingCommands
+        )
+    }
+
+    func saveAndRetryWithCredentials(authError: GitAuthError, password: String, saveToKeychain: Bool) {
+        if saveToKeychain {
+            GitKeychainHelper.saveInternetPassword(server: authError.host, account: authError.username, password: password)
+        }
+        self.authErrorDetails = nil
+        self.performSequence(authError.pendingCommands, askpassPassword: password)
     }
 }
 
@@ -693,6 +829,8 @@ private struct GitManagerView: View {
     @State private var commitMessage = ""
     @State private var amend = false
     @State private var pushImmediately = true
+    @State private var inputAuthPassword = ""
+    @State private var rememberAuthInKeychain = true
     @State private var branchName = ""
     @State private var stashMessage = ""
     @State private var discard: GitFileChange?
@@ -793,6 +931,9 @@ private struct GitManagerView: View {
             case .checkoutRemote(let rb): checkoutRemoteSheet(rb)
             case .createPR: createPRSheet
             }
+        }
+        .sheet(item: $model.authErrorDetails) { authError in
+            gitAuthSheet(authError)
         }
         .alert("Đã tạo Pull Request thành công! 🎉", isPresented: $showingPRSuccessAlert) {
             if let urlStr = createdPRUrl, let url = URL(string: urlStr) {
@@ -1702,6 +1843,111 @@ private struct GitManagerView: View {
                 pullRemote = firstRemote
             }
         }
+    }
+
+    private func gitAuthSheet(_ auth: GitAuthError) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle().fill(Color.orange.opacity(0.15)).frame(width: 44, height: 44)
+                    Image(systemName: "key.fill").font(.system(size: 22)).foregroundStyle(.orange)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Xác thực Git Bitbucket").font(.title3.bold())
+                    Text("Git cần App Password để push / pull với \(auth.host)")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Tài khoản Bitbucket:")
+                        .font(.caption.bold())
+                        .frame(width: 140, alignment: .leading)
+                    Text(auth.username)
+                        .font(.subheadline.monospaced().bold())
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                }
+
+                HStack {
+                    Text("App Password:")
+                        .font(.caption.bold())
+                        .frame(width: 140, alignment: .leading)
+                    SecureField("Nhập Bitbucket App Password...", text: $inputAuthPassword)
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                Toggle("Lưu mật khẩu vào macOS Keychain (Tự động đăng nhập lần sau)", isOn: $rememberAuthInKeychain)
+                    .font(.caption)
+                    .toggleStyle(.checkbox)
+                    .padding(.top, 4)
+            }
+            .padding(14)
+            .background(AppPalette.surface, in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.08), lineWidth: 1))
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 4) {
+                    Image(systemName: "info.circle.fill").foregroundStyle(AppPalette.blue)
+                    Text("Lưu ý về mật khẩu Bitbucket Git:").font(.caption.bold())
+                }
+                Text("Bitbucket Cloud yêu cầu sử dụng **App Password** thay cho mật khẩu đăng nhập thông thường khi làm việc với Git qua HTTPS.")
+                    .font(.caption2).foregroundStyle(.secondary)
+
+                if let url = URL(string: "https://bitbucket.org/account/settings/app-passwords/") {
+                    Button {
+                        NSWorkspace.shared.open(url)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("Tạo App Password trên Bitbucket (Quyền Repositories Read/Write)")
+                            Image(systemName: "arrow.up.right.square")
+                        }
+                        .font(.caption.bold())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(AppPalette.blue)
+                    .padding(.top, 2)
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(AppPalette.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+
+            Divider()
+
+            HStack {
+                Button("Hủy") {
+                    model.authErrorDetails = nil
+                    inputAuthPassword = ""
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Spacer()
+
+                Button {
+                    let pwd = inputAuthPassword.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !pwd.isEmpty else { return }
+                    model.saveAndRetryWithCredentials(authError: auth, password: pwd, saveToKeychain: rememberAuthInKeychain)
+                    inputAuthPassword = ""
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.up.circle.fill")
+                        Text("Lưu & Push ngay")
+                            .bold()
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(AppPalette.blue)
+                .keyboardShortcut(.defaultAction)
+                .disabled(inputAuthPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(22)
+        .frame(width: 500)
     }
 
     private var pushSheet: some View {
