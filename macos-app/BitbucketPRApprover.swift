@@ -6,6 +6,7 @@ import CryptoKit
 import Security
 import WebKit
 import Network
+import IOKit
 
 // MARK: - Native Git Manager
 
@@ -159,6 +160,80 @@ private struct GitSnapshot {
 private struct GitCommandError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
+}
+
+// MARK: - Hardware-Bound Secure Vault (Zero-Keychain Prompt Across App Updates)
+private enum AppSecureVault {
+    private static var vaultURL: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("GitPulse", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        }
+        return dir.appendingPathComponent("credentials_vault.enc")
+    }
+
+    private static func deriveKey() -> SymmetricKey {
+        let platformExpert = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice"))
+        defer { if platformExpert != 0 { IOObjectRelease(platformExpert) } }
+        let hardwareUUID: String
+        if platformExpert != 0,
+           let uuidString = IORegistryEntryCreateCFProperty(platformExpert, kIOPlatformUUIDKey as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? String {
+            hardwareUUID = uuidString
+        } else {
+            hardwareUUID = "GitPulse-Device-Hardware-UUID-Fallback"
+        }
+        let salt = Data("com.hungnv.gitpulse.vault.salt.v1".utf8)
+        let inputMaterial = Data((hardwareUUID + ":" + NSUserName()).utf8)
+        return HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: inputMaterial), salt: salt, outputByteCount: 32)
+    }
+
+    private static func loadVaultDict() -> [String: String] {
+        let url = vaultURL
+        guard FileManager.default.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url) else { return [:] }
+        do {
+            let key = deriveKey()
+            let box = try AES.GCM.SealedBox(combined: data)
+            let decryptedData = try AES.GCM.open(box, using: key)
+            if let dict = try? JSONSerialization.jsonObject(with: decryptedData) as? [String: String] {
+                return dict
+            }
+        } catch {
+            // Decryption failure or corrupted payload
+        }
+        return [:]
+    }
+
+    private static func saveVaultDict(_ dict: [String: String]) {
+        let url = vaultURL
+        let key = deriveKey()
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: dict) else { return }
+        guard let sealed = try? AES.GCM.seal(jsonData, using: key) else { return }
+        guard let combined = sealed.combined else { return }
+        try? combined.write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    static func get(_ key: String) -> String? {
+        loadVaultDict()[key]
+    }
+
+    static func set(_ key: String, value: String?) {
+        var dict = loadVaultDict()
+        if let value = value, !value.isEmpty {
+            dict[key] = value
+        } else {
+            dict.removeValue(forKey: key)
+        }
+        saveVaultDict(dict)
+    }
+
+    static func remove(_ key: String) {
+        var dict = loadVaultDict()
+        dict.removeValue(forKey: key)
+        saveVaultDict(dict)
+    }
 }
 
 private enum GitKeychainHelper {
@@ -5469,24 +5544,32 @@ enum VpnConnectionStatus: String {
     var hasSavedPassword: Bool { savedPassword() != nil }
 
     private func savedPassword() -> String? {
+        guard let origin else { return nil }
+        let vaultKey = "owner_password:" + origin.originString
+        if let vaulted = AppSecureVault.get(vaultKey), !vaulted.isEmpty {
+            return vaulted
+        }
         guard var query = passwordKeychainQuery else { return nil }
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+              let data = result as? Data,
+              let str = String(data: data, encoding: .utf8) else { return nil }
+        AppSecureVault.set(vaultKey, value: str)
+        return str
     }
 
     private func storePassword(_ value: String) throws {
-        guard let query = passwordKeychainQuery else { return }
-        SecItemDelete(query as CFDictionary)
-        var item = query
-        item[kSecValueData as String] = Data(value.utf8)
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        let status = SecItemAdd(item as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw NSError(domain: "Keychain", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Không lưu được Owner password vào Keychain (mã \(status))."])
+        guard let origin else { return }
+        let vaultKey = "owner_password:" + origin.originString
+        AppSecureVault.set(vaultKey, value: value)
+        if let query = passwordKeychainQuery {
+            SecItemDelete(query as CFDictionary)
+            var item = query
+            item[kSecValueData as String] = Data(value.utf8)
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            _ = SecItemAdd(item as CFDictionary, nil)
         }
     }
 
@@ -5661,8 +5744,9 @@ enum VpnConnectionStatus: String {
             if rememberPassword && !enteredPassword.isEmpty {
                 do { try storePassword(enteredPassword) }
                 catch { message = error.localizedDescription }
-            } else if !rememberPassword, let query = passwordKeychainQuery {
-                SecItemDelete(query as CFDictionary)
+            } else if !rememberPassword {
+                if let origin { AppSecureVault.remove("owner_password:" + origin.originString) }
+                if let query = passwordKeychainQuery { SecItemDelete(query as CFDictionary) }
             }
             UserDefaults.standard.set(server, forKey: "controlPlaneOrigin")
             await refresh()
@@ -5740,6 +5824,7 @@ enum VpnConnectionStatus: String {
 
     func logout() async {
         let _: EmptyData? = try? await call("POST", "/api/session/logout", [:])
+        if let origin { AppSecureVault.remove("owner_password:" + origin.originString) }
         if let query = passwordKeychainQuery { SecItemDelete(query as CFDictionary) }
         historyGeneration += 1
         csrf = ""; authenticated = false; needsReauth = false; accounts = []; workers = []; jobs = []; logs = []; runs = []; runHistoryAvailable = true; historyError = ""; selectedWorkerId = ""
@@ -6012,6 +6097,12 @@ enum VpnConnectionStatus: String {
 
     func loadCredentialsForAccount(_ accountId: String) -> [String: String]? {
         guard !accountId.isEmpty else { return nil }
+        let vaultKey = "account_creds:" + accountId
+        if let jsonStr = AppSecureVault.get(vaultKey),
+           let data = jsonStr.data(using: .utf8),
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            return dict
+        }
         var query = accountCredentialsQuery(for: accountId)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -6019,6 +6110,9 @@ enum VpnConnectionStatus: String {
         if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
            let data = result as? Data,
            let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            if let jsonStr = String(data: data, encoding: .utf8) {
+                AppSecureVault.set(vaultKey, value: jsonStr)
+            }
             return dict
         }
         return nil
@@ -6032,12 +6126,15 @@ enum VpnConnectionStatus: String {
             "token": token
         ]
         if let data = try? JSONSerialization.data(withJSONObject: dict) {
+            if let jsonStr = String(data: data, encoding: .utf8) {
+                AppSecureVault.set("account_creds:" + accountId, value: jsonStr)
+            }
             let query = accountCredentialsQuery(for: accountId)
             SecItemDelete(query as CFDictionary)
             var item = query
             item[kSecValueData as String] = data
             item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            SecItemAdd(item as CFDictionary, nil)
+            _ = SecItemAdd(item as CFDictionary, nil)
         }
     }
 
@@ -6072,18 +6169,33 @@ enum VpnConnectionStatus: String {
         if let user = ud.string(forKey: "bb_pipeline_username") { cfg.username = user }
         if let accId = ud.string(forKey: "bb_pipeline_acc_id") { cfg.selectedAccountId = accId }
 
-        var query = pipelineKeychainQuery
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-           let data = result as? Data,
+        var loadedFromVault = false
+        if let jsonStr = AppSecureVault.get("pipeline_secrets"),
+           let data = jsonStr.data(using: .utf8),
            let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
             cfg.token = dict["token"] ?? ""
             cfg.cookie = dict["cookie"] ?? ""
             cfg.csrfToken = dict["csrfToken"] ?? "1rfIZh8UmWS7a162UeggG2niaPCrYM7z"
-        } else {
-            cfg.csrfToken = "1rfIZh8UmWS7a162UeggG2niaPCrYM7z"
+            loadedFromVault = true
+        }
+
+        if !loadedFromVault {
+            var query = pipelineKeychainQuery
+            query[kSecReturnData as String] = true
+            query[kSecMatchLimit as String] = kSecMatchLimitOne
+            var result: CFTypeRef?
+            if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+               let data = result as? Data,
+               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+                cfg.token = dict["token"] ?? ""
+                cfg.cookie = dict["cookie"] ?? ""
+                cfg.csrfToken = dict["csrfToken"] ?? "1rfIZh8UmWS7a162UeggG2niaPCrYM7z"
+                if let jsonStr = String(data: data, encoding: .utf8) {
+                    AppSecureVault.set("pipeline_secrets", value: jsonStr)
+                }
+            } else {
+                cfg.csrfToken = "1rfIZh8UmWS7a162UeggG2niaPCrYM7z"
+            }
         }
         if cfg.cookie.isEmpty {
             cfg.cookie = "_otPreferencesSynced=; OptanonConsent=isGpcEnabled=0&datestamp=Thu+Feb+05+2026+14%3A14%3A01+GMT%2B0700+(Indochina+Time)&version=202503.2.0&browserGpcFlag=0&isIABGlobal=false&identifierType=null&hosts=&landingPath=https%3A%2F%2Fbitbucket.org%2Fproduct%2Fcomparison%2Fbitbucket-vs-github&groups=1%3A1%2C2%3A1%2C3%3A1%2C4%3A1; atlCohort={\"bucketAll\":{\"bucketedAtUTC\":\"2026-02-05T07:14:01.992Z\",\"version\":\"2\",\"index\":85,\"bucketId\":0}}; atl_xid.ts=1770275642119; atl_xid.current=%5B%7B%22type%22%3A%22xc%22%2C%22value%22%3A%222c9621ad-ec9e-470e-941e-df8693af72cd%22%2C%22createdAt%22%3A%222025-12-28T05%3A26%3A22.524Z%22%7D%5D; atlUserHash=1393648612; csrftoken=1rfIZh8UmWS7a162UeggG2niaPCrYM7z; default_workspace=508ddaa4-7e55-415d-bde0-f7221eaa4d9d; ajs_anonymous_id=%2204cb9c92-4555-48eb-b58e-507c0b408b2a%22; bb_session=zzd3xvapx13reys44omcc5hvl8mxa2v7; atl-bsc-consent-token-fallback=0031111010; atl-bsc-consent-token=0030000010; atl-bsc-show-banner=0; cloud.session.token=eyJraWQiOiJnZW5lcmljLWtleXBhaXIvc2Vzc2lvbi1zZXJ2aWNlL3NpZ25pbmcta2V5LS05NmxpaGI1aG9vNWdrMG9iIiwiYWxnIjoiUlMyNTYifQ.eyJhc3NvY2lhdGlvbnMiOltdLCJzdWIiOiI2M2IzZjJhZmYzZTcwMDRmNzdmZTExM2EiLCJlbWFpbERvbWFpbiI6Im1zbS5jb20udm4iLCJpbXBlcnNvbmF0aW9uIjpbXSwiY3JlYXRlZCI6MTc4MzM5MzcyNCwicmVmcmVzaFRpbWVvdXQiOjE3OTE5NDk0OTAsInZlcmlmaWVkIjp0cnVlLCJpc3MiOiJnZW5lcmljLWtleXBhaXIvc2Vzc2lvbi1zZXJ2aWNlIiwiZG9tYWlucyI6WyJiaXRidWNrZXQub3JnIl0sInNlc3Npb25JZCI6ImE5YTA0ZTIzLWQ3ZjItNDAzOC05ZGRmLThjNzMwOWNmOTFmZSIsInN0ZXBVcHMiOltdLCJvcmdJZCI6ImIxa2QxNDI4LWE3OGQtMTI5OS1qMDAzLWMzN2JqODNqampiNSIsImF1ZCI6ImlkZW50aXR5IiwibmJmIjoxNzkxOTQ4ODkwLCJleHAiOjE3OTQ1NDA4OTAsImlhdCI6MTc5MTk0ODg5MCwiZW1haWwiOiJodW5nbnZAbXNtLmNvbS52biIsImp0aSI6ImE5YTA0ZTIzLWQ3ZjItNDAzOC05ZGRmLThjNzMwOWNmOTFmZSJ9.fjwhwDLATsF1BQGRU5_7II5z09WeHLW4JetRsNruIkQ_mrDozLZM9laah1mXA-uaya4RoRt4UVLvGcI7JjpRJ4lU4gbrXu8hDU1j3PmaVVSmZkQ6IWOIMIkl1o2u2EsZ5mMOyrMuZGvSw7HgIMdrsThcQlTd-KRVkLsteQ9_8LikDrtA1Mhcgb8jKZ_TMMHwvrUKknYnIU4qzxoaCeOxwHDZfZoApOw2_Siiv7qciM7VvDQvuMx45WwZ5IcGz8lrbdUBfiTagbBkYiaDYIol3-PcSM1bhk_trF5MUAQSLd_UapoiFYlH7-7RNE3R3NKg-LR5KsOWMHyGvbwa2xVDA"
@@ -6140,6 +6252,9 @@ enum VpnConnectionStatus: String {
             "csrfToken": cleanCfg.csrfToken
         ]
         if let data = try? JSONSerialization.data(withJSONObject: secrets) {
+            if let jsonStr = String(data: data, encoding: .utf8) {
+                AppSecureVault.set("pipeline_secrets", value: jsonStr)
+            }
             SecItemDelete(pipelineKeychainQuery as CFDictionary)
             var item = pipelineKeychainQuery
             item[kSecValueData as String] = data
