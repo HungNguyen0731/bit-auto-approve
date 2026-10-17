@@ -350,6 +350,47 @@ describe('Git Manager Frontend Components', () => {
       const commitInput = screen.getByPlaceholderText(/write a clear commit message/i);
       expect(commitInput).toHaveValue('previous commit subject');
     });
+
+    it('supports selecting unstaged files via checkboxes and staging only upon commit', () => {
+      const onStage = vi.fn();
+      const onCommit = vi.fn();
+      render(
+        <GitStagingPanel
+          status={mockWorkingTreeStatus}
+          selectedFile={null}
+          onSelectFile={vi.fn()}
+          onStage={onStage}
+          onUnstage={vi.fn()}
+          onDiscard={vi.fn()}
+          onCommit={onCommit}
+        />
+      );
+
+      // Checkbox for unstaged file
+      const selectFileBtn = screen.getByRole('button', { name: 'Select src/components/GitStaging.tsx' });
+      fireEvent.click(selectFileBtn);
+
+      // onStage was NOT called immediately (preventing UI lag!)
+      expect(onStage).not.toHaveBeenCalled();
+
+      // Button now says Deselect
+      expect(screen.getByRole('button', { name: 'Deselect src/components/GitStaging.tsx' })).toBeInTheDocument();
+
+      // Enter commit message
+      const commitInput = screen.getByPlaceholderText(/write a clear commit message/i);
+      fireEvent.change(commitInput, { target: { value: 'feat: lazy staging on commit' } });
+
+      const commitBtn = screen.getByRole('button', { name: /commit/i });
+      fireEvent.click(commitBtn);
+
+      // onCommit is called with stagePaths containing the selected unstaged file
+      expect(onCommit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: 'feat: lazy staging on commit',
+          stagePaths: ['src/components/GitStaging.tsx'],
+        })
+      );
+    });
   });
 
   describe('4. GitDiffViewer Component', () => {

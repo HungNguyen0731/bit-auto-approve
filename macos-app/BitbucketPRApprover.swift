@@ -609,7 +609,14 @@ private final class GitManagerModel: ObservableObject {
         refresh()
     }
 
-    func refresh() { perform(nil) }
+    private var lastRefreshTime: Date = .distantPast
+
+    func refresh() {
+        let now = Date()
+        guard now.timeIntervalSince(lastRefreshTime) > 0.4 else { return }
+        lastRefreshTime = now
+        perform(nil)
+    }
 
     func perform(_ arguments: [String]?, askpassPassword: String? = nil) {
         guard !busy, let path = selectedPath else { return }
@@ -625,9 +632,19 @@ private final class GitManagerModel: ObservableObject {
                         self.repositories[index] = state.repository
                         self.persistRepositories()
                     }
-                    self.selectedFile = nil
-                    self.selectedCommit = nil
-                    self.diff = "Select a file or commit to inspect its diff."
+                    if arguments == nil, let currentFile = self.selectedFile {
+                        if let updatedFile = state.changes.first(where: { $0.path == currentFile.path }) {
+                            self.selectedFile = updatedFile
+                            self.inspect(file: updatedFile, staged: self.fileIsStaged, commit: nil)
+                        } else {
+                            self.selectedFile = nil
+                            self.diff = "Select a file or commit to inspect its diff."
+                        }
+                    } else if arguments != nil {
+                        self.selectedFile = nil
+                        self.selectedCommit = nil
+                        self.diff = "Select a file or commit to inspect its diff."
+                    }
                     self.busy = false
                     self.message = arguments == nil ? "Repository refreshed." : "Git operation completed."
                 }
@@ -851,6 +868,7 @@ private struct GitManagerView: View {
     @State private var commitMessage = ""
     @State private var amend = false
     @State private var pushImmediately = true
+    @State private var selectedUnstagedPaths: Set<String> = []
     @State private var inputAuthPassword = ""
     @State private var rememberAuthInKeychain = true
     @State private var availableReviewers: [BitbucketReviewer] = []
@@ -864,6 +882,11 @@ private struct GitManagerView: View {
     @State private var repoToExclude: GitRepository?
     @State private var confirmExclude = false
     @State private var isRepoListCollapsed = false
+    @State private var isBranchesCollapsed = false
+    @State private var isRemotesCollapsed = false
+    @State private var isTagsCollapsed = false
+    @State private var isStashesCollapsed = false
+    @State private var isStagedListCollapsed = false
     @State private var isDiffCollapsed = false
     @State private var isDiffMaximized = false
 
@@ -969,6 +992,29 @@ private struct GitManagerView: View {
             Button("Đóng", role: .cancel) {}
         } message: {
             Text("Pull Request \(createdPRNumber ?? "") đã được tạo trực tiếp qua Bitbucket API thành công!\n\nĐường dẫn:\n\(createdPRUrl ?? "")\n\n(Đã tự động sao chép link vào Clipboard)")
+        }
+        .onAppear {
+            if model.selectedPath != nil && !model.busy {
+                model.refresh()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            if model.selectedPath != nil && !model.busy {
+                model.refresh()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            if model.selectedPath != nil && !model.busy {
+                model.refresh()
+            }
+        }
+        .onChange(of: mode) {
+            if mode == 0 && model.selectedPath != nil && !model.busy {
+                model.refresh()
+            }
+        }
+        .onChange(of: model.snapshot?.repository.path) {
+            selectedUnstagedPaths.removeAll()
         }
     }
 
@@ -1522,6 +1568,7 @@ private struct GitManagerView: View {
                 .buttonStyle(.plain)
                 .help("Open Workspace Folder")
             }
+            .fixedSize(horizontal: true, vertical: false)
 
             Divider().frame(height: 24).padding(.horizontal, 2)
 
@@ -1530,152 +1577,155 @@ private struct GitManagerView: View {
             let behindCount = model.snapshot?.repository.behind ?? 0
             let aheadCount = model.snapshot?.repository.ahead ?? 0
 
-            HStack(spacing: 4) {
-                // Commit
-                Button {
-                    mode = 0
-                } label: {
-                    sourceTreeToolbarItem(
-                        label: "Commit",
-                        icon: "plus.circle",
-                        count: stagedCount,
-                        badgeColor: AppPalette.blue
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(model.selectedPath == nil)
-                .help("Review and commit staged changes")
-
-                // Pull - opens SourceTree Pull Dialog
-                Button {
-                    pullBranch = model.snapshot?.repository.branch ?? "main"
-                    pullRemote = model.snapshot?.remotes.first ?? "origin"
-                    activeSheet = .pull
-                } label: {
-                    sourceTreeToolbarItem(
-                        label: "Pull",
-                        icon: "arrow.down.circle",
-                        count: behindCount,
-                        badgeColor: .red
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(model.selectedPath == nil)
-                .help("Pull commits from remote repository")
-
-                // Push - opens SourceTree Push Dialog
-                Button {
-                    pushRemote = model.snapshot?.remotes.first ?? "origin"
-                    activeSheet = .push
-                } label: {
-                    sourceTreeToolbarItem(
-                        label: "Push",
-                        icon: "arrow.up.circle",
-                        count: aheadCount,
-                        badgeColor: AppPalette.blue
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(model.selectedPath == nil)
-                .help("Push local commits to remote")
-
-                // Fetch - opens SourceTree Fetch Dialog
-                Button {
-                    activeSheet = .fetch
-                } label: {
-                    sourceTreeToolbarItem(
-                        label: "Fetch",
-                        icon: "arrow.down.circle.dotted"
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(model.selectedPath == nil)
-                .help("Fetch all remote changes")
-
-                // Branch - opens SourceTree Branch Dialog
-                Button {
-                    branchNameInput = ""
-                    let current = model.snapshot?.repository.branch ?? ""
-                    checkoutTargetBranch = (model.snapshot?.branches ?? []).first(where: { $0 != current }) ?? current
-                    activeSheet = .branch
-                } label: {
-                    sourceTreeToolbarItem(
-                        label: "Branch",
-                        icon: "arrow.triangle.branch"
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(model.selectedPath == nil)
-                .help("Branch management (Create and Checkout)")
-
-                // Merge - opens SourceTree Merge Dialog
-                Button {
-                    let current = model.snapshot?.repository.branch ?? ""
-                    mergeTargetBranch = (model.snapshot?.branches ?? []).first(where: { $0 != current }) ?? ""
-                    activeSheet = .merge
-                } label: {
-                    sourceTreeToolbarItem(
-                        label: "Merge",
-                        icon: "arrow.triangle.merge"
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(model.selectedPath == nil)
-                .help("Merge another branch into current branch")
-
-                // Stash - opens SourceTree Stash Dialog
-                Button {
-                    stashMessageInput = ""
-                    activeSheet = .stash
-                } label: {
-                    sourceTreeToolbarItem(
-                        label: "Stash",
-                        icon: "archivebox"
-                    )
-                }
-                .buttonStyle(.plain)
-                .disabled(model.selectedPath == nil)
-                .help("Stash management")
-
-                // Tạo PR (Create Pull Request to dev, qc, uat directly via Bitbucket API)
-                Menu {
-                    Section("Tạo PR trực tiếp vào:") {
-                        Button {
-                            executeCreatePR(targetBranch: "dev")
-                        } label: {
-                            Label("Tạo PR vào 'dev' (Development)", systemImage: "plus.circle.fill")
-                        }
-                        Button {
-                            executeCreatePR(targetBranch: "qc")
-                        } label: {
-                            Label("Tạo PR vào 'qc' (Testing/QA)", systemImage: "plus.circle.fill")
-                        }
-                        Button {
-                            executeCreatePR(targetBranch: "uat")
-                        } label: {
-                            Label("Tạo PR vào 'uat' (Staging/UAT)", systemImage: "plus.circle.fill")
-                        }
-                    }
-                    Divider()
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    // Commit
                     Button {
-                        openCreatePRDialog(defaultTarget: "dev")
+                        mode = 0
                     } label: {
-                        Label("Tùy chỉnh tiêu đề & nhánh khác…", systemImage: "slider.horizontal.3")
+                        sourceTreeToolbarItem(
+                            label: "Commit",
+                            icon: "plus.circle",
+                            count: stagedCount,
+                            badgeColor: AppPalette.blue
+                        )
                     }
-                } label: {
-                    sourceTreeToolbarItem(
-                        label: isCreatingPR ? "Đang tạo…" : "Tạo PR",
-                        icon: isCreatingPR ? "arrow.triangle.2.circlepath" : "arrow.triangle.pull"
-                    )
-                } primaryAction: {
-                    openCreatePRDialog(defaultTarget: "dev")
+                    .buttonStyle(.plain)
+                    .disabled(model.selectedPath == nil)
+                    .help("Review and commit staged changes")
+
+                    // Pull - opens SourceTree Pull Dialog
+                    Button {
+                        pullBranch = model.snapshot?.repository.branch ?? "main"
+                        pullRemote = model.snapshot?.remotes.first ?? "origin"
+                        activeSheet = .pull
+                    } label: {
+                        sourceTreeToolbarItem(
+                            label: "Pull",
+                            icon: "arrow.down.circle",
+                            count: behindCount,
+                            badgeColor: .red
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.selectedPath == nil)
+                    .help("Pull commits from remote repository")
+
+                    // Push - opens SourceTree Push Dialog
+                    Button {
+                        pushRemote = model.snapshot?.remotes.first ?? "origin"
+                        activeSheet = .push
+                    } label: {
+                        sourceTreeToolbarItem(
+                            label: "Push",
+                            icon: "arrow.up.circle",
+                            count: aheadCount,
+                            badgeColor: AppPalette.blue
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.selectedPath == nil)
+                    .help("Push local commits to remote")
+
+                    // Fetch - opens SourceTree Fetch Dialog
+                    Button {
+                        activeSheet = .fetch
+                    } label: {
+                        sourceTreeToolbarItem(
+                            label: "Fetch",
+                            icon: "arrow.down.circle.dotted"
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.selectedPath == nil)
+                    .help("Fetch all remote changes")
+
+                    // Branch - opens SourceTree Branch Dialog
+                    Button {
+                        branchNameInput = ""
+                        let current = model.snapshot?.repository.branch ?? ""
+                        checkoutTargetBranch = (model.snapshot?.branches ?? []).first(where: { $0 != current }) ?? current
+                        activeSheet = .branch
+                    } label: {
+                        sourceTreeToolbarItem(
+                            label: "Branch",
+                            icon: "arrow.triangle.branch"
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.selectedPath == nil)
+                    .help("Branch management (Create and Checkout)")
+
+                    // Merge - opens SourceTree Merge Dialog
+                    Button {
+                        let current = model.snapshot?.repository.branch ?? ""
+                        mergeTargetBranch = (model.snapshot?.branches ?? []).first(where: { $0 != current }) ?? ""
+                        activeSheet = .merge
+                    } label: {
+                        sourceTreeToolbarItem(
+                            label: "Merge",
+                            icon: "arrow.triangle.merge"
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.selectedPath == nil)
+                    .help("Merge another branch into current branch")
+
+                    // Stash - opens SourceTree Stash Dialog
+                    Button {
+                        stashMessageInput = ""
+                        activeSheet = .stash
+                    } label: {
+                        sourceTreeToolbarItem(
+                            label: "Stash",
+                            icon: "archivebox"
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.selectedPath == nil)
+                    .help("Stash management")
+
+                    // Tạo PR (Create Pull Request to dev, qc, uat directly via Bitbucket API)
+                    Menu {
+                        Section("Tạo PR trực tiếp vào:") {
+                            Button {
+                                executeCreatePR(targetBranch: "dev")
+                            } label: {
+                                Label("Tạo PR vào 'dev' (Development)", systemImage: "plus.circle.fill")
+                            }
+                            Button {
+                                executeCreatePR(targetBranch: "qc")
+                            } label: {
+                                Label("Tạo PR vào 'qc' (Testing/QA)", systemImage: "plus.circle.fill")
+                            }
+                            Button {
+                                executeCreatePR(targetBranch: "uat")
+                            } label: {
+                                Label("Tạo PR vào 'uat' (Staging/UAT)", systemImage: "plus.circle.fill")
+                            }
+                        }
+                        Divider()
+                        Button {
+                            openCreatePRDialog(defaultTarget: "dev")
+                        } label: {
+                            Label("Tùy chỉnh tiêu đề & nhánh khác…", systemImage: "slider.horizontal.3")
+                        }
+                    } label: {
+                        sourceTreeToolbarItem(
+                            label: isCreatingPR ? "Đang tạo…" : "Tạo PR",
+                            icon: isCreatingPR ? "arrow.triangle.2.circlepath" : "arrow.triangle.pull"
+                        )
+                    } primaryAction: {
+                        openCreatePRDialog(defaultTarget: "dev")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .disabled(model.selectedPath == nil || isCreatingPR)
+                    .help("Tạo Pull Request trực tiếp qua Bitbucket API vào dev, qc hoặc uat")
                 }
-                .menuStyle(.borderlessButton)
-                .disabled(model.selectedPath == nil || isCreatingPR)
-                .help("Tạo Pull Request trực tiếp qua Bitbucket API vào dev, qc hoặc uat")
+                .padding(.vertical, 2)
             }
 
-            Spacer()
+            Spacer(minLength: 12)
 
             // Right Group: Repository & Branch Menu, View Remote, Show in Finder, Terminal, Panel Toggles
             HStack(spacing: 5) {
@@ -1743,6 +1793,8 @@ private struct GitManagerView: View {
                 .disabled(model.selectedPath == nil)
                 .help("Refresh repository status")
             }
+            .fixedSize(horizontal: true, vertical: false)
+            .layoutPriority(1)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
@@ -2335,18 +2387,40 @@ private struct GitManagerView: View {
                     ScrollView {
                         VStack(spacing: 6) {
                             ForEach(stashes, id: \.self) { s in
-                                HStack {
+                                HStack(spacing: 8) {
                                     Text(s)
                                         .font(.caption.monospaced())
                                         .lineLimit(1)
                                     Spacer()
-                                    Button("Pop / Apply") {
+                                    Button("Apply") {
                                         let idx = String(s.prefix(while: { $0 != ":" }))
-                                        model.perform(["stash", "pop", idx])
+                                        model.perform(["stash", "apply", idx])
                                         activeSheet = nil
                                     }
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
+                                    .help("Apply changes without deleting stash from list")
+
+                                    Button("Pop") {
+                                        let idx = String(s.prefix(while: { $0 != ":" }))
+                                        model.perform(["stash", "pop", idx])
+                                        activeSheet = nil
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(AppPalette.blue)
+                                    .controlSize(.small)
+                                    .help("Apply changes and remove this stash")
+
+                                    Button {
+                                        let idx = String(s.prefix(while: { $0 != ":" }))
+                                        model.perform(["stash", "drop", idx])
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .font(.caption)
+                                            .foregroundStyle(Color.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Delete this stash")
                                 }
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 4)
@@ -3253,10 +3327,14 @@ private struct GitManagerView: View {
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(Color.primary)
                         .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 130, alignment: .leading)
                     Text(snapshot.repository.branch)
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
                         .foregroundStyle(AppPalette.mint)
                         .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 130, alignment: .leading)
                 }
                 Image(systemName: "chevron.up.chevron.down")
                     .font(.system(size: 8, weight: .bold))
@@ -3356,9 +3434,18 @@ private struct GitManagerView: View {
                 Text("No stashes saved")
             } else {
                 ForEach(snapshot.stashes, id: \.self) { stash in
-                    Button("Pop \(stash)") {
-                        let idx = String(stash.prefix(while: { $0 != ":" }))
-                        model.perform(["stash", "pop", idx])
+                    let idx = String(stash.prefix(while: { $0 != ":" }))
+                    Menu("\(stash)") {
+                        Button("Apply Stash (keep in list)") {
+                            model.perform(["stash", "apply", idx])
+                        }
+                        Button("Pop Stash (apply and delete)") {
+                            model.perform(["stash", "pop", idx])
+                        }
+                        Divider()
+                        Button("Drop Stash") {
+                            model.perform(["stash", "drop", idx])
+                        }
                     }
                 }
             }
@@ -3501,144 +3588,383 @@ private struct GitManagerView: View {
                             .buttonStyle(.plain)
                         }
 
+                        // STAGED LIST IN SIDEBAR
+                        let stagedFilesInSidebar = snapshot.changes.filter { $0.staged }
+                        if !stagedFilesInSidebar.isEmpty {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack {
+                                    Button {
+                                        withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                                            isStagedListCollapsed.toggle()
+                                        }
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: isStagedListCollapsed ? "chevron.right" : "chevron.down")
+                                                .font(.system(size: 8, weight: .bold))
+                                            Text("STAGED CHANGES (\(stagedFilesInSidebar.count))")
+                                                .font(.system(size: 10, weight: .bold))
+                                                .tracking(1)
+                                        }
+                                        .foregroundStyle(AppPalette.mint)
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    Spacer()
+
+                                    Button("Unstage All") {
+                                        model.unstage(nil)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(.secondary)
+                                }
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 2)
+
+                                if !isStagedListCollapsed {
+                                    ForEach(stagedFilesInSidebar) { file in
+                                        let isSelected = model.selectedFile?.path == file.path && model.fileIsStaged
+                                        Button {
+                                            mode = 0
+                                            model.inspect(file: file, staged: true)
+                                        } label: {
+                                            HStack(spacing: 5) {
+                                                GitStatusBadge(status: file.statusType(staged: true))
+                                                Text(file.filename)
+                                                    .font(.system(size: 11))
+                                                    .lineLimit(1)
+                                                Spacer()
+                                            }
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 3)
+                                            .background(isSelected ? AppPalette.mint.opacity(0.15) : Color.clear, in: RoundedRectangle(cornerRadius: 4))
+                                            .contentShape(Rectangle())
+                                        }
+                                        .buttonStyle(.plain)
+                                        .contextMenu {
+                                            Button {
+                                                model.unstage(file)
+                                            } label: {
+                                                Label("Unstage '\(file.filename)'", systemImage: "minus.circle")
+                                            }
+                                            Divider()
+                                            Button {
+                                                let repoPath = snapshot.repository.path
+                                                let fullPath = "\(repoPath)/\(file.path)"
+                                                NSWorkspace.shared.selectFile(fullPath, inFileViewerRootedAtPath: repoPath)
+                                            } label: {
+                                                Label("Show in Finder", systemImage: "folder")
+                                            }
+                                            Button {
+                                                let repoPath = snapshot.repository.path
+                                                let fullPath = "\(repoPath)/\(file.path)"
+                                                NSWorkspace.shared.open(URL(fileURLWithPath: fullPath))
+                                            } label: {
+                                                Label("Open in Default App", systemImage: "arrow.up.forward.app")
+                                            }
+                                            Divider()
+                                            Button {
+                                                NSPasteboard.general.clearContents()
+                                                NSPasteboard.general.setString(file.path, forType: .string)
+                                            } label: {
+                                                Label("Copy Path", systemImage: "doc.on.doc")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // BRANCHES
                         VStack(alignment: .leading, spacing: 3) {
-                            Text("BRANCHES")
-                                .font(.system(size: 10, weight: .bold))
-                                .tracking(1)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 4)
-
-                            ForEach(snapshot.branches.filter { search.isEmpty || $0.localizedCaseInsensitiveContains(search) }, id: \.self) { branch in
-                                let isCurrent = branch == snapshot.repository.branch
+                            HStack {
                                 Button {
-                                    if !isCurrent {
-                                        model.perform(["checkout", branch])
+                                    withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                                        isBranchesCollapsed.toggle()
                                     }
                                 } label: {
-                                    HStack(spacing: 6) {
-                                        if isCurrent {
-                                            Circle()
-                                                .fill(AppPalette.blue)
-                                                .frame(width: 7, height: 7)
-                                        } else {
-                                            Circle()
-                                                .fill(Color.clear)
-                                                .frame(width: 7, height: 7)
-                                        }
-                                        Text(branch)
-                                            .font(.caption)
-                                            .fontWeight(isCurrent ? .bold : .regular)
-                                            .lineLimit(1)
-                                        Spacer()
-                                        if isCurrent {
-                                            Image(systemName: "checkmark")
-                                                .font(.system(size: 9, weight: .bold))
-                                                .foregroundStyle(AppPalette.blue)
-                                        }
+                                    HStack(spacing: 4) {
+                                        Image(systemName: isBranchesCollapsed ? "chevron.right" : "chevron.down")
+                                            .font(.system(size: 8, weight: .bold))
+                                        Text("BRANCHES (\(snapshot.branches.count))")
+                                            .font(.system(size: 10, weight: .bold))
+                                            .tracking(1)
                                     }
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 4)
-                                    .background(isCurrent ? AppPalette.blue.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
-                                    .foregroundStyle(isCurrent ? AppPalette.blue : Color.primary)
+                                    .foregroundStyle(.secondary)
                                 }
                                 .buttonStyle(.plain)
-                                .contextMenu {
-                                    if !isCurrent {
-                                        Button {
+
+                                Spacer()
+
+                                Button {
+                                    activeSheet = .branch
+                                } label: {
+                                    Image(systemName: "plus")
+                                        .font(.system(size: 9, weight: .bold))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Create New Branch")
+                            }
+                            .padding(.horizontal, 4)
+
+                            if !isBranchesCollapsed {
+                                ForEach(snapshot.branches.filter { search.isEmpty || $0.localizedCaseInsensitiveContains(search) }, id: \.self) { branch in
+                                    let isCurrent = branch == snapshot.repository.branch
+                                    Button {
+                                        if !isCurrent {
                                             model.perform(["checkout", branch])
+                                        }
+                                    } label: {
+                                        HStack(spacing: 6) {
+                                            if isCurrent {
+                                                Circle()
+                                                    .fill(AppPalette.blue)
+                                                    .frame(width: 7, height: 7)
+                                            } else {
+                                                Circle()
+                                                    .fill(Color.clear)
+                                                    .frame(width: 7, height: 7)
+                                            }
+                                            Text(branch)
+                                                .font(.caption)
+                                                .fontWeight(isCurrent ? .bold : .regular)
+                                                .lineLimit(1)
+                                            Spacer()
+                                            if isCurrent {
+                                                Image(systemName: "checkmark")
+                                                    .font(.system(size: 9, weight: .bold))
+                                                    .foregroundStyle(AppPalette.blue)
+                                            }
+                                        }
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 4)
+                                        .background(isCurrent ? AppPalette.blue.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                                        .foregroundStyle(isCurrent ? AppPalette.blue : Color.primary)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .contextMenu {
+                                        if !isCurrent {
+                                            Button {
+                                                model.perform(["checkout", branch])
+                                            } label: {
+                                                Label("Checkout '\(branch)'", systemImage: "arrow.triangle.branch")
+                                            }
+                                        }
+                                        Button {
+                                            model.perform(["pull"])
                                         } label: {
-                                            Label("Checkout '\(branch)'", systemImage: "arrow.triangle.branch")
+                                            Label("Pull latest into current branch", systemImage: "arrow.down.circle")
                                         }
                                     }
-                                    Button {
-                                        model.perform(["pull"])
-                                    } label: {
-                                        Label("Pull latest into current branch", systemImage: "arrow.down.circle")
-                                    }
+                                    .help(isCurrent ? "Current branch: \(branch)" : "Click to checkout \(branch)")
                                 }
-                                .help(isCurrent ? "Current branch: \(branch)" : "Click to checkout \(branch)")
                             }
                         }
 
                         // REMOTES
                         if !snapshot.remotes.isEmpty {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("REMOTES")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .tracking(1)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 4)
+                                HStack {
+                                    Button {
+                                        withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                                            isRemotesCollapsed.toggle()
+                                        }
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: isRemotesCollapsed ? "chevron.right" : "chevron.down")
+                                                .font(.system(size: 8, weight: .bold))
+                                            Text("REMOTES (\(snapshot.remotes.count))")
+                                                .font(.system(size: 10, weight: .bold))
+                                                .tracking(1)
+                                        }
+                                        .foregroundStyle(.secondary)
+                                    }
+                                    .buttonStyle(.plain)
 
-                                ForEach(snapshot.remotes, id: \.self) { remote in
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        HStack(spacing: 6) {
-                                            Image(systemName: "cloud")
-                                                .font(.caption2)
-                                                .foregroundStyle(AppPalette.blue)
-                                            Text(remote)
-                                                .font(.caption.bold())
-                                            Spacer()
-                                            Button {
-                                                model.perform(["fetch", remote])
-                                            } label: {
-                                                Image(systemName: "arrow.clockwise")
-                                                    .font(.system(size: 9))
+                                    Spacer()
+                                }
+                                .padding(.horizontal, 4)
+
+                                if !isRemotesCollapsed {
+                                    ForEach(snapshot.remotes, id: \.self) { remote in
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            HStack(spacing: 6) {
+                                                Image(systemName: "cloud")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(AppPalette.blue)
+                                                Text(remote)
+                                                    .font(.caption.bold())
+                                                Spacer()
+                                                Button {
+                                                    model.perform(["fetch", remote])
+                                                } label: {
+                                                    Image(systemName: "arrow.clockwise")
+                                                        .font(.system(size: 9))
+                                                }
+                                                .buttonStyle(.plain)
+                                                .help("Fetch \(remote)")
                                             }
-                                            .buttonStyle(.plain)
-                                            .help("Fetch \(remote)")
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 3)
+
+                                            let remotePrefix = "\(remote)/"
+                                            let matched = snapshot.remoteBranches.filter { $0.hasPrefix(remotePrefix) && !$0.hasSuffix("/HEAD") }
+                                            ForEach(matched, id: \.self) { rb in
+                                                let short = String(rb.dropFirst(remotePrefix.count))
+                                                let isCheckedOut = snapshot.branches.contains(short) && snapshot.repository.branch == short
+                                                HStack(spacing: 4) {
+                                                    Image(systemName: "arrow.triangle.branch")
+                                                        .font(.system(size: 8))
+                                                        .foregroundStyle(isCheckedOut ? AppPalette.mint : Color.secondary)
+                                                    Text(short)
+                                                        .font(.caption2)
+                                                        .fontWeight(isCheckedOut ? .bold : .regular)
+                                                        .foregroundStyle(isCheckedOut ? AppPalette.mint : Color.secondary)
+                                                    .lineLimit(1)
+                                                    Spacer()
+                                                    if isCheckedOut {
+                                                        Image(systemName: "checkmark")
+                                                            .font(.system(size: 8, weight: .bold))
+                                                            .foregroundStyle(AppPalette.mint)
+                                                    }
+                                                }
+                                                .padding(.leading, 18)
+                                                .padding(.trailing, 6)
+                                                .padding(.vertical, 3)
+                                                .background(isCheckedOut ? AppPalette.mint.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 4))
+                                                .contentShape(Rectangle())
+                                                .onTapGesture(count: 2) {
+                                                    startCheckoutRemote(rb, snapshot: snapshot)
+                                                }
+                                                .contextMenu {
+                                                    Button {
+                                                        startCheckoutRemote(rb, snapshot: snapshot)
+                                                    } label: {
+                                                        Label("Checkout & Pull '\(short)' (SourceTree)…", systemImage: "arrow.triangle.branch")
+                                                    }
+                                                    Button {
+                                                        quickCheckoutAndPull(rb, snapshot: snapshot)
+                                                    } label: {
+                                                        Label("Quick Checkout & Pull", systemImage: "arrow.down.circle")
+                                                    }
+                                                    Divider()
+                                                    Button {
+                                                        checkoutRemoteBranch(rb, snapshot: snapshot)
+                                                    } label: {
+                                                        Label("Checkout Only", systemImage: "arrow.right.circle")
+                                                    }
+                                                }
+                                                .help(isCheckedOut ? "Current branch (\(short))" : "Double-click to Checkout & Pull '\(short)' to local (SourceTree)")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // STASHES IN SIDEBAR
+                        if !snapshot.stashes.isEmpty {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack {
+                                    Button {
+                                        withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                                            isStashesCollapsed.toggle()
+                                        }
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: isStashesCollapsed ? "chevron.right" : "chevron.down")
+                                                .font(.system(size: 8, weight: .bold))
+                                            Text("STASHES (\(snapshot.stashes.count))")
+                                                .font(.system(size: 10, weight: .bold))
+                                                .tracking(1)
+                                        }
+                                        .foregroundStyle(AppPalette.amber)
+                                    }
+                                    .buttonStyle(.plain)
+
+                                    Spacer()
+                                }
+                                .padding(.horizontal, 4)
+
+                                if !isStashesCollapsed {
+                                    ForEach(snapshot.stashes, id: \.self) { s in
+                                        let idx = String(s.prefix(while: { $0 != ":" }))
+                                        let msg = String(s.drop(while: { $0 != ":" }).dropFirst(2))
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "tray")
+                                                    .font(.caption2)
+                                                    .foregroundStyle(AppPalette.amber)
+                                                Text(idx)
+                                                    .font(.caption2.monospaced().bold())
+                                                    .foregroundStyle(AppPalette.amber)
+                                                Text(msg)
+                                                    .font(.caption2)
+                                                    .lineLimit(1)
+                                                    .truncationMode(.tail)
+                                                Spacer()
+                                            }
+
+                                            HStack(spacing: 4) {
+                                                Button {
+                                                    model.perform(["stash", "apply", idx])
+                                                } label: {
+                                                    Text("Apply")
+                                                        .font(.system(size: 9.5, weight: .semibold))
+                                                        .padding(.horizontal, 6)
+                                                        .padding(.vertical, 2)
+                                                        .background(AppPalette.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 3))
+                                                }
+                                                .buttonStyle(.plain)
+                                                .foregroundStyle(AppPalette.blue)
+                                                .help("Apply changes without deleting stash from list")
+
+                                                Button {
+                                                    model.perform(["stash", "pop", idx])
+                                                } label: {
+                                                    Text("Pop")
+                                                        .font(.system(size: 9.5, weight: .semibold))
+                                                        .padding(.horizontal, 6)
+                                                        .padding(.vertical, 2)
+                                                        .background(AppPalette.amber.opacity(0.18), in: RoundedRectangle(cornerRadius: 3))
+                                                }
+                                                .buttonStyle(.plain)
+                                                .foregroundStyle(AppPalette.amber)
+                                                .help("Apply changes and remove this stash")
+
+                                                Button {
+                                                    model.perform(["stash", "drop", idx])
+                                                } label: {
+                                                    Image(systemName: "trash")
+                                                        .font(.system(size: 9))
+                                                        .foregroundStyle(Color.secondary)
+                                                }
+                                                .buttonStyle(.plain)
+                                                .help("Delete this stash")
+                                            }
+                                            .padding(.leading, 14)
                                         }
                                         .padding(.horizontal, 6)
                                         .padding(.vertical, 3)
-
-                                        let remotePrefix = "\(remote)/"
-                                        let matched = snapshot.remoteBranches.filter { $0.hasPrefix(remotePrefix) && !$0.hasSuffix("/HEAD") }
-                                        ForEach(matched, id: \.self) { rb in
-                                            let short = String(rb.dropFirst(remotePrefix.count))
-                                            let isCheckedOut = snapshot.branches.contains(short) && snapshot.repository.branch == short
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "arrow.triangle.branch")
-                                                    .font(.system(size: 8))
-                                                    .foregroundStyle(isCheckedOut ? AppPalette.mint : Color.secondary)
-                                                Text(short)
-                                                    .font(.caption2)
-                                                    .fontWeight(isCheckedOut ? .bold : .regular)
-                                                    .foregroundStyle(isCheckedOut ? AppPalette.mint : Color.secondary)
-                                                    .lineLimit(1)
-                                                Spacer()
-                                                if isCheckedOut {
-                                                    Image(systemName: "checkmark")
-                                                        .font(.system(size: 8, weight: .bold))
-                                                        .foregroundStyle(AppPalette.mint)
-                                                }
+                                        .background(Color.secondary.opacity(0.04), in: RoundedRectangle(cornerRadius: 4))
+                                        .contextMenu {
+                                            Button {
+                                                model.perform(["stash", "apply", idx])
+                                            } label: {
+                                                Label("Apply Stash (keep in list)", systemImage: "arrow.uturn.down")
                                             }
-                                            .padding(.leading, 18)
-                                            .padding(.trailing, 6)
-                                            .padding(.vertical, 3)
-                                            .background(isCheckedOut ? AppPalette.mint.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 4))
-                                            .contentShape(Rectangle())
-                                            .onTapGesture(count: 2) {
-                                                startCheckoutRemote(rb, snapshot: snapshot)
+                                            Button {
+                                                model.perform(["stash", "pop", idx])
+                                            } label: {
+                                                Label("Pop Stash (apply and delete)", systemImage: "tray.and.arrow.up")
                                             }
-                                            .contextMenu {
-                                                Button {
-                                                    startCheckoutRemote(rb, snapshot: snapshot)
-                                                } label: {
-                                                    Label("Checkout & Pull '\(short)' (SourceTree)…", systemImage: "arrow.triangle.branch")
-                                                }
-                                                Button {
-                                                    quickCheckoutAndPull(rb, snapshot: snapshot)
-                                                } label: {
-                                                    Label("Quick Checkout & Pull", systemImage: "arrow.down.circle")
-                                                }
-                                                Divider()
-                                                Button {
-                                                    checkoutRemoteBranch(rb, snapshot: snapshot)
-                                                } label: {
-                                                    Label("Checkout Only", systemImage: "arrow.right.circle")
-                                                }
+                                            Divider()
+                                            Button(role: .destructive) {
+                                                model.perform(["stash", "drop", idx])
+                                            } label: {
+                                                Label("Drop Stash", systemImage: "trash")
                                             }
-                                            .help(isCheckedOut ? "Current branch (\(short))" : "Double-click to Checkout & Pull '\(short)' to local (SourceTree)")
                                         }
                                     }
                                 }
@@ -3648,23 +3974,40 @@ private struct GitManagerView: View {
                         // TAGS
                         if !snapshot.tags.isEmpty {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("TAGS")
-                                    .font(.system(size: 10, weight: .bold))
-                                    .tracking(1)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 4)
-
-                                ForEach(snapshot.tags, id: \.self) { tag in
-                                    HStack(spacing: 6) {
-                                        Image(systemName: "tag")
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                        Text(tag)
-                                            .font(.caption2)
-                                            .lineLimit(1)
+                                HStack {
+                                    Button {
+                                        withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                                            isTagsCollapsed.toggle()
+                                        }
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: isTagsCollapsed ? "chevron.right" : "chevron.down")
+                                                .font(.system(size: 8, weight: .bold))
+                                            Text("TAGS (\(snapshot.tags.count))")
+                                                .font(.system(size: 10, weight: .bold))
+                                                .tracking(1)
+                                        }
+                                        .foregroundStyle(.secondary)
                                     }
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
+                                    .buttonStyle(.plain)
+
+                                    Spacer()
+                                }
+                                .padding(.horizontal, 4)
+
+                                if !isTagsCollapsed {
+                                    ForEach(snapshot.tags, id: \.self) { tag in
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "tag")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                            Text(tag)
+                                                .font(.caption2)
+                                                .lineLimit(1)
+                                        }
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                    }
                                 }
                             }
                         }
@@ -3990,6 +4333,9 @@ private struct GitManagerView: View {
 
     private var commitBox: some View {
         let stagedCount = (model.snapshot?.changes ?? []).filter { $0.staged }.count
+        let validSelectedUnstaged = (model.snapshot?.changes ?? []).filter { $0.unstaged && selectedUnstagedPaths.contains($0.path) }
+        let selectedCount = validSelectedUnstaged.count
+        let totalCountToCommit = stagedCount + selectedCount
         let hasConflicts = (model.snapshot?.changes ?? []).contains(where: { $0.conflicted })
 
         return VStack(alignment: .leading, spacing: 8) {
@@ -4003,10 +4349,24 @@ private struct GitManagerView: View {
                         .font(.caption2.bold())
                         .foregroundStyle(AppPalette.amber)
                 }
-                if stagedCount > 0 {
-                    Text("\(stagedCount) staged")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(AppPalette.mint)
+                if totalCountToCommit > 0 {
+                    HStack(spacing: 4) {
+                        if stagedCount > 0 {
+                            Text("\(stagedCount) staged")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(AppPalette.mint)
+                        }
+                        if stagedCount > 0 && selectedCount > 0 {
+                            Text("+")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        if selectedCount > 0 {
+                            Text("\(selectedCount) unstage đã chọn")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(AppPalette.blue)
+                        }
+                    }
                 }
             }
 
@@ -4047,6 +4407,10 @@ private struct GitManagerView: View {
                             Image(systemName: amend ? "arrow.triangle.2.circlepath" : (pushImmediately ? "arrow.up.circle.fill" : "checkmark"))
                             Text(amend ? (pushImmediately ? "Amend & Push" : "Amend Commit") : (pushImmediately ? "Commit & Push" : "Commit"))
                                 .bold()
+                            if totalCountToCommit > 0 {
+                                Text("(\(totalCountToCommit))")
+                                    .font(.caption.monospacedDigit())
+                            }
                         }
                     }
                     .buttonStyle(.borderedProminent)
@@ -4055,10 +4419,10 @@ private struct GitManagerView: View {
                     .keyboardShortcut(.return, modifiers: .command)
                     .disabled(
                         commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                        (!amend && stagedCount == 0) ||
+                        (!amend && totalCountToCommit == 0) ||
                         hasConflicts
                     )
-                    .help("Commit staged changes (⌘⏎)")
+                    .help("Commit staged changes and selected unstaged changes (⌘⏎)")
                 }
             }
         }
@@ -4071,13 +4435,29 @@ private struct GitManagerView: View {
         commitMessage = "" // Xoá comment/commit message ngay khi bấm OK/Commit
         let branch = model.snapshot?.repository.branch ?? "main"
         let remote = model.snapshot?.remotes.first ?? "origin"
+
+        let validSelectedUnstaged = (model.snapshot?.changes ?? [])
+            .filter { $0.unstaged && selectedUnstagedPaths.contains($0.path) }
+            .map { $0.path }
+        selectedUnstagedPaths.removeAll()
+
+        var sequence: [[String]] = []
+        if !validSelectedUnstaged.isEmpty {
+            sequence.append(["add", "--"] + validSelectedUnstaged)
+        }
         let commitArgs = ["commit"] + (amend ? ["--amend"] : []) + ["-m", msg]
+        sequence.append(commitArgs)
+
         if pushImmediately {
             var pushArgs = ["push", remote, branch]
             if amend { pushArgs.append("--force-with-lease") }
-            model.performSequence([commitArgs, pushArgs])
+            sequence.append(pushArgs)
+        }
+
+        if sequence.count == 1 {
+            model.perform(sequence[0])
         } else {
-            model.perform(commitArgs)
+            model.performSequence(sequence)
         }
     }
 
@@ -4121,16 +4501,40 @@ private struct GitManagerView: View {
                     .controlSize(.small)
                     .disabled(files.isEmpty)
                 } else {
-                    Button {
-                        model.perform(["add", "--all"])
-                    } label: {
-                        Label("Stage All", systemImage: "plus.circle.fill")
-                            .font(.caption.bold())
+                    let allChecked = !files.isEmpty && files.allSatisfy { selectedUnstagedPaths.contains($0.path) }
+                    let someChecked = files.contains { selectedUnstagedPaths.contains($0.path) }
+
+                    HStack(spacing: 6) {
+                        Button {
+                            if allChecked {
+                                for f in files { selectedUnstagedPaths.remove(f.path) }
+                            } else {
+                                for f in files { selectedUnstagedPaths.insert(f.path) }
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: allChecked ? "checkmark.square.fill" : (someChecked ? "minus.square.fill" : "square"))
+                                    .foregroundStyle(allChecked || someChecked ? AppPalette.blue : Color.secondary)
+                                Text(allChecked ? "Uncheck all" : "Check all")
+                                    .font(.caption.bold())
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(files.isEmpty)
+                        .help("Check all / Uncheck all unstaged files for commit")
+
+                        Button {
+                            model.perform(["add", "--all"])
+                        } label: {
+                            Label("Stage All", systemImage: "plus.circle.fill")
+                                .font(.caption.bold())
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(AppPalette.blue)
+                        .controlSize(.small)
+                        .disabled(files.isEmpty)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(AppPalette.blue)
-                    .controlSize(.small)
-                    .disabled(files.isEmpty)
                 }
             }
             .padding(.horizontal, 10)
@@ -4162,8 +4566,28 @@ private struct GitManagerView: View {
 
     private func fileRow(file: GitFileChange, staged: Bool) -> some View {
         let isSelected = model.selectedFile?.path == file.path && model.fileIsStaged == staged
+        let isUnstagedChecked = !staged && selectedUnstagedPaths.contains(file.path)
 
         return HStack(spacing: 6) {
+            if !staged {
+                Button {
+                    if isUnstagedChecked {
+                        selectedUnstagedPaths.remove(file.path)
+                    } else {
+                        selectedUnstagedPaths.insert(file.path)
+                    }
+                } label: {
+                    Image(systemName: isUnstagedChecked ? "checkmark.square.fill" : "square")
+                        .font(.system(size: 13.5))
+                        .foregroundStyle(isUnstagedChecked ? AppPalette.blue : Color.secondary.opacity(0.6))
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(isUnstagedChecked ? "Bỏ chọn file này" : "Chọn file này để commit (sẽ tự stage khi commit)")
+                .accessibilityLabel(isUnstagedChecked ? "Deselect \(file.filename) for commit" : "Select \(file.filename) for commit")
+            }
+
             Button {
                 if isDiffCollapsed {
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
@@ -4178,7 +4602,7 @@ private struct GitManagerView: View {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(file.filename)
                             .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(.primary)
+                            .foregroundStyle(isUnstagedChecked ? AppPalette.blue : .primary)
                             .lineLimit(1)
                         if !file.directory.isEmpty {
                             Text(file.directory)
@@ -4227,8 +4651,96 @@ private struct GitManagerView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 2)
-        .background(isSelected ? AppPalette.blue.opacity(0.12) : Color.clear)
+        .background(
+            isSelected
+                ? AppPalette.blue.opacity(0.12)
+                : (isUnstagedChecked ? AppPalette.blue.opacity(0.05) : Color.clear)
+        )
         .clipShape(RoundedRectangle(cornerRadius: 6))
+        .contextMenu {
+            if staged {
+                Button {
+                    model.unstage(file)
+                } label: {
+                    Label("Unstage '\(file.filename)'", systemImage: "minus.circle")
+                }
+            } else {
+                let isChecked = selectedUnstagedPaths.contains(file.path)
+                Button {
+                    if isChecked {
+                        selectedUnstagedPaths.remove(file.path)
+                    } else {
+                        selectedUnstagedPaths.insert(file.path)
+                    }
+                } label: {
+                    Label(isChecked ? "Deselect for Commit" : "Select for Commit", systemImage: isChecked ? "xmark.square" : "checkmark.square")
+                }
+
+                Button {
+                    model.perform(["add", "--", file.path])
+                } label: {
+                    Label("Stage '\(file.filename)' (git add)", systemImage: "plus.circle.fill")
+                }
+            }
+
+            Divider()
+
+            if !staged && !file.untracked && !file.conflicted {
+                Button(role: .destructive) {
+                    discard = file
+                    confirmDiscard = true
+                } label: {
+                    Label("Discard Changes…", systemImage: "arrow.uturn.backward.circle")
+                }
+            }
+
+            Button {
+                if isDiffCollapsed {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                        isDiffCollapsed = false
+                    }
+                }
+                model.inspect(file: file, staged: staged)
+            } label: {
+                Label("View Diff", systemImage: "doc.text.magnifyingglass")
+            }
+
+            Divider()
+
+            Button {
+                let repoPath = model.snapshot?.repository.path ?? ""
+                let fullPath = repoPath.isEmpty ? file.path : "\(repoPath)/\(file.path)"
+                NSWorkspace.shared.selectFile(fullPath, inFileViewerRootedAtPath: repoPath)
+            } label: {
+                Label("Show in Finder", systemImage: "folder")
+            }
+
+            Button {
+                let repoPath = model.snapshot?.repository.path ?? ""
+                let fullPath = repoPath.isEmpty ? file.path : "\(repoPath)/\(file.path)"
+                NSWorkspace.shared.open(URL(fileURLWithPath: fullPath))
+            } label: {
+                Label("Open File", systemImage: "arrow.up.forward.app")
+            }
+
+            Divider()
+
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(file.path, forType: .string)
+            } label: {
+                Label("Copy Relative Path", systemImage: "doc.on.doc")
+            }
+
+            Button {
+                let repoPath = model.snapshot?.repository.path ?? ""
+                let fullPath = repoPath.isEmpty ? file.path : "\(repoPath)/\(file.path)"
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(fullPath, forType: .string)
+            } label: {
+                Label("Copy Full Path", systemImage: "doc.on.clipboard")
+            }
+        }
     }
 
     private var history: some View {
@@ -7587,6 +8099,16 @@ private struct AppView: View {
         }
         .onReceive(Timer.publish(every: 600, on: .main, in: .common).autoconnect()) { _ in
             Task { await model.checkForUpdate() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            if gitModel.selectedPath != nil && !gitModel.busy {
+                gitModel.refresh()
+            }
+        }
+        .onChange(of: selectedTab) {
+            if selectedTab == 7 && gitModel.selectedPath != nil && !gitModel.busy {
+                gitModel.refresh()
+            }
         }
     }
 

@@ -415,20 +415,55 @@ export const GitManager: React.FC<GitManagerProps> = ({
     }
   };
 
-  const handleCommit = async ({ message, amend, pushImmediately }: { message: string; amend?: boolean; pushImmediately?: boolean }) => {
+  // Auto-reload files when returning to the app / window / tab focus
+  useEffect(() => {
+    const handleFocus = () => {
+      if (selectedRepo && !isRefreshing && !isScanning && !isCommitting && !isStaging) {
+        loadRepoData(selectedRepo.path);
+      }
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && selectedRepo && !isRefreshing && !isScanning && !isCommitting && !isStaging) {
+        loadRepoData(selectedRepo.path);
+      }
+    };
+
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [selectedRepo, isRefreshing, isScanning, isCommitting, isStaging, loadRepoData]);
+
+  const handleCommit = async ({
+    message,
+    amend,
+    pushImmediately,
+    stagePaths,
+  }: {
+    message: string;
+    amend?: boolean;
+    pushImmediately?: boolean;
+    stagePaths?: string[];
+  }) => {
     if (!selectedRepo) return;
     setIsCommitting(true);
     try {
+      if (stagePaths && stagePaths.length > 0) {
+        await gitApi.stageFiles({ repoPath: selectedRepo.path, paths: stagePaths });
+      }
       const res = await gitApi.commit({
         repoPath: selectedRepo.path,
         message,
         amend,
       });
+      const activeBranch = status?.branch || selectedRepo.currentBranch;
       if (pushImmediately) {
         await gitApi.pushRepo({
           repoPath: selectedRepo.path,
           remote: 'origin',
-          branch: selectedRepo.branch,
+          branch: activeBranch,
           force: amend,
         });
       }
@@ -436,7 +471,7 @@ export const GitManager: React.FC<GitManagerProps> = ({
       toast(
         'success',
         amend ? (pushImmediately ? 'Commit Amended & Pushed' : 'Commit Amended') : (pushImmediately ? 'Commit & Pushed' : 'Commit Created'),
-        `Branch: ${selectedRepo.branch}${res.commitHash ? ` (${res.commitHash.slice(0, 7)})` : ''}`
+        `Branch: ${activeBranch}${res.commitHash ? ` (${res.commitHash.slice(0, 7)})` : ''}`
       );
     } catch (err: any) {
       toast('error', 'Commit/Push Failed', err.message);

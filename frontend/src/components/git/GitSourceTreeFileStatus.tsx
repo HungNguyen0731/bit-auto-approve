@@ -19,6 +19,7 @@ import {
   FolderTree,
   Loader2,
   Code2,
+  ArrowUpCircle,
 } from 'lucide-react';
 
 interface GitSourceTreeFileStatusProps {
@@ -29,7 +30,7 @@ interface GitSourceTreeFileStatusProps {
   onStage: (paths?: string[], all?: boolean) => void;
   onUnstage: (paths?: string[], all?: boolean) => void;
   onDiscard: (paths?: string[], all?: boolean) => void;
-  onCommit: (payload: { message: string; amend?: boolean }) => void;
+  onCommit: (payload: { message: string; amend?: boolean; pushImmediately?: boolean; stagePaths?: string[] }) => void;
   isStaging?: boolean;
   isCommitting?: boolean;
   isDiffLoading?: boolean;
@@ -56,6 +57,8 @@ export const GitSourceTreeFileStatus: React.FC<GitSourceTreeFileStatusProps> = (
   const [viewMode, setViewMode] = useState<'list' | 'tree'>('list');
   const [commitMessage, setCommitMessage] = useState('');
   const [isAmend, setIsAmend] = useState(false);
+  const [pushImmediately, setPushImmediately] = useState(true);
+  const [selectedUnstagedPaths, setSelectedUnstagedPaths] = useState<Set<string>>(new Set());
   const [activeMenuFile, setActiveMenuFile] = useState<string | null>(null);
 
   const stagedFiles: GitStatusFile[] = status?.staged || [];
@@ -63,6 +66,11 @@ export const GitSourceTreeFileStatus: React.FC<GitSourceTreeFileStatusProps> = (
     ...(status?.unstaged || []),
     ...(status?.untracked || []),
   ];
+
+  const validSelectedUnstaged = unstagedFiles
+    .filter((f) => selectedUnstagedPaths.has(f.path))
+    .map((f) => f.path);
+  const totalFilesToCommit = stagedFiles.length + validSelectedUnstaged.length;
 
   // All pending files merged
   const allPendingFiles: Array<GitStatusFile & { isStaged: boolean }> = [
@@ -80,12 +88,23 @@ export const GitSourceTreeFileStatus: React.FC<GitSourceTreeFileStatusProps> = (
 
   const allStaged = stagedFiles.length > 0 && unstagedFiles.length === 0;
   const someStaged = stagedFiles.length > 0;
+  const allUnstagedChecked =
+    unstagedFiles.length > 0 &&
+    unstagedFiles.every((f) => selectedUnstagedPaths.has(f.path));
 
   const handleToggleAllStaged = () => {
-    if (allStaged) {
-      onUnstage(undefined, true);
+    if (filterMode === 'staged' || (filterMode === 'pending' && stagedFiles.length > 0 && unstagedFiles.length === 0)) {
+      if (allStaged) {
+        onUnstage(undefined, true);
+      } else {
+        onStage(undefined, true);
+      }
     } else {
-      onStage(undefined, true);
+      if (allUnstagedChecked) {
+        setSelectedUnstagedPaths(new Set());
+      } else {
+        setSelectedUnstagedPaths(new Set(unstagedFiles.map((f) => f.path)));
+      }
     }
   };
 
@@ -93,19 +112,30 @@ export const GitSourceTreeFileStatus: React.FC<GitSourceTreeFileStatusProps> = (
     if (file.isStaged) {
       onUnstage([file.path]);
     } else {
-      onStage([file.path]);
+      setSelectedUnstagedPaths((prev) => {
+        const next = new Set(prev);
+        if (next.has(file.path)) {
+          next.delete(file.path);
+        } else {
+          next.add(file.path);
+        }
+        return next;
+      });
     }
   };
 
   const handleCommitSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!commitMessage.trim()) return;
-    if (stagedFiles.length === 0 && !isAmend) return;
+    if (totalFilesToCommit === 0 && !isAmend) return;
 
     onCommit({
       message: commitMessage.trim(),
       amend: isAmend,
+      pushImmediately,
+      stagePaths: validSelectedUnstaged,
     });
+    setSelectedUnstagedPaths(new Set());
     setCommitMessage('');
     setIsAmend(false);
   };
@@ -205,11 +235,11 @@ export const GitSourceTreeFileStatus: React.FC<GitSourceTreeFileStatusProps> = (
                 onClick={handleToggleAllStaged}
                 disabled={isStaging || allPendingFiles.length === 0}
                 className="p-1 rounded text-blue-600 hover:bg-slate-200/60 disabled:opacity-40 transition-colors"
-                title={allStaged ? 'Unstage all files' : 'Stage all files'}
+                title={allStaged || allUnstagedChecked ? 'Deselect all files' : 'Select all files for commit'}
               >
-                {allStaged ? (
-                  <CheckSquare className="w-4 h-4" />
-                ) : someStaged ? (
+                {allStaged || allUnstagedChecked ? (
+                  <CheckSquare className="w-4 h-4 fill-blue-600 text-white" />
+                ) : someStaged || validSelectedUnstaged.length > 0 ? (
                   <span className="w-4 h-4 rounded border-2 border-blue-600 flex items-center justify-center">
                     <span className="w-2 h-2 bg-blue-600 rounded-xs" />
                   </span>
@@ -283,6 +313,8 @@ export const GitSourceTreeFileStatus: React.FC<GitSourceTreeFileStatusProps> = (
                     className={`group relative flex items-center justify-between px-2 py-1.5 rounded text-xs cursor-pointer transition-colors ${
                       isSelected
                         ? 'bg-[#d0e2ff] text-slate-900 font-semibold'
+                        : selectedUnstagedPaths.has(file.path)
+                        ? 'bg-blue-50/60 text-slate-900'
                         : 'hover:bg-slate-200/60 text-slate-800'
                     }`}
                   >
@@ -297,9 +329,22 @@ export const GitSourceTreeFileStatus: React.FC<GitSourceTreeFileStatusProps> = (
                         }}
                         disabled={isStaging}
                         className="text-blue-600 hover:text-blue-800 focus-visible:outline-none"
-                        title={file.isStaged ? 'Unstage file' : 'Stage file'}
+                        title={
+                          file.isStaged
+                            ? `Unstage ${file.path}`
+                            : selectedUnstagedPaths.has(file.path)
+                            ? `Deselect ${file.path}`
+                            : `Select ${file.path}`
+                        }
+                        aria-label={
+                          file.isStaged
+                            ? `Unstage ${file.path}`
+                            : selectedUnstagedPaths.has(file.path)
+                            ? `Deselect ${file.path}`
+                            : `Select ${file.path}`
+                        }
                       >
-                        {file.isStaged ? (
+                        {file.isStaged || selectedUnstagedPaths.has(file.path) ? (
                           <CheckSquare className="w-4 h-4 fill-blue-600 text-white" />
                         ) : (
                           <Square className="w-4 h-4 text-slate-400" />
@@ -558,27 +603,47 @@ export const GitSourceTreeFileStatus: React.FC<GitSourceTreeFileStatusProps> = (
 
             <button
               type="submit"
-              disabled={isCommitting || !commitMessage.trim() || (stagedFiles.length === 0 && !isAmend)}
+              disabled={isCommitting || !commitMessage.trim() || (totalFilesToCommit === 0 && !isAmend)}
               className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 transition-colors shadow-xs shrink-0"
             >
-              {isCommitting ? 'Committing…' : `Commit ${stagedFiles.length > 0 ? `(${stagedFiles.length})` : ''}`}
+              {isCommitting ? 'Committing…' : `Commit ${totalFilesToCommit > 0 ? `(${totalFilesToCommit})` : ''}`}
             </button>
           </div>
 
           <div className="flex items-center justify-between text-[11px] text-slate-500">
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={isAmend}
-                onChange={(e) => handleAmendToggle(e.target.checked)}
-                disabled={isCommitting}
-                className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
-              />
-              <span>Amend previous commit</span>
-            </label>
+            <div className="flex items-center gap-4">
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={pushImmediately}
+                  onChange={(e) => setPushImmediately(e.target.checked)}
+                  disabled={isCommitting}
+                  className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                />
+                <span className="flex items-center gap-1 text-slate-700 font-medium">
+                  <ArrowUpCircle className="w-3.5 h-3.5 text-blue-600" />
+                  Push changes immediately to{' '}
+                  <span className="font-mono text-blue-600 font-semibold">
+                    {status?.branch || 'current branch'}
+                  </span>
+                </span>
+              </label>
+
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={isAmend}
+                  onChange={(e) => handleAmendToggle(e.target.checked)}
+                  disabled={isCommitting}
+                  className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                />
+                <span>Amend previous commit</span>
+              </label>
+            </div>
 
             <span className="font-mono text-[10px]">
-              {stagedFiles.length} staged / {unstagedFiles.length} unstaged
+              {stagedFiles.length} staged
+              {validSelectedUnstaged.length > 0 && ` + ${validSelectedUnstaged.length} selected`} / {unstagedFiles.length} unstaged
             </span>
           </div>
         </form>
