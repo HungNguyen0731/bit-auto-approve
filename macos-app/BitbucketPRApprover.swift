@@ -943,6 +943,7 @@ private struct GitManagerView: View {
     @State private var commitMessage = ""
     @State private var amend = false
     @State private var pushImmediately = true
+    @State private var stashOnCommit = false
     @State private var selectedUnstagedPaths: Set<String> = []
     @State private var inputAuthPassword = ""
     @State private var rememberAuthInKeychain = true
@@ -4407,11 +4408,12 @@ private struct GitManagerView: View {
     }
 
     private var commitBox: some View {
-        let stagedCount = (model.snapshot?.changes ?? []).filter { $0.staged }.count
-        let validSelectedUnstaged = (model.snapshot?.changes ?? []).filter { $0.unstaged && selectedUnstagedPaths.contains($0.path) }
+        let allChanges = model.snapshot?.changes ?? []
+        let stagedCount = allChanges.filter { $0.staged }.count
+        let validSelectedUnstaged = allChanges.filter { $0.unstaged && selectedUnstagedPaths.contains($0.path) }
         let selectedCount = validSelectedUnstaged.count
-        let totalCountToCommit = stagedCount + selectedCount
-        let hasConflicts = (model.snapshot?.changes ?? []).contains(where: { $0.conflicted })
+        let totalCountToCommit = stashOnCommit ? allChanges.count : (stagedCount + selectedCount)
+        let hasConflicts = allChanges.contains(where: { $0.conflicted })
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -4426,20 +4428,26 @@ private struct GitManagerView: View {
                 }
                 if totalCountToCommit > 0 {
                     HStack(spacing: 4) {
-                        if stagedCount > 0 {
-                            Text("\(stagedCount) staged")
-                                .font(.caption2.monospacedDigit())
-                                .foregroundStyle(AppPalette.mint)
-                        }
-                        if stagedCount > 0 && selectedCount > 0 {
-                            Text("+")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        if selectedCount > 0 {
-                            Text("\(selectedCount) unstage đã chọn")
-                                .font(.caption2.monospacedDigit())
-                                .foregroundStyle(AppPalette.blue)
+                        if stashOnCommit {
+                            Text("\(allChanges.count) files (all)")
+                                .font(.caption2.bold().monospacedDigit())
+                                .foregroundStyle(AppPalette.amber)
+                        } else {
+                            if stagedCount > 0 {
+                                Text("\(stagedCount) staged")
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(AppPalette.mint)
+                            }
+                            if stagedCount > 0 && selectedCount > 0 {
+                                Text("+")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if selectedCount > 0 {
+                                Text("\(selectedCount) unstage đã chọn")
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(AppPalette.blue)
+                            }
                         }
                     }
                 }
@@ -4467,6 +4475,17 @@ private struct GitManagerView: View {
                 }
                 .toggleStyle(.checkbox)
                 .help("Tự động push commit lên remote branch sau khi commit thành công")
+
+                Toggle(isOn: $stashOnCommit) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "archivebox.fill")
+                            .foregroundStyle(AppPalette.amber)
+                        Text("Stash lại theo commit (gồm cả unstage & stage)")
+                            .font(.caption)
+                    }
+                }
+                .toggleStyle(.checkbox)
+                .help("Tự động stash toàn bộ code làm backup trước khi commit, bao gồm tất cả file unstage và stage")
 
                 HStack {
                     Toggle("Amend latest", isOn: $amend)
@@ -4517,7 +4536,12 @@ private struct GitManagerView: View {
         selectedUnstagedPaths.removeAll()
 
         var sequence: [[String]] = []
-        if !validSelectedUnstaged.isEmpty {
+        if stashOnCommit && !(model.snapshot?.changes ?? []).isEmpty {
+            let stashMsg = "Stash before commit: \(msg)"
+            sequence.append(["stash", "push", "-u", "-m", stashMsg])
+            sequence.append(["stash", "apply"])
+            sequence.append(["add", "-A"])
+        } else if !validSelectedUnstaged.isEmpty {
             sequence.append(["add", "--"] + validSelectedUnstaged)
         }
         let commitArgs = ["commit"] + (amend ? ["--amend"] : []) + ["-m", msg]
@@ -5647,8 +5671,29 @@ enum VpnConnectionStatus: String {
             let targetLegacy = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Applications/Bitbucket PR Approver.app", isDirectory: true)
             let currentBundleURL = Bundle.main.bundleURL
-            let target = currentBundleURL.lastPathComponent == "GitPulse.app" || FileManager.default.fileExists(atPath: targetPulse.path)
-                ? targetPulse : targetLegacy
+            let targetSystem = URL(fileURLWithPath: "/Applications/GitPulse.app", isDirectory: true)
+            let target: URL
+            if currentBundleURL.path == targetSystem.path {
+                target = targetSystem
+            } else if currentBundleURL.path == targetPulse.path || currentBundleURL.path == targetLegacy.path {
+                // Existing HOME installations update in place, never migrate or remove another copy.
+                target = currentBundleURL
+            } else {
+                target = currentBundleURL.lastPathComponent == "GitPulse.app" || FileManager.default.fileExists(atPath: targetPulse.path)
+                    ? targetPulse : targetLegacy
+            }
+            let preflight = Process()
+            let preflightError = Pipe()
+            preflight.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            preflight.arguments = [helper.path, "--preflight", target.path]
+            preflight.standardError = preflightError
+            try preflight.run()
+            let preflightDetails = preflightError.fileHandleForReading.readDataToEndOfFile()
+            preflight.waitUntilExit()
+            guard preflight.terminationStatus == 0 else {
+                let detail = String(data: preflightDetails, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                throw updateError("Không thể ghi bản cập nhật vào \(target.path). Ứng dụng vẫn đang chạy; không yêu cầu quyền quản trị. \(detail)")
+            }
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = [helper.path, candidate.path, target.path, String(ProcessInfo.processInfo.processIdentifier), manifest.version]

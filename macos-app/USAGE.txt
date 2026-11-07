@@ -8,6 +8,21 @@ Worker cho từng job, cấu hình bộ lọc và chu kỳ, rồi bật chạy n
 mã hóa trên server; cửa sổ Mac chỉ nhận tên và phần token đã che. Owner password
 và token không được lưu vào UserDefaults.
 
+Cài từ ZIP phát hành (macOS 15+, Apple Silicon):
+- Giải nén toàn bộ ZIP, thoát GitPulse nếu /Applications/GitPulse.app đang chạy.
+- Chạy install-gitpulse.command bên cạnh Bitbucket PR Approver.app.
+- Installer chỉ cài vào /Applications/GitPulse.app; không nhận đường dẫn khác,
+  không dùng sudo và không yêu cầu/bỏ qua quyền quản trị. Nếu không có quyền ghi,
+  installer dừng và báo lỗi; bản đang có được giữ nguyên.
+- Installer xác minh bundle ID, phiên bản và chữ ký trước/sau khi copy. Bundle được
+  stage trong /Applications, thay thế có backup/rollback nếu bước đổi tên thất bại.
+- Installer không tự mở/dừng app, không xóa/di chuyển bản trong ~/Applications,
+  không thay đổi settings, vault, Keychain, Worker pairing hoặc LaunchAgents.
+- Mở GitPulse từ Applications sau khi cài. Auto-update cập nhật đúng bản đang chạy
+  trong /Applications hoặc hai vị trí ~/Applications tương thích cũ.
+- Chữ ký hiện tại là ad-hoc (kiểm tra toàn vẹn, không phải Developer ID/notarization).
+  Không tắt Gatekeeper hoặc bỏ qua cảnh báo bảo mật để chạy một bản không tin cậy.
+
 Trên Mac có Apple Command Line Tools, từ repo chạy:
 
   /bin/zsh macos-app/build.sh
