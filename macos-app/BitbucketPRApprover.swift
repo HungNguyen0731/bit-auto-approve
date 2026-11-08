@@ -2920,38 +2920,41 @@ private struct GitManagerView: View {
     }
 
     private func applyPRAuth(to req: inout URLRequest, config: PipelineConfig, accounts: [Account], workspace: String, repoSlug: String, sourceBranch: String, destBranch: String) {
-        req.httpShouldHandleCookies = false
-        let cleanCookie = appModel.sanitizeCookie(config.cookie)
-        let cleanCsrf = appModel.sanitizeCsrf(config.csrfToken)
-
-        if !cleanCookie.isEmpty {
-            req.setValue(cleanCookie, forHTTPHeaderField: "Cookie")
-        }
-        if !cleanCsrf.isEmpty {
-            req.setValue(cleanCsrf, forHTTPHeaderField: "x-csrftoken")
-        }
-        req.setValue("XMLHttpRequest", forHTTPHeaderField: "x-requested-with")
-        req.setValue("frontbucket", forHTTPHeaderField: "x-bitbucket-frontend")
-        req.setValue("https://bitbucket.org", forHTTPHeaderField: "origin")
-        req.setValue("https://bitbucket.org/\(workspace)/\(repoSlug)/pull-requests/new?source=\(sourceBranch)&dest=\(destBranch)", forHTTPHeaderField: "referer")
-        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36", forHTTPHeaderField: "user-agent")
-
-        if !config.token.isEmpty {
-            let user = config.username.isEmpty ? (accounts.first(where: { $0.id == config.selectedAccountId })?.username ?? "") : config.username
-            if !user.isEmpty {
-                let auth = Data("\(user):\(config.token)".utf8).base64EncodedString()
-                req.setValue("Basic \(auth)", forHTTPHeaderField: "Authorization")
-            } else {
-                req.setValue("Bearer \(config.token)", forHTTPHeaderField: "Authorization")
-            }
+        appModel.applyAuth(to: &req, config: config, repo: "\(workspace)/\(repoSlug)")
+        if appModel.usesBitbucketSession(config) {
+            req.setValue("https://bitbucket.org/\(workspace)/\(repoSlug)/pull-requests/new?source=\(sourceBranch)&dest=\(destBranch)", forHTTPHeaderField: "referer")
         }
     }
 
     private func executeCreatePR(targetBranch: String, title: String? = nil, description: String? = nil, reviewerUUIDs: Set<String>? = nil) {
-        guard let path = model.selectedPath else { return }
+        guard !isCreatingPR else { return }
+        isCreatingPR = true
+        prErrorMessage = ""
+        prStatusMessage = "Đang xác định tài khoản để lưu PR…"
+        let config = appModel.pipelineConfig
+        let originalPath = model.selectedPath
+        let originalBranch = model.snapshot?.repository.branch
+        Task { @MainActor in
+            do {
+                let identity = try await appModel.resolvePRIdentity(config: config)
+                guard config == appModel.pipelineConfig, originalPath == model.selectedPath,
+                      originalBranch == model.snapshot?.repository.branch else {
+                    throw PRReadError(message: "Tài khoản, repository hoặc nhánh đã đổi; hãy tạo PR lại")
+                }
+                executeRegisteredCreatePR(targetBranch: targetBranch, title: title, description: description,
+                                          reviewerUUIDs: reviewerUUIDs, config: config, identity: identity)
+            } catch {
+                isCreatingPR = false
+                prErrorMessage = "Chưa tạo PR: không xác định được tài khoản Bitbucket. " + error.localizedDescription
+            }
+        }
+    }
+
+    private func executeRegisteredCreatePR(targetBranch: String, title: String?, description: String?, reviewerUUIDs: Set<String>?, config: PipelineConfig, identity: String) {
+        guard let path = model.selectedPath else { isCreatingPR = false; return }
         let currentBranch = model.snapshot?.repository.branch ?? "main"
         let trimmedTarget = targetBranch.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedTarget.isEmpty else { return }
+        guard !trimmedTarget.isEmpty else { isCreatingPR = false; return }
 
         let resolvedTitle: String
         if let t = title?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
@@ -2970,7 +2973,8 @@ private struct GitManagerView: View {
         createdPRUrl = nil
         createdPRNumber = nil
 
-        let prConfig = self.appModel.pipelineConfig
+        let prConfig = config
+        let prAPIBase = self.appModel.bitbucketAPIBase(prConfig)
         let prAccounts = self.appModel.accounts
 
         DispatchQueue.global(qos: .userInitiated).async {
@@ -3015,7 +3019,7 @@ private struct GitManagerView: View {
                 self.prStatusMessage = "Đang gọi Bitbucket API tạo Pull Request vào '\(trimmedTarget)'…"
             }
 
-            let endpoint = "https://bitbucket.org/!api/2.0/repositories/\(workspace)/\(repoSlug)/pullrequests/?fields=links.html.href"
+            let endpoint = "\(prAPIBase)/repositories/\(workspace)/\(repoSlug)/pullrequests/?fields=id,links.html.href"
             guard let url = URL(string: endpoint) else {
                 DispatchQueue.main.async {
                     self.isCreatingPR = false
@@ -3052,7 +3056,7 @@ private struct GitManagerView: View {
             }
             req.httpBody = bodyData
 
-            let session = URLSession(configuration: .default)
+            let session = URLSession(configuration: .ephemeral, delegate: SameOriginRedirects(), delegateQueue: nil)
             let task = session.dataTask(with: req) { data, response, error in
                 DispatchQueue.main.async {
                     self.isCreatingPR = false
@@ -3066,6 +3070,7 @@ private struct GitManagerView: View {
                     }
 
                     if httpRes.statusCode == 201 || httpRes.statusCode == 200 {
+                        self.appModel.recordAppCreatedPR(repository: "\(workspace)/\(repoSlug)", config: prConfig, identity: identity, status: httpRes.statusCode, data: data ?? Data(), location: httpRes.value(forHTTPHeaderField: "Location"))
                         var prHref = ""
                         if let data = data,
                            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -5343,7 +5348,7 @@ private struct JobDraft {
     }
 }
 
-private struct PipelineConfig: Codable {
+private struct PipelineConfig: Codable, Equatable {
     var repository: String = "msm-software/digifact-utilities"
     var branch: String = "devops"
     var authType: String = "account" // "account" | "session" | "token"
@@ -5415,49 +5420,40 @@ private struct PRBuildStatusItem: Identifiable, Codable {
     var updated_on: String?
     var type: String?
 
-    var isFailed: Bool {
-        let s = state.uppercased()
-        let desc = (description ?? "").lowercased()
-        return s == "FAILED" || s == "ERROR" || desc.contains("fail") || desc.contains("error")
-    }
+    var kind: PRBuildKind { PRBuildKind.summarize([state]) }
+    var isFailed: Bool { kind == .failed || kind == .stopped }
+    var isPaused: Bool { kind == .paused }
+    var isInProgress: Bool { kind == .running }
+    var isSuccess: Bool { kind == .success }
 
-    var isPaused: Bool {
-        let s = state.uppercased()
-        let desc = (description ?? "").lowercased()
-        let n = name.lowercased()
-        return s == "STOPPED" || s == "PAUSED" || desc.contains("pause") || desc.contains("manual") || desc.contains("waiting") || n.contains("pause")
-    }
+}
 
-    var isInProgress: Bool {
-        let s = state.uppercased()
-        return (s == "INPROGRESS" || s == "PENDING" || s == "RUNNING") && !isPaused
-    }
-
-    var isSuccess: Bool {
-        let s = state.uppercased()
-        return s == "SUCCESSFUL" || s == "SUCCESS"
-    }
+private struct PRPollInfo {
+    var loading = false
+    var updated: Date?
+    var error = ""
 }
 
 private struct UnsuccessfulPullRequest: Identifiable, Codable {
     let id: Int
-    let title: String
-    let description: String?
+    var title: String
+    var description: String?
     let repository: String
-    let sourceBranch: String
-    let targetBranch: String
-    let commitHash: String?
-    let authorName: String
-    let authorAvatar: String?
+    var sourceBranch: String
+    var targetBranch: String
+    var commitHash: String?
+    var authorName: String
+    var authorAvatar: String?
     let htmlUrl: String
-    let createdDate: String
-    let updatedDate: String
+    var createdDate: String
+    var updatedDate: String
     var builds: [PRBuildStatusItem] = []
     var summaryState: String = "FAILED" // "FAILED", "PAUSED", "INPROGRESS"
     var statusReason: String = ""
+    var key: PRKey { PRKey(repository: repository, number: id) }
 
     var isFailed: Bool {
-        builds.contains { $0.isFailed } || summaryState == "FAILED"
+        builds.contains { $0.isFailed } || ["FAILED", "STOPPED"].contains(summaryState)
     }
 
     var isPaused: Bool {
@@ -5465,7 +5461,7 @@ private struct UnsuccessfulPullRequest: Identifiable, Codable {
     }
 
     var isInProgress: Bool {
-        builds.contains { $0.isInProgress } || summaryState == "INPROGRESS"
+        builds.contains { $0.isInProgress } || PRBuildKind.summarize([summaryState]) == .running
     }
 
     var failedCount: Int { builds.filter { $0.isFailed }.count }
@@ -5518,6 +5514,38 @@ enum VpnConnectionStatus: String {
     @Published var prsError = ""
     @Published var selectedPRId: Int? = nil
     @Published var selectedPRRepo: String? = nil
+    @Published var prPollInfo: [PRKey: PRPollInfo] = [:]
+    @Published var prRegistryError = ""
+    var prDetailsVisible = false
+    private var prSchedule = PRPollSchedule()
+    private var terminalPRs = Set<PRKey>()
+    private var prIdentity: String?
+    private var resolvedPRIdentity: (config: PipelineConfig, identity: String, uuid: UUID)?
+    private var prIdentityRetryAt = Date.distantPast
+    private var prGeneration = 0
+    private var prDetailAt: [PRKey: Date] = [:]
+    private var prFullAt: [PRKey: Date] = [:]
+    private var prNextPollAt: [PRKey: Date] = [:]
+    private var prDiscoveryUntil: [PRKey: Date] = [:]
+    private var prPipelineCache: [String: (String, PRBuildKind, String)] = [:]
+    private var prPipelineKinds: [PRKey: PRBuildKind] = [:]
+    private var prPipelineURLs: [PRKey: Set<String>] = [:]
+    private let prReader = PRReadClient()
+    private let prStoppedStepClient = PRStoppedStepClient()
+    private var prRecoveryBusy = false
+    private var prRecoveryAt: [PRKey: Date] = [:]
+    private var prRecoveryCooldownUntil = Date.distantPast
+    private var prRecoveryScanAt = Date.distantPast
+    private var prRecoveryScanRepos = Set<String>()
+    private var prRecoveryScanConfig: PipelineConfig?
+    private var prRecoveryScanBlocked = true
+    private let prRecoveryLedger = PRRecoveryLedger(url: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("GitPulse/stopped-step-recovery.json"))
+    private let prRegistry: PRCreationRegistry = {
+        let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("GitPulse", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return PRCreationRegistry(url: folder.appendingPathComponent("app-created-prs.json"))
+    }()
     // MARK: - FortiClient VPN & Reconnect State
     @Published var vpnGatewayIp: String = UserDefaults.standard.string(forKey: "vpnGatewayIp") ?? "115.78.233.162"
     @Published var vpnAutoReconnect: Bool = UserDefaults.standard.object(forKey: "vpnAutoReconnect") as? Bool ?? true
@@ -5805,7 +5833,7 @@ enum VpnConnectionStatus: String {
             accounts = try await call("GET", "/api/accounts")
             workers = try await call("GET", "/api/workers")
             jobs = try await call("GET", "/api/jobs")
-            if pipelineConfig.selectedAccountId.isEmpty, let first = accounts.first {
+            if pipelineConfig.selectedAccountId.isEmpty, pipelineConfig.cookie.isEmpty, pipelineConfig.token.isEmpty, let first = accounts.first {
                 selectAccountAndAutofill(first.id)
             }
         } catch { message = error.localizedDescription }
@@ -6499,7 +6527,20 @@ enum VpnConnectionStatus: String {
         }
     }
 
-    private func applyAuth(to req: inout URLRequest, config: PipelineConfig, repo: String) {
+    fileprivate func usesBitbucketSession(_ config: PipelineConfig) -> Bool {
+        let hasCookie = !sanitizeCookie(config.cookie).isEmpty
+        if config.authType == "account" {
+            if accounts.first(where: { $0.id == config.selectedAccountId })?.authType == "session", hasCookie { return true }
+            return config.token.isEmpty && hasCookie
+        }
+        return config.authType == "session" || (hasCookie && config.authType != "token")
+    }
+
+    fileprivate func bitbucketAPIBase(_ config: PipelineConfig) -> String {
+        usesBitbucketSession(config) ? "https://bitbucket.org/!api/2.0" : "https://api.bitbucket.org/2.0"
+    }
+
+    fileprivate func applyAuth(to req: inout URLRequest, config: PipelineConfig, repo: String) {
         req.httpShouldHandleCookies = false
         let cleanCookie = sanitizeCookie(config.cookie)
         let cleanCsrf = sanitizeCsrf(config.csrfToken)
@@ -6988,249 +7029,361 @@ enum VpnConnectionStatus: String {
     // MARK: - Unsuccessful PRs & Build Details Scanner
 
     func fetchUnsuccessfulPRs() async {
+        guard !prsLoading, authenticated, !needsReauth else { return }
         prsLoading = true
-        prsError = ""
         defer { prsLoading = false }
-
-        // Auto-load credentials if needed
-        if pipelineConfig.cookie.isEmpty && pipelineConfig.token.isEmpty {
-            for acc in accounts {
-                if let creds = loadCredentialsForAccount(acc.id) {
-                    if let c = creds["cookie"], !c.isEmpty { pipelineConfig.cookie = c }
-                    if let csrf = creds["csrfToken"], !csrf.isEmpty { pipelineConfig.csrfToken = csrf }
-                    if let t = creds["token"], !t.isEmpty { pipelineConfig.token = t }
-                    if !pipelineConfig.cookie.isEmpty || !pipelineConfig.token.isEmpty {
-                        pipelineConfig.selectedAccountId = acc.id
-                        break
-                    }
-                }
-            }
-        }
-
-        var reposToScan = Set<String>()
-        for job in jobs {
-            for repo in job.rules.repositories {
-                let trimmed = repo.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty && !trimmed.contains("*") && trimmed.contains("/") {
-                    reposToScan.insert(trimmed)
-                }
-            }
-        }
-        let cfgRepo = pipelineConfig.repository.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !cfgRepo.isEmpty && cfgRepo.contains("/") {
-            reposToScan.insert(cfgRepo)
-        }
-        for log in logs {
-            if let r = log.repository, r.contains("/") {
-                reposToScan.insert(r)
-            }
-        }
-
-        if reposToScan.isEmpty {
-            reposToScan.insert("msm-software/digifact-utilities")
-        }
-
-        var fetchedPRs: [UnsuccessfulPullRequest] = []
-
-        for repo in reposToScan {
-            await scanRepoForUnsuccessfulPRs(repo: repo, into: &fetchedPRs)
-        }
-
-        // Merge from worker logs to ensure every PR that failed during runs is included
-        for log in logs where log.status == "SKIPPED" || log.status == "CHECKING_CI" || (log.failureReason != nil && !log.failureReason!.isEmpty) {
-            guard let repo = log.repository, let title = log.prTitle else { continue }
-            let reason = log.failureReason ?? ""
-            let lowerReason = reason.lowercased()
-            let isCiFail = lowerReason.contains("fail") || lowerReason.contains("error")
-            let isCiPause = lowerReason.contains("pause") || lowerReason.contains("stopped") || lowerReason.contains("manual")
-            if isCiFail || isCiPause {
-                if !fetchedPRs.contains(where: { $0.repository == repo && $0.title == title }) {
-                    var buildsList: [PRBuildStatusItem] = []
-                    if isCiFail {
-                        buildsList.append(PRBuildStatusItem(
-                            key: "worker-ci",
-                            name: "CI Pipeline (Worker)",
-                            state: "FAILED",
-                            description: reason,
-                            url: "https://bitbucket.org/\(repo)/pull-requests",
-                            uuid: UUID().uuidString,
-                            created_on: log.timestamp,
-                            updated_on: log.timestamp,
-                            type: "commit_status"
-                        ))
-                    } else {
-                        buildsList.append(PRBuildStatusItem(
-                            key: "worker-ci",
-                            name: "CI Pipeline (Worker)",
-                            state: "STOPPED",
-                            description: reason,
-                            url: "https://bitbucket.org/\(repo)/pull-requests",
-                            uuid: UUID().uuidString,
-                            created_on: log.timestamp,
-                            updated_on: log.timestamp,
-                            type: "commit_status"
-                        ))
-                    }
-                    fetchedPRs.append(UnsuccessfulPullRequest(
-                        id: abs(log.id.hashValue) % 10000,
-                        title: title,
-                        description: log.failureReason,
-                        repository: repo,
-                        sourceBranch: "source",
-                        targetBranch: "target",
-                        commitHash: nil,
-                        authorName: "Worker",
-                        authorAvatar: nil,
-                        htmlUrl: "https://bitbucket.org/\(repo)/pull-requests",
-                        createdDate: log.timestamp,
-                        updatedDate: log.timestamp,
-                        builds: buildsList,
-                        summaryState: isCiFail ? "FAILED" : "PAUSED",
-                        statusReason: reason
-                    ))
-                }
-            }
-        }
-
-        self.unsuccessfulPRs = fetchedPRs.sorted { $0.updatedDate > $1.updatedDate }
-        if self.selectedPRId == nil, let first = self.unsuccessfulPRs.first {
-            self.selectedPRId = first.id
-            self.selectedPRRepo = first.repository
-        }
-    }
-
-    private func scanRepoForUnsuccessfulPRs(repo: String, into list: inout [UnsuccessfulPullRequest]) async {
-        let cleanCookie = sanitizeCookie(pipelineConfig.cookie)
-        let isSession = pipelineConfig.authType == "session" || (!cleanCookie.isEmpty && pipelineConfig.authType != "token")
-        let endpoint = isSession
-            ? "https://bitbucket.org/!api/2.0/repositories/\(repo)/pullrequests?state=OPEN&pagelen=30"
-            : "https://api.bitbucket.org/2.0/repositories/\(repo)/pullrequests?state=OPEN&pagelen=30"
-
-        guard let url = URL(string: endpoint) else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        applyAuth(to: &req, config: pipelineConfig, repo: repo)
-
+        let config = pipelineConfig
         do {
-            let (data, response) = try await pipelineSession.data(for: req)
-            guard let http = response as? HTTPURLResponse, http.statusCode >= 200 && http.statusCode < 300 else {
-                return
+            _ = try await resolvePRIdentity(config: config)
+            guard config == pipelineConfig else { return }
+            prRegistryError = ""
+            prsError = ""
+            let keys = try prRegistry.keys(account: monitoringIdentity ?? "")
+            for key in keys {
+                prNextPollAt.removeValue(forKey: key)
+                prDetailAt.removeValue(forKey: key)
+                prFullAt.removeValue(forKey: key)
             }
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let values = json["values"] as? [[String: Any]] else {
-                return
-            }
-
-            for item in values {
-                guard let prId = item["id"] as? Int,
-                      let title = item["title"] as? String else { continue }
-
-                let sourceObj = item["source"] as? [String: Any]
-                let sourceBranchObj = sourceObj?["branch"] as? [String: Any]
-                let sourceBranch = sourceBranchObj?["name"] as? String ?? "unknown"
-                let sourceCommitObj = sourceObj?["commit"] as? [String: Any]
-                let commitHash = sourceCommitObj?["hash"] as? String
-
-                let destObj = item["destination"] as? [String: Any]
-                let destBranchObj = destObj?["branch"] as? [String: Any]
-                let destBranch = destBranchObj?["name"] as? String ?? "unknown"
-
-                let authorObj = item["author"] as? [String: Any]
-                let authorName = authorObj?["display_name"] as? String ?? authorObj?["nickname"] as? String ?? "unknown"
-                let authorLinks = authorObj?["links"] as? [String: Any]
-                let avatarLink = authorLinks?["avatar"] as? [String: Any]
-                let authorAvatar = avatarLink?["href"] as? String
-
-                let linksObj = item["links"] as? [String: Any]
-                let htmlLinkObj = linksObj?["html"] as? [String: Any]
-                let htmlUrl = htmlLinkObj?["href"] as? String ?? "https://bitbucket.org/\(repo)/pull-requests/\(prId)"
-
-                let createdDate = item["created_on"] as? String ?? ""
-                let updatedDate = item["updated_on"] as? String ?? ""
-                let summaryObj = item["summary"] as? [String: Any]
-                let description = summaryObj?["raw"] as? String ?? item["description"] as? String
-
-                let builds = await fetchStatusesForPR(repo: repo, prId: prId, commitHash: commitHash)
-
-                let hasFailed = builds.contains { $0.isFailed }
-                let hasPaused = builds.contains { $0.isPaused }
-                let hasInProgress = builds.contains { $0.isInProgress }
-                let allSuccess = !builds.isEmpty && builds.allSatisfy { $0.isSuccess }
-
-                if hasFailed || hasPaused || (hasInProgress && !allSuccess) {
-                    let summary = hasFailed ? "FAILED" : (hasPaused ? "PAUSED" : "INPROGRESS")
-                    let statusReason = hasFailed
-                        ? "Có \(builds.filter { $0.isFailed }.count) build bị thất bại"
-                        : (hasPaused ? "Có \(builds.filter { $0.isPaused }.count) build bị tạm dừng/chờ duyệt" : "Đang chạy build")
-
-                    list.append(UnsuccessfulPullRequest(
-                        id: prId,
-                        title: title,
-                        description: description,
-                        repository: repo,
-                        sourceBranch: sourceBranch,
-                        targetBranch: destBranch,
-                        commitHash: commitHash,
-                        authorName: authorName,
-                        authorAvatar: authorAvatar,
-                        htmlUrl: htmlUrl,
-                        createdDate: createdDate,
-                        updatedDate: updatedDate,
-                        builds: builds,
-                        summaryState: summary,
-                        statusReason: statusReason
-                    ))
-                }
+            prSchedule.refresh(keys)
+            pollPRs()
+            if selectedPRId == nil, let first = unsuccessfulPRs.first {
+                selectedPRId = first.id; selectedPRRepo = first.repository
             }
         } catch {
-            logConsole("⚠️ Lỗi quét PR cho repo \(repo): \(error.localizedDescription)")
+            guard config == pipelineConfig else { return }
+            prIdentityRetryAt = Date().addingTimeInterval((error as? PRReadError)?.retryAfter ?? 30)
+            prRegistryError = "Không xác định được tài khoản Bitbucket: " + error.localizedDescription
         }
     }
 
-    private func fetchStatusesForPR(repo: String, prId: Int, commitHash: String?) async -> [PRBuildStatusItem] {
-        let cleanCookie = sanitizeCookie(pipelineConfig.cookie)
-        let isSession = pipelineConfig.authType == "session" || (!cleanCookie.isEmpty && pipelineConfig.authType != "token")
-
-        var endpoint = isSession
-            ? "https://bitbucket.org/!api/2.0/repositories/\(repo)/pullrequests/\(prId)/statuses"
-            : "https://api.bitbucket.org/2.0/repositories/\(repo)/pullrequests/\(prId)/statuses"
-
-        if let url = URL(string: endpoint) {
-            var req = URLRequest(url: url)
-            req.httpMethod = "GET"
-            req.setValue("application/json", forHTTPHeaderField: "Accept")
-            applyAuth(to: &req, config: pipelineConfig, repo: repo)
-
-            if let (data, response) = try? await pipelineSession.data(for: req),
-               let http = response as? HTTPURLResponse, http.statusCode >= 200 && http.statusCode < 300,
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let values = json["values"] as? [[String: Any]], !values.isEmpty {
-                return parseBuildStatusItems(values)
-            }
+    // Resolve anonymous session/token configurations from the authenticated user,
+    // never from cookies, token hashes, a PR author or the first unrelated account.
+    func resolvePRIdentity(config: PipelineConfig) async throws -> String {
+        if let cached = resolvedPRIdentity, cached.config == config { return cached.identity }
+        let base = bitbucketAPIBase(config)
+        var request = URLRequest(url: URL(string: base + "/user")!)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyAuth(to: &request, config: config, repo: config.repository)
+        let user = try await prReader.object(request, background: false)
+        guard config == pipelineConfig,
+              let uuid = user["uuid"] as? String,
+              let id = UUID(uuidString: uuid.trimmingCharacters(in: CharacterSet(charactersIn: "{}"))) else {
+            throw PRReadError(message: "Bitbucket chưa trả về mã tài khoản hợp lệ")
         }
+        let identity = "bitbucket:user:" + id.uuidString.lowercased()
+        resolvedPRIdentity = (config, identity, id)
+        return identity
+    }
 
-        if let hash = commitHash, !hash.isEmpty {
-            endpoint = isSession
-                ? "https://bitbucket.org/!api/2.0/repositories/\(repo)/commit/\(hash)/statuses"
-                : "https://api.bitbucket.org/2.0/repositories/\(repo)/commit/\(hash)/statuses"
+    private func prRequest(repo: String, path: String) throws -> URLRequest {
+        guard let repo = PRIdentity.repository(repo) else { throw PRReadError() }
+        let base = bitbucketAPIBase(pipelineConfig)
+        guard let url = URL(string: "\(base)/repositories/\(repo)/\(path)") else { throw PRReadError() }
+        var req = URLRequest(url: url); req.httpMethod = "GET"
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyAuth(to: &req, config: pipelineConfig, repo: repo)
+        return req
+    }
 
-            if let url = URL(string: endpoint) {
-                var req2 = URLRequest(url: url)
-                req2.httpMethod = "GET"
-                req2.setValue("application/json", forHTTPHeaderField: "Accept")
-                applyAuth(to: &req2, config: pipelineConfig, repo: repo)
+    private var monitoringIdentity: String? {
+        resolvedPRIdentity?.config == pipelineConfig ? resolvedPRIdentity?.identity : nil
+    }
 
-                if let (data, response) = try? await pipelineSession.data(for: req2),
-                   let http = response as? HTTPURLResponse, http.statusCode >= 200 && http.statusCode < 300,
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let values = json["values"] as? [[String: Any]], !values.isEmpty {
-                    return parseBuildStatusItems(values)
+    private func monitoringRead(_ request: URLRequest, key: PRKey) async throws -> [String:Any] {
+        let selected = prDetailsVisible && NSApplication.shared.isActive && selectedPRId == key.number && selectedPRRepo == key.repository
+        return try await prReader.object(request, background: !selected)
+    }
+
+    private func monitoringValues(repo: String, path: String, key: PRKey) async throws -> [[String: Any]] {
+        var request = try prRequest(repo: repo, path: path)
+        let origin = request.url!
+        var result: [[String: Any]] = []
+        var visited = Set<URL>()
+        for _ in 0..<10 {
+            guard let url = request.url, visited.insert(url).inserted else { throw PRReadError(message: "Bitbucket trả về vòng lặp phân trang") }
+            let json = try await monitoringRead(request, key: key)
+            guard let values = json["values"] as? [[String: Any]] else { throw PRReadError(message: "Bitbucket thiếu danh sách trạng thái") }
+            result.append(contentsOf: values)
+            guard let next = json["next"] as? String else { return result }
+            guard let url = URL(string: next), url.scheme == origin.scheme, url.host == origin.host,
+                  url.port == origin.port, url.path == origin.path, url.user == nil, url.password == nil else {
+                throw PRReadError(message: "Bitbucket trả về liên kết phân trang không hợp lệ")
+            }
+            request.url = url
+        }
+        throw PRReadError(message: "Danh sách vượt quá 10 trang; chưa tải đủ dữ liệu")
+    }
+
+    private func fetchConcretePipeline(pr: UnsuccessfulPullRequest, commit: String) async throws -> (PRBuildKind, String) {
+        // Require full hashes: ambiguous short hashes fail closed rather than binding another commit.
+        guard commit.count == 40, commit.allSatisfy({ $0.isASCII && $0.isHexDigit }) else { throw PRReadError() }
+        let identity = monitoringIdentity
+        let generation = prGeneration
+        let config = pipelineConfig
+        guard let userID = resolvedPRIdentity?.uuid, resolvedPRIdentity?.config == config else { throw PRReadError() }
+        let creator = userID.uuidString.lowercased()
+        let values = try await monitoringValues(repo: pr.repository, path: "pipelines/?target.commit.hash=\(commit)&creator.uuid=%7B\(creator)%7D&sort=-created_on&pagelen=100", key: pr.key)
+        guard generation == prGeneration, identity == monitoringIdentity, config == pipelineConfig else { throw PRReadError() }
+        var kinds: [PRBuildKind] = []
+        var reasons: [String] = []
+        var allowedURLs = Set<String>()
+        var contexts = Set<Data>()
+        for pipeline in values.sorted(by: { ($0["created_on"] as? String ?? "") > ($1["created_on"] as? String ?? "") }) {
+            guard let creator = (pipeline["creator"] as? [String: Any])?["uuid"] as? String,
+                  UUID(uuidString: creator.trimmingCharacters(in: CharacterSet(charactersIn: "{}"))) == userID else { continue }
+            let target = pipeline["target"] as? [String:Any] ?? [:]
+            guard PRMonitoringPolicy.matches(target: target, commit: commit, branch: pr.sourceBranch, number: pr.id) else { continue }
+            let context: [String: Any] = ["selector": target["selector"] ?? [:], "type": target["type"] ?? "", "ref": target["ref_name"] ?? "", "pr": (target["pullrequest"] as? [String: Any])?["id"] ?? 0]
+            let contextKey = try JSONSerialization.data(withJSONObject: context, options: .sortedKeys)
+            guard contexts.insert(contextKey).inserted else { continue } // Latest run per context, ordered by created_on.
+            guard let uuid = pipeline["uuid"] as? String, UUID(uuidString: uuid.trimmingCharacters(in: CharacterSet(charactersIn: "{}"))) != nil,
+                  let state = pipeline["state"] as? [String:Any] else { throw PRReadError() }
+            if let number = pipeline["build_number"] as? Int {
+                allowedURLs.insert("https://bitbucket.org/\(pr.repository)/pipelines/results/\(number)")
+            }
+            let signature = String(data: try JSONSerialization.data(withJSONObject: state, options: .sortedKeys), encoding: .utf8) ?? ""
+            let cacheKey = "\(pr.repository)/\(uuid)"
+            if let cached = prPipelineCache[cacheKey], cached.0 == signature, [PRBuildKind.success, .failed].contains(cached.1) {
+                kinds.append(cached.1); reasons.append(cached.2); continue
+            }
+            let safe = uuid.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ""
+            let steps = try await monitoringValues(repo: pr.repository, path: "pipelines/\(safe)/steps?pagelen=100", key: pr.key)
+            guard generation == prGeneration, identity == monitoringIdentity, config == pipelineConfig else { throw PRReadError() }
+            let overall = PRPipelineState.kind(state)
+            let kind = [PRBuildKind.success, .failed, .stopped].contains(overall) ? overall
+                : PRBuildKind.combine([overall] + steps.map { PRPipelineState.kind($0["state"] as? [String:Any] ?? [:]) })
+            let number = pipeline["build_number"] as? Int
+            let url = "https://bitbucket.org/\(pr.repository)/pipelines/results/\(number.map(String.init) ?? safe)"
+            let names = steps.map { "\($0["name"] as? String ?? "Unnamed step"): \(PRPipelineState.kind($0["state"] as? [String:Any] ?? [:]).rawValue)" }.joined(separator: ", ")
+            var reason = "\(url) • \(names)" + (kind == .paused ? " • Đang tạm dừng; cần xác minh nguyên nhân trước khi Resume" : "")
+            if PRPipelineState.kind(state) == .stopped {
+                reason += " • " + (try await recoverStoppedPipeline(pr: pr, pipeline: pipeline, commit: commit))
+            }
+            guard generation == prGeneration, identity == monitoringIdentity, config == pipelineConfig else { throw PRReadError() }
+            prPipelineCache[cacheKey] = (signature, kind, reason)
+            kinds.append(kind); reasons.append(reason)
+        }
+        prPipelineURLs[pr.key] = allowedURLs
+        return (PRBuildKind.combine(kinds), reasons.isEmpty
+            ? "PR #\(pr.id) đã được lưu. Đang chờ Bitbucket tạo pipeline riêng cho PR này; app sẽ tự kiểm tra lại."
+            : reasons.joined(separator: "\n"))
+    }
+
+    private func recoverStoppedPipeline(pr: UnsuccessfulPullRequest, pipeline: [String: Any], commit: String) async throws -> String {
+        guard let identity = monitoringIdentity, prRegistry.permitsRecovery(pr.key, account: identity),
+              let uuid = pipeline["uuid"] as? String else { return "PR chưa bật tự chạy lại" }
+        guard usesBitbucketSession(pipelineConfig), !sanitizeCsrf(pipelineConfig.csrfToken).isEmpty else {
+            return "Tự chạy lại cần phiên Cookie và CSRF hợp lệ"
+        }
+        if try prRecoveryLedger.contains(account: identity, key: pr.key, pipeline: uuid) {
+            return "Đã ghi nhận lượt thử chạy lại cho pipeline này; không gửi lặp"
+        }
+        guard !prRecoveryBusy, Date() >= prRecoveryCooldownUntil else { return "Đang chờ lượt chạy lại khác" }
+        if let last = prRecoveryAt[pr.key], Date().timeIntervalSince(last) < 60 { return "Đang chờ kiểm tra job khác" }
+        prRecoveryBusy = true
+        prRecoveryAt[pr.key] = Date()
+        defer { prRecoveryBusy = false }
+        let config = pipelineConfig
+        let generation = prGeneration
+        func current() -> Bool { config == pipelineConfig && identity == monitoringIdentity && generation == prGeneration && authenticated && !needsReauth }
+        // Include other creators when checking blockers; they never enter the displayed PR list.
+        let repositories = Set(try prRegistry.keys(account: identity).map(\.repository))
+        if Date().timeIntervalSince(prRecoveryScanAt) >= 60 || prRecoveryScanConfig != config || prRecoveryScanRepos != repositories {
+            prRecoveryScanBlocked = true
+            var blocked = false
+            scan: for repository in repositories.sorted() {
+                for status in ["BUILDING", "PENDING", "PARSING"] {
+                    let json = try await monitoringRead(prRequest(repo: repository, path: "pipelines/?status=\(status)&pagelen=1"), key: pr.key)
+                    guard current(), let values = json["values"] as? [[String: Any]] else { throw PRReadError() }
+                    if !values.isEmpty { blocked = true; break scan }
                 }
             }
+            prRecoveryScanBlocked = blocked
+            prRecoveryScanAt = Date()
+            prRecoveryScanConfig = config
+            prRecoveryScanRepos = repositories
         }
+        if prRecoveryScanBlocked { return "Chờ job đang chạy xong, app sẽ kiểm tra lại" }
+        let detail = try await monitoringRead(prRequest(repo: pr.repository, path: "pullrequests/\(pr.id)"), key: pr.key)
+        guard current(), detail["state"] as? String == "OPEN",
+              let hash = ((detail["source"] as? [String: Any])?["commit"] as? [String: Any])?["hash"] as? String,
+              hash == commit || (hash.count >= 7 && commit.hasPrefix(hash)) else { return "PR hoặc commit đã đổi; không chạy lại dữ liệu cũ" }
+        let safe = uuid.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ""
+        let fresh = try await monitoringRead(prRequest(repo: pr.repository, path: "pipelines/\(safe)"), key: pr.key)
+        guard current(), PRPipelineState.kind(fresh["state"] as? [String: Any] ?? [:]) == .stopped,
+              PRMonitoringPolicy.matches(target: fresh["target"] as? [String: Any] ?? [:], commit: commit, branch: pr.sourceBranch, number: pr.id),
+              let creator = (fresh["creator"] as? [String: Any])?["uuid"] as? String,
+              UUID(uuidString: creator.trimmingCharacters(in: CharacterSet(charactersIn: "{}"))) == resolvedPRIdentity?.uuid else {
+            return "Pipeline đã đổi trạng thái; chờ cập nhật"
+        }
+        guard prRegistry.permitsRecovery(pr.key, account: identity),
+              try prRecoveryLedger.reserve(account: identity, key: pr.key, pipeline: uuid) else { return "Đã ghi nhận lượt chạy lại" }
+        var request = URLRequest(url: URL(string: "https://bitbucket.org/!api/internal/repositories/\(pr.repository)/pipelines/\(safe)/runs")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        applyAuth(to: &request, config: config, repo: pr.repository)
+        prRecoveryCooldownUntil = Date().addingTimeInterval(60)
+        prRecoveryScanBlocked = true
+        prRecoveryScanAt = .distantPast
+        do {
+            try await prStoppedStepClient.rerun(request)
+            prFullAt.removeValue(forKey: pr.key)
+            return "Đã yêu cầu Rerun stopped steps; đang chờ Bitbucket cập nhật"
+        } catch {
+            // The server may have accepted a request even if its reply was lost.
+            // Keep the durable reservation and never automatically resend.
+            throw PRReadError(message: "Lượt chạy lại đã ghi nhận nhưng chưa xác nhận kết quả: " + error.localizedDescription + ". Kiểm tra Bitbucket; app không gửi lặp.")
+        }
+    }
 
-        return []
+    func recordAppCreatedPR(repository: String, config: PipelineConfig, identity: String, status: Int, data: Data, location: String?) {
+        guard [200,201].contains(status) else { return }
+        do {
+            try prRegistry.recordCreated(repository: repository, account: identity, status: status, data: data, location: location)
+            prRegistryError = ""
+            if config == pipelineConfig { pollPRs() }
+        } catch { prRegistryError = "PR đã tạo nhưng id/repository/registry không hợp lệ; chưa đăng ký theo dõi." }
+    }
+
+    func isAppCreated(_ pr: UnsuccessfulPullRequest) -> Bool {
+        guard let identity = monitoringIdentity else { return false }
+        return prRegistry.contains(pr.key, account: identity)
+    }
+
+    func pollPRs() {
+        let identity = monitoringIdentity
+        if identity != prIdentity {
+            prIdentity = identity; prGeneration += 1
+            unsuccessfulPRs = []; prPollInfo = [:]; terminalPRs = []
+            selectedPRId = nil; selectedPRRepo = nil
+            prDetailAt = [:]; prFullAt = [:]; prNextPollAt = [:]; prDiscoveryUntil = [:]; prPipelineCache = [:]; prPipelineKinds = [:]; prPipelineURLs = [:]
+            // Keep shared budget/cooldown and old in-flight reservations across identity switches.
+        }
+        guard authenticated, !needsReauth else { return }
+        guard let identity else {
+            if !prsLoading, Date() >= prIdentityRetryAt { Task { await fetchUnsuccessfulPRs() } }
+            return
+        }
+        var registered: [PRKey] = []
+        do { registered = try prRegistry.keys(account: identity); prRegistryError = "" }
+        catch { prRegistryError = "Không đọc được danh sách PR đã lưu."; return }
+        let allowed = Set(registered)
+        unsuccessfulPRs.removeAll { !allowed.contains($0.key) }
+        for key in registered where !unsuccessfulPRs.contains(where: { $0.key == key }) {
+            prDiscoveryUntil[key] = Date().addingTimeInterval(90)
+            unsuccessfulPRs.append(UnsuccessfulPullRequest(id: key.number, title: "PR #\(key.number) • đang tải registry", description: nil, repository: key.repository, sourceBranch: "unknown", targetBranch: "unknown", commitHash: nil, authorName: "", authorAvatar: nil, htmlUrl: "https://bitbucket.org/\(key.repository)/pull-requests/\(key.number)", createdDate: "", updatedDate: "", builds: [], summaryState: "UNKNOWN", statusReason: "App-created registry; đang tải thông tin"))
+        }
+        let selected = prDetailsVisible && NSApplication.shared.isActive ? selectedPRId.flatMap { id in selectedPRRepo.map { PRKey(repository: $0, number: id) } } : nil
+        let now = Date()
+        let keys = registered.filter { !terminalPRs.contains($0) && now >= (prNextPollAt[$0] ?? .distantPast) }
+        for key in prSchedule.reserve(keys: keys, selected: selected, now: now.timeIntervalSince1970) {
+            // Pace complete polling cycles, rather than exhausting the hourly cap in a burst.
+            let discovering = now < (prDiscoveryUntil[key] ?? .distantPast) && [.empty, .unknown].contains(prPipelineKinds[key] ?? .unknown)
+            let interval: TimeInterval = discovering
+                ? (key == selected ? max(5, Double(registered.count) * 5) : max(15, Double(registered.count) * 15))
+                : (key == selected ? 30 : max(60, Double(registered.count) * 60))
+            prNextPollAt[key] = now.addingTimeInterval(interval)
+            if let pr = unsuccessfulPRs.first(where: { $0.key == key }) { Task { await pollReservedPR(pr) } }
+        }
+    }
+
+    private func pollReservedPR(_ pr: UnsuccessfulPullRequest) async {
+        let config = pipelineConfig
+        let generation = prGeneration
+        let key = pr.key
+        var retry: TimeInterval? = nil
+        var rateLimited = false
+        defer { prSchedule.finish(key, now: Date().timeIntervalSince1970, retryAfter: retry, rateLimited: rateLimited) }
+        func current() -> Bool {
+            generation == prGeneration && config.selectedAccountId == pipelineConfig.selectedAccountId && config.token == pipelineConfig.token && config.cookie == pipelineConfig.cookie && config.authType == pipelineConfig.authType && config.username == pipelineConfig.username && authenticated
+        }
+        do {
+            var commit = pr.commitHash
+            var refreshed = pr
+            let now = Date()
+            let detailDue = prDetailAt[key].map { now.timeIntervalSince($0) >= 15 } ?? true
+            if detailDue {
+                let detail = try await monitoringRead(prRequest(repo: pr.repository, path: "pullrequests/\(pr.id)"), key: key)
+                guard current() else { return }
+                guard let state = detail["state"] as? String else { throw PRReadError() }
+                if PRMonitoringPolicy.isClosed(state) {
+                    terminalPRs.insert(key)
+                    if let identity = monitoringIdentity { try prRegistry.markClosed(key, account: identity) }
+                    if let i = unsuccessfulPRs.firstIndex(where: { $0.key == key }) { unsuccessfulPRs[i].summaryState = state; unsuccessfulPRs[i].statusReason = "PR đã đóng; dừng polling" }
+                    prPollInfo[key] = PRPollInfo(loading: false, updated: Date(), error: "")
+                    return
+                }
+                guard state == "OPEN" else { throw PRReadError() }
+                let source = detail["source"] as? [String:Any]
+                commit = (source?["commit"] as? [String:Any])?["hash"] as? String
+                refreshed.title = detail["title"] as? String ?? pr.title
+                refreshed.sourceBranch = (source?["branch"] as? [String:Any])?["name"] as? String ?? pr.sourceBranch
+                refreshed.targetBranch = ((detail["destination"] as? [String:Any])?["branch"] as? [String:Any])?["name"] as? String ?? pr.targetBranch
+                refreshed.commitHash = commit
+                let author = detail["author"] as? [String: Any]
+                refreshed.authorName = author?["display_name"] as? String ?? author?["nickname"] as? String ?? ""
+                refreshed.authorAvatar = (((author?["links"] as? [String: Any])?["avatar"] as? [String: Any])?["href"] as? String)
+                refreshed.createdDate = detail["created_on"] as? String ?? ""
+                refreshed.updatedDate = detail["updated_on"] as? String ?? ""
+                refreshed.description = detail["description"] as? String
+                prDetailAt[key] = now
+            }
+            guard let reportedCommit = commit, (7...40).contains(reportedCommit.count), reportedCommit.allSatisfy({ $0.isASCII && $0.isHexDigit }) else {
+                throw PRReadError(message: "PR chưa có commit hợp lệ để tải pipeline")
+            }
+            if reportedCommit.count < 40 {
+                let object = try await monitoringRead(prRequest(repo: pr.repository, path: "commit/\(reportedCommit)"), key: key)
+                guard current(), let full = object["hash"] as? String, full.count == 40,
+                      full.allSatisfy({ $0.isASCII && $0.isHexDigit }), full.lowercased().hasPrefix(reportedCommit.lowercased()) else {
+                    throw PRReadError(message: "Không xác định được full commit từ Bitbucket")
+                }
+                commit = full
+            }
+            guard let commit else { throw PRReadError() }
+            refreshed.commitHash = commit
+            let changed = pr.commitHash != commit
+            if changed { refreshed.builds = []; prPipelineKinds.removeValue(forKey: key) }
+            if let index = unsuccessfulPRs.firstIndex(where: { $0.key == key }) { unsuccessfulPRs[index] = refreshed }
+            let settled = [.success, .failed, .stopped].contains(prPipelineKinds[key] ?? .unknown)
+            let fullDue = changed || (prFullAt[key].map { now.timeIntervalSince($0) >= PRMonitoringPolicy.fullInterval(kind: prPipelineKinds[key] ?? .unknown) } ?? true)
+            if settled && !detailDue && !fullDue { return }
+            if fullDue {
+                let values = try await monitoringValues(repo: pr.repository, path: "commit/\(commit)/statuses?pagelen=100", key: key)
+                guard current() else { return }
+                refreshed.builds = parseBuildStatusItems(values)
+            }
+            var pipelineKind = prPipelineKinds[key] ?? .unknown
+            if !settled || fullDue {
+                let result = try await fetchConcretePipeline(pr: refreshed, commit: commit)
+                pipelineKind = result.0; refreshed.statusReason = result.1
+            }
+            guard current(), let i = unsuccessfulPRs.firstIndex(where: { $0.key == key }) else { return }
+            let allowedURLs = prPipelineURLs[key] ?? []
+            refreshed.builds = refreshed.builds.filter { build in
+                guard let raw = build.url, let url = URL(string: raw), url.scheme == "https", url.host == "bitbucket.org",
+                      url.user == nil, url.password == nil else { return false }
+                let parts = url.path.split(separator: "/")
+                guard parts.count >= 5 else { return false }
+                let pipelineURL = "https://bitbucket.org/" + parts.prefix(5).joined(separator: "/")
+                return allowedURLs.contains(pipelineURL)
+            }
+            refreshed.summaryState = pipelineKind == .empty && refreshed.builds.isEmpty ? "WAITING"
+                : PRBuildKind.combine([PRBuildKind.summarize(refreshed.builds.map(\.state)), pipelineKind]).rawValue.uppercased()
+            unsuccessfulPRs[i] = refreshed
+            prPipelineKinds[key] = pipelineKind
+            if pipelineKind == .empty, Date() < (prDiscoveryUntil[key] ?? .distantPast) {
+                let interval = max(5, Double(unsuccessfulPRs.count) * 5)
+                prNextPollAt[key] = Date().addingTimeInterval(interval)
+            }
+            if fullDue { prFullAt[key] = now }
+            prPollInfo[key] = PRPollInfo(loading: false, updated: Date(), error: "")
+            // Pipeline completion is NOT PR closure. Continue detail checks and detect later commits/reruns.
+        } catch {
+            rateLimited = (error as? PRReadError)?.status == 429
+            retry = (error as? PRReadError)?.retryAfter ?? 15
+            guard current() else { return }
+            prPollInfo[key, default: PRPollInfo()].error = error.localizedDescription
+        }
     }
 
     private func parseBuildStatusItems(_ values: [[String: Any]]) -> [PRBuildStatusItem] {
@@ -7250,14 +7403,15 @@ enum VpnConnectionStatus: String {
     }
 
     func refreshBuildsForPR(_ pr: UnsuccessfulPullRequest) async {
-        let newBuilds = await fetchStatusesForPR(repo: pr.repository, prId: pr.id, commitHash: pr.commitHash)
-        if let idx = unsuccessfulPRs.firstIndex(where: { $0.id == pr.id && $0.repository == pr.repository }) {
-            unsuccessfulPRs[idx].builds = newBuilds
-            let hasFailed = newBuilds.contains { $0.isFailed }
-            let hasPaused = newBuilds.contains { $0.isPaused }
-            unsuccessfulPRs[idx].summaryState = hasFailed ? "FAILED" : (hasPaused ? "PAUSED" : "INPROGRESS")
-        }
+        guard isAppCreated(pr) else { return }
+        selectedPRId = pr.id; selectedPRRepo = pr.repository
+        terminalPRs.remove(pr.key)
+        prNextPollAt.removeValue(forKey: pr.key)
+        prDetailAt.removeValue(forKey: pr.key)
+        prFullAt.removeValue(forKey: pr.key)
+        pollPRs()
     }
+
 }
 
 private func getActiveVpnTunnelInfo() -> (hasTunnel: Bool, ip: String?, interface: String?) {
@@ -7628,7 +7782,7 @@ private struct UnsuccessfulPRsView: View {
     @State private var search = ""
     @State private var statusFilter = "Tất cả"
     @State private var selectedRepo = "Tất cả"
-    @State private var selectedPRId: Int? = nil
+    @State private var selectedPRKey: PRKey? = nil
 
     private var availableRepos: [String] {
         let set = Set(model.unsuccessfulPRs.map { $0.repository })
@@ -7655,24 +7809,38 @@ private struct UnsuccessfulPRsView: View {
     }
 
     private var currentPR: UnsuccessfulPullRequest? {
-        if let id = selectedPRId {
-            return model.unsuccessfulPRs.first(where: { $0.id == id })
-        }
+        if let key = selectedPRKey, let pr = filteredPRs.first(where: { $0.key == key }) { return pr }
         return filteredPRs.first
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             headerBar
+            if !model.prsError.isEmpty { Text(model.prsError).font(.caption).foregroundStyle(.orange) }
+            if !model.prRegistryError.isEmpty { Text(model.prRegistryError).font(.caption).foregroundStyle(.orange) }
             kpiBar
             filterToolbar
             masterDetailView
         }
         .padding(20)
         .onAppear {
+            model.prDetailsVisible = true
+            synchronizeSelection()
             if model.unsuccessfulPRs.isEmpty && !model.prsLoading {
                 Task { await model.fetchUnsuccessfulPRs() }
             }
+        }
+        .onDisappear { model.prDetailsVisible = false }
+        .onChange(of: selectedRepo) { synchronizeSelection() }
+        .onChange(of: statusFilter) { synchronizeSelection() }
+        .onChange(of: search) { synchronizeSelection() }
+        .onChange(of: model.unsuccessfulPRs.map(\.key)) { synchronizeSelection() }
+    }
+
+    private func synchronizeSelection() {
+        if let pr = currentPR {
+            model.selectedPRId = pr.id; model.selectedPRRepo = pr.repository
+            model.pollPRs()
         }
     }
 
@@ -7680,7 +7848,7 @@ private struct UnsuccessfulPRsView: View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
-                    Text("PR Chưa Thành Công").font(.largeTitle.bold())
+                    Text("Theo Dõi PR & Pipeline").font(.largeTitle.bold())
                     if !model.unsuccessfulPRs.isEmpty {
                         Text("\(model.unsuccessfulPRs.count)")
                             .font(.headline.bold())
@@ -7689,14 +7857,14 @@ private struct UnsuccessfulPRsView: View {
                             .foregroundStyle(.red)
                     }
                 }
-                Text("Theo dõi các PR có build bị fail hoặc bị pause/stopped. Nhấn vào chi tiết để xem từng build.")
+                Text("Chỉ theo dõi PR bạn tạo từ Git Manager bằng tài khoản hiện tại. Danh sách được lưu khi đóng app; tự cập nhật khi mở lại. PR mới được kiểm tra nhanh trong 90 giây đầu; sau đó PR đang chọn cập nhật mỗi 30 giây, nền chậm hơn theo số PR.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
             Spacer()
             if model.prsLoading {
                 ProgressView().controlSize(.small)
-                Text("Đang quét...").font(.caption).foregroundStyle(.secondary)
+                Text("Đang tải...").font(.caption).foregroundStyle(.secondary)
             }
             Button {
                 Task { await model.fetchUnsuccessfulPRs() }
@@ -7710,7 +7878,7 @@ private struct UnsuccessfulPRsView: View {
 
     private var kpiBar: some View {
         HStack(spacing: 12) {
-            kpiCard("Tổng PR chưa đạt", model.unsuccessfulPRs.count, "exclamationmark.triangle.fill", Color.orange)
+            kpiCard("PR đã tạo từ app", model.unsuccessfulPRs.count, "exclamationmark.triangle.fill", Color.orange)
             kpiCard("Build bị Fail", model.unsuccessfulPRs.filter { $0.isFailed }.count, "xmark.circle.fill", Color.red)
             kpiCard("Build bị Pause / Chờ", model.unsuccessfulPRs.filter { $0.isPaused }.count, "pause.circle.fill", Color.orange)
             kpiCard("Đang build / Pending", model.unsuccessfulPRs.filter { $0.isInProgress }.count, "arrow.triangle.2.circlepath", Color.blue)
@@ -7780,12 +7948,12 @@ private struct UnsuccessfulPRsView: View {
                 if filteredPRs.isEmpty {
                     VStack(spacing: 12) {
                         Spacer()
-                        Image(systemName: model.prsLoading ? "arrow.triangle.2.circlepath" : "checkmark.seal.fill")
+                        Image(systemName: model.prsLoading ? "arrow.triangle.2.circlepath" : "doc.text.magnifyingglass")
                             .font(.system(size: 38))
                             .foregroundStyle(model.prsLoading ? AppPalette.blue : AppPalette.mint)
-                        Text(model.prsLoading ? "Đang quét các PR..." : "Không có PR nào gặp lỗi build")
+                        Text(model.prsLoading ? "Đang tải PR đã lưu…" : "Chưa có PR đã lưu cho tài khoản này")
                             .font(.headline)
-                        Text(model.prsLoading ? "Vui lòng đợi giây lát" : "Tất cả các PR trong phạm vi quét đều thành công hoặc không có PR mở.")
+                        Text(model.prsLoading ? "Vui lòng đợi giây lát" : "PR sẽ xuất hiện sau khi bạn nhấn Tạo PR trong Git Manager. PR cũ chưa được lưu sẽ không tự thêm vào danh sách.")
                             .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         Spacer()
                     }
@@ -7794,7 +7962,7 @@ private struct UnsuccessfulPRsView: View {
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 8) {
-                            ForEach(filteredPRs) { pr in
+                            ForEach(filteredPRs, id: \.key) { pr in
                                 prCard(pr)
                             }
                         }
@@ -7833,10 +8001,11 @@ private struct UnsuccessfulPRsView: View {
     }
 
     private func prCard(_ pr: UnsuccessfulPullRequest) -> some View {
-        let isSelected = (selectedPRId == pr.id) || (selectedPRId == nil && filteredPRs.first?.id == pr.id)
+        let isSelected = currentPR?.key == pr.key
 
         return Button {
-            selectedPRId = pr.id
+            selectedPRKey = pr.key
+            synchronizeSelection()
         } label: {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
@@ -7927,6 +8096,16 @@ private struct UnsuccessfulPRsView: View {
     private func prDetailInspector(_ pr: UnsuccessfulPullRequest) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(model.isAppCreated(pr) ? "Đã đăng ký: app-created PR (account hiện tại)" : "Chỉ theo dõi: không có registry app-created cho account hiện tại")
+                    Text("Stopped: tự Rerun stopped steps một lần khi các job đang chạy đã xong (cần Cookie). Pause chờ duyệt thủ công không tự Resume.")
+                    Text(pr.summaryState + " • " + pr.statusReason)
+                    if let info = model.prPollInfo[pr.key] {
+                        if info.loading { Text("Đang cập nhật…") }
+                        if let date = info.updated { Text("Cập nhật: " + date.formatted(date: .omitted, time: .standard) + (Date().timeIntervalSince(date) > max(90, Double(model.unsuccessfulPRs.count) * 60 + 30) ? " • Dữ liệu cũ" : "")) }
+                        if !info.error.isEmpty { Text("Lỗi / dữ liệu cũ: " + info.error).foregroundStyle(.orange) }
+                    } else { Text("Chưa có kết quả kiểm tra") }
+                }.font(.caption).textSelection(.enabled)
                 // PR Overview Banner
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(alignment: .top) {
@@ -7968,6 +8147,7 @@ private struct UnsuccessfulPRsView: View {
                             }
                             .buttonStyle(.bordered)
                             .help("Kiểm tra lại trạng thái build của PR này")
+                            .accessibilityLabel("Làm mới trạng thái PR")
                         }
                     }
 
@@ -8036,7 +8216,7 @@ private struct UnsuccessfulPRsView: View {
                             Text("Có thể commit chưa kích hoạt CI Pipelines trên Bitbucket, hoặc cần nạp credentials của tài khoản có quyền đọc build status.")
                                 .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                             if !pr.statusReason.isEmpty {
-                                Text("Lý do từ Worker: \(pr.statusReason)")
+                                Text("Trạng thái: \(pr.statusReason)")
                                     .font(.caption.bold())
                                     .foregroundStyle(.red)
                                     .padding(8)
@@ -8062,9 +8242,9 @@ private struct UnsuccessfulPRsView: View {
     private func buildCard(_ item: PRBuildStatusItem) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .center, spacing: 12) {
-                Image(systemName: item.isFailed ? "xmark.circle.fill" : (item.isPaused ? "pause.circle.fill" : (item.isInProgress ? "arrow.triangle.2.circlepath" : "checkmark.circle.fill")))
+                Image(systemName: item.isFailed ? "xmark.circle.fill" : (item.isPaused ? "pause.circle.fill" : (item.isInProgress ? "arrow.triangle.2.circlepath" : (item.isSuccess ? "checkmark.circle.fill" : "questionmark.circle"))))
                     .font(.system(size: 22))
-                    .foregroundStyle(item.isFailed ? Color.red : (item.isPaused ? Color.orange : (item.isInProgress ? Color.blue : AppPalette.mint)))
+                    .foregroundStyle(item.isFailed ? Color.red : (item.isPaused ? Color.orange : (item.isInProgress ? Color.blue : (item.isSuccess ? AppPalette.mint : Color.secondary))))
 
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 8) {
@@ -8106,7 +8286,7 @@ private struct UnsuccessfulPRsView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "pause.fill")
                         .foregroundStyle(.orange)
-                    Text("Build đang bị Pause hoặc chờ bước xác nhận thủ công (Manual Step). Bạn có thể bấm 'Mở Build' để resume hoặc phê duyệt.")
+                    Text("Pipeline đang tạm dừng. Nếu deployment chờ job khác, có thể cần Resume sau khi job đó kết thúc.")
                         .font(.caption.bold())
                         .foregroundStyle(.orange)
                 }
@@ -8163,12 +8343,14 @@ private struct UnsuccessfulPRsView: View {
                     .padding(.horizontal, 8).padding(.vertical, 2)
                     .background(Color.blue.opacity(0.18), in: Capsule())
                     .foregroundStyle(.blue)
-            } else {
+            } else if item.isSuccess {
                 Text("THÀNH CÔNG")
                     .font(.caption2.bold())
                     .padding(.horizontal, 8).padding(.vertical, 2)
                     .background(AppPalette.mint.opacity(0.18), in: Capsule())
                     .foregroundStyle(AppPalette.mint)
+            } else {
+                Text("KHÔNG XÁC ĐỊNH").font(.caption2.bold()).foregroundStyle(.secondary)
             }
         }
     }
@@ -8253,6 +8435,9 @@ private struct AppView: View {
         }
         .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
             Task { await model.checkVpnHealth() }
+        }
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            model.pollPRs()
         }
         .onReceive(Timer.publish(every: 10, on: .main, in: .common).autoconnect()) { _ in
             if model.authenticated && !model.needsReauth && !model.busy { Task { await model.refresh() } }

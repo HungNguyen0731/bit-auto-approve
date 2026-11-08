@@ -14,7 +14,7 @@ app="$script_dir/dist/Bitbucket PR Approver.app"
 /bin/cp -r "$script_dir/Assets/generative_agents" "$app/Contents/Resources/generative_agents"
 /bin/mkdir -p /tmp/swift-modules
 /usr/bin/swiftc -parse-as-library -module-cache-path /tmp/swift-modules -target arm64-apple-macos15.0 -framework SwiftUI -framework AppKit -framework WebKit -framework IOKit \
-  "$script_dir/BitbucketPRApprover.swift" -o "$app/Contents/MacOS/BitbucketPRApprover"
+  "$script_dir/PRAutomationCore.swift" "$script_dir/BitbucketPRApprover.swift" -o "$app/Contents/MacOS/BitbucketPRApprover"
 /bin/cp "$script_dir/../worker/install/macos/portable-setup.sh" "$app/Contents/Resources/portable-setup.sh"
 /bin/cp "$script_dir/update-app.sh" "$app/Contents/Resources/update-app.sh"
 /bin/chmod 755 "$app/Contents/MacOS/BitbucketPRApprover" "$app/Contents/Resources/portable-setup.sh" "$app/Contents/Resources/update-app.sh"
